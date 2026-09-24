@@ -63,7 +63,16 @@ jobs:
       - name: Install NSIS (Windows installer)
         if: runner.os == 'Windows'
         shell: pwsh
-        run: choco install nsis -y --no-progress
+        run: |
+          # choco 源偶发 504，重试 3 次
+          $ok = $false
+          foreach ($i in 1..3) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -eq 0) { $ok = $true; break }
+            Write-Host "choco 第 $i 次失败，15s 后重试..."
+            Start-Sleep -Seconds 15
+          }
+          if (-not $ok) { throw "NSIS 安装失败" }
 
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2

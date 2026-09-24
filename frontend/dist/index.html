@@ -225,6 +225,24 @@
           </div>
 
           <div class="card">
+            <div class="card-head">
+              <h2>软件更新</h2>
+              <span class="hint">检查 GitHub Releases 上的新版本</span>
+            </div>
+            <div class="upd-row">
+              <span id="upd-status">当前版本 v-</span>
+              <span class="row-actions">
+                <button class="btn btn-mini" id="btn-check-update">检查更新</button>
+                <button class="btn btn-primary btn-mini hidden" id="btn-do-update">下载并安装</button>
+              </span>
+            </div>
+            <div class="progress hidden" id="upd-progress">
+              <div class="progress-bar" id="upd-bar"></div>
+            </div>
+            <div class="hint upd-message" id="upd-message"></div>
+          </div>
+
+          <div class="card">
             <div class="card-head"><h2>文件位置</h2></div>
             <dl class="kv">
               <div><dt>数据目录</dt><dd class="mono" id="path-data">-</dd></div>

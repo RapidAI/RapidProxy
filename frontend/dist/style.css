@@ -382,3 +382,12 @@ html, body {
   .topbar-actions { gap: 6px; }
   .topbar-actions .btn { padding: 6px 9px; font-size: 12px; }
 }
+
+/* ---- 在线更新 ---- */
+.upd-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.upd-row span:first-child { font-size: 13px; color: var(--text); }
+.upd-message { margin-top: 8px; white-space: pre-wrap; }
+.progress { margin-top: 10px; height: 8px; border-radius: 5px; background: var(--bg); border: 1px solid var(--border); overflow: hidden; }
+.progress-bar { height: 100%; width: 0; border-radius: 5px; background: linear-gradient(135deg, var(--accent), var(--accent-violet)); transition: width .25s ease; }
+.progress-bar.indeterminate { width: 40% !important; animation: upd-indet 1.1s ease-in-out infinite alternate; }
+@keyframes upd-indet { from { margin-left: -10%; } to { margin-left: 70%; } }

@@ -5,6 +5,7 @@ const S = {
   state: null,
   logs: [],
   login: { status: 'idle' },
+  update: null,
   revealKey: false,
   modelFilter: '',
   dirty: false,
@@ -550,6 +551,10 @@ function bindUI() {
       toast('生成失败：' + err);
     }
   };
+
+  // 在线更新
+  $('btn-check-update').onclick = checkUpdate;
+  $('btn-do-update').onclick = doUpdate;
 }
 
 async function runSync(message) {
@@ -581,6 +586,61 @@ function bindEvents() {
     if (S.logs.length > 400) S.logs = S.logs.slice(-400);
     renderLogs();
   });
+  window.runtime.EventsOn('update', (payload) => {
+    S.update = payload;
+    renderUpdate();
+    if (payload.phase === 'available') toast(payload.message || '发现新版本');
+    if (payload.phase === 'failed') toast('更新失败：' + (payload.message || ''));
+  });
+}
+
+// ---------------- 在线更新 ----------------
+
+function renderUpdate() {
+  const u = S.update || {};
+  const status = $('upd-status');
+  const btnCheck = $('btn-check-update');
+  const btnDo = $('btn-do-update');
+  const bar = $('upd-progress');
+  const fill = $('upd-bar');
+  const msg = $('upd-message');
+  if (!status) return;
+
+  const cur = (S.state && S.state.settings && S.state.settings.version) || '';
+  status.textContent = '当前版本 v' + cur + (u.latest ? '　·　最新版本 v' + u.latest : '');
+
+  const busy = u.phase === 'checking' || u.phase === 'downloading' || u.phase === 'installing';
+  btnCheck.disabled = busy;
+  btnCheck.textContent = u.phase === 'checking' ? '检查中…' : '检查更新';
+  btnDo.classList.toggle('hidden', u.phase !== 'available');
+
+  bar.classList.toggle('hidden', u.phase !== 'downloading');
+  if (u.phase === 'downloading') {
+    fill.style.width = u.progress >= 0 ? u.progress + '%' : '40%';
+    fill.classList.toggle('indeterminate', u.progress < 0);
+  }
+
+  msg.textContent = u.message || '';
+}
+
+async function checkUpdate() {
+  S.update = { phase: 'checking' };
+  renderUpdate();
+  try {
+    S.update = await call('CheckUpdate');
+  } catch (err) {
+    S.update = { phase: 'failed', message: String(err) };
+  }
+  renderUpdate();
+}
+
+async function doUpdate() {
+  try {
+    await call('DoUpdate');
+  } catch (err) {
+    S.update = { phase: 'failed', message: String(err) };
+    renderUpdate();
+  }
 }
 
 async function main() {

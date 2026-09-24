@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -22,19 +23,21 @@ import (
 	"github.com/znsoftm/RapidProxy/internal/proxysrv"
 	"github.com/znsoftm/RapidProxy/internal/store"
 	"github.com/znsoftm/RapidProxy/internal/tray"
+	"github.com/znsoftm/RapidProxy/internal/update"
 	"github.com/znsoftm/RapidProxy/internal/upstream"
 	"github.com/znsoftm/RapidProxy/internal/winfit"
 )
 
 // 事件名（前端通过 window.runtime.EventsOn 订阅）。
 const (
-	eventState = "state"
-	eventLogin = "login"
-	eventLog   = "log"
+	eventState  = "state"
+	eventLogin  = "login"
+	eventLog    = "log"
+	eventUpdate = "update"
 )
 
 // Version 是程序版本号。
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -143,6 +146,19 @@ type LoginView struct {
 	AccountID string `json:"accountId"`
 }
 
+// UpdateView 是在线更新的检查结果与安装进度。
+type UpdateView struct {
+	Phase     string `json:"phase"` // idle / checking / available / none / downloading / installing / done / failed
+	Current   string `json:"current"`
+	Latest    string `json:"latest"`
+	HasUpdate bool   `json:"hasUpdate"`
+	Page      string `json:"page"`      // Release 页面
+	AssetName string `json:"assetName"` // 将下载的安装包
+	Notes     string `json:"notes"`     // Release 说明
+	Progress  int    `json:"progress"`  // 0-100（下载时）
+	Message   string `json:"message"`   // 给用户看的提示
+}
+
 // ProfileInput 是保存设置时的上游开关。
 type ProfileInput struct {
 	ID      string `json:"id"`
@@ -195,6 +211,9 @@ type App struct {
 	unsubLog func()
 	loginMu  sync.Mutex
 	login    *loginRun
+
+	updMu sync.Mutex
+	upd   *update.Release // 最近一次检查到的可用更新
 }
 
 // NewApp 初始化应用。
@@ -249,6 +268,27 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.pushState()
+
+	// 后台静默检查一次更新（失败不打扰用户，结果通过 update 事件推送）
+	go func() {
+		time.Sleep(4 * time.Second)
+		if a.quitting.Load() {
+			return
+		}
+		client := &http.Client{Timeout: 20 * time.Second}
+		ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+		defer cancel()
+		if rel, has, err := update.Check(ctx, client, "", update.DefaultRepo, Version); err == nil && has {
+			a.updMu.Lock()
+			a.upd = rel
+			a.updMu.Unlock()
+			a.emitUpdate(UpdateView{
+				Phase: "available", Current: Version, Latest: rel.Version,
+				HasUpdate: true, Page: rel.Page, AssetName: rel.Asset.Name, Notes: rel.Notes,
+				Message: fmt.Sprintf("发现新版本 v%s，可在「设置」页下载安装", rel.Version),
+			})
+		}
+	}()
 }
 
 func (a *App) context() context.Context {
@@ -1042,6 +1082,160 @@ func (a *App) CopyText(text string) {
 		return
 	}
 	wailsrt.ClipboardSetText(ctx, text)
+}
+
+// -----------------------------------------------------------------------------
+// 在线更新
+// -----------------------------------------------------------------------------
+
+// emitUpdate 向前端推送更新进度。
+func (a *App) emitUpdate(v UpdateView) {
+	a.emit(eventUpdate, v)
+}
+
+// CheckUpdate 检查 GitHub 上的新版本。有更新时结果会被记住，供 DoUpdate 使用。
+func (a *App) CheckUpdate() (UpdateView, error) {
+	view := UpdateView{Phase: "checking", Current: Version}
+	a.emitUpdate(view)
+
+	client := &http.Client{Timeout: 20 * time.Second}
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+
+	rel, has, err := update.Check(ctx, client, "", update.DefaultRepo, Version)
+	if err != nil {
+		view.Phase, view.Message = "failed", err.Error()
+		a.emitUpdate(view)
+		return view, err
+	}
+
+	view.Latest = rel.Version
+	view.Page = rel.Page
+	view.Notes = rel.Notes
+	if !has {
+		a.updMu.Lock()
+		a.upd = nil
+		a.updMu.Unlock()
+		view.Phase, view.Message = "none", "当前已是最新版本"
+		a.emitUpdate(view)
+		return view, nil
+	}
+
+	a.updMu.Lock()
+	a.upd = rel
+	a.updMu.Unlock()
+	view.Phase = "available"
+	view.HasUpdate = true
+	view.AssetName = rel.Asset.Name
+	view.Message = fmt.Sprintf("发现新版本 v%s，可下载安装包（%s）", rel.Version, rel.Asset.Name)
+	a.log.Infof("检查到新版本 v%s（当前 %s）", rel.Version, Version)
+	a.emitUpdate(view)
+	return view, nil
+}
+
+// DoUpdate 下载安装包并执行安装，随后退出当前程序。
+//
+//   - Windows：运行 NSIS 安装向导后退出
+//   - macOS：用 open 打开 PKG 安装器后退出
+//   - Linux：把新 AppImage 原地替换当前程序后自动重启；非 AppImage 运行方式
+//     则把安装包放到数据目录并提示手动运行
+func (a *App) DoUpdate() error {
+	a.updMu.Lock()
+	rel := a.upd
+	a.updMu.Unlock()
+	if rel == nil {
+		return fmt.Errorf("请先检查更新")
+	}
+
+	dest := filepath.Join(a.dataDir, "update", rel.Asset.Name)
+	a.emitUpdate(UpdateView{
+		Phase: "downloading", Current: Version, Latest: rel.Version,
+		AssetName: rel.Asset.Name, Progress: -1,
+		Message: "开始下载 " + rel.Asset.Name,
+	})
+
+	err := update.Download(context.Background(), nil, rel.Asset, dest, func(done, total int64) {
+		pct := -1
+		if total > 0 {
+			pct = int(done * 100 / total)
+		}
+		a.emitUpdate(UpdateView{
+			Phase: "downloading", Current: Version, Latest: rel.Version,
+			AssetName: rel.Asset.Name, Progress: pct,
+			Message: fmt.Sprintf("下载中 %s / %s", humanBytes(done), humanBytes(total)),
+		})
+	})
+	if err != nil {
+		a.log.Errorf("下载更新失败: %v", err)
+		a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Latest: rel.Version, Message: "下载失败：" + err.Error()})
+		return err
+	}
+	a.log.Infof("更新包已下载: %s", dest)
+
+	if runtime.GOOS == "linux" {
+		return a.applyLinuxUpdate(rel, dest)
+	}
+
+	a.emitUpdate(UpdateView{Phase: "installing", Current: Version, Latest: rel.Version, Message: "正在启动安装程序…"})
+	a.log.Infof("启动安装程序: %s", dest)
+	if err := update.LaunchInstaller(dest); err != nil {
+		a.log.Errorf("启动安装程序失败: %v", err)
+		a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Latest: rel.Version, Message: "启动安装程序失败：" + err.Error()})
+		return err
+	}
+	a.log.Infof("安装程序已启动，程序即将退出")
+	a.QuitApp()
+	return nil
+}
+
+// applyLinuxUpdate 处理 Linux 平台的更新：AppImage 原地替换并重启。
+func (a *App) applyLinuxUpdate(rel *update.Release, dest string) error {
+	exe, err := os.Executable()
+	if err == nil {
+		exe, err = filepath.EvalSymlinks(exe)
+	}
+	if err == nil && strings.EqualFold(filepath.Ext(exe), ".appimage") {
+		a.emitUpdate(UpdateView{Phase: "installing", Current: Version, Latest: rel.Version, Message: "正在替换 AppImage…"})
+		if err := os.Chmod(dest, 0o755); err != nil {
+			a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Message: "设置执行权限失败：" + err.Error()})
+			return err
+		}
+		if err := os.Rename(dest, exe); err != nil {
+			a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Message: "替换程序失败：" + err.Error()})
+			return err
+		}
+		a.log.Infof("AppImage 已替换为 v%s，正在重启", rel.Version)
+		a.emitUpdate(UpdateView{Phase: "done", Current: rel.Version, Latest: rel.Version, Message: "更新完成，正在重启…"})
+		if err := exec.Command(exe).Start(); err != nil {
+			a.log.Warnf("自动重启失败，请手动启动: %v", err)
+		}
+		a.QuitApp()
+		return nil
+	}
+
+	// 非 AppImage 运行方式（如源码/压缩包运行）：交给用户手动安装
+	a.emitUpdate(UpdateView{
+		Phase: "done", Current: Version, Latest: rel.Version,
+		Message: "安装包已下载到 " + dest + "，请手动运行安装",
+	})
+	return nil
+}
+
+// humanBytes 把字节数格式化为可读文本。
+func humanBytes(n int64) string {
+	if n < 0 {
+		return "?"
+	}
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for m := n / unit; m >= unit; m /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }
 
 // OpenDataDir 打开数据目录（配置文件与凭据所在位置）。

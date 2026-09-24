@@ -22,6 +22,7 @@
         <button class="nav-item" data-tab="accounts"><span class="nav-dot"></span>账号</button>
         <button class="nav-item" data-tab="models"><span class="nav-dot"></span>模型</button>
         <button class="nav-item" data-tab="settings"><span class="nav-dot"></span>设置</button>
+        <button class="nav-item" data-tab="about"><span class="nav-dot"></span>关于</button>
       </nav>
 
       <div class="sidebar-footer">
@@ -222,6 +223,45 @@
           </div>
 
           <div class="card">
+            <div class="card-head"><h2>文件位置</h2></div>
+            <dl class="kv">
+              <div><dt>数据目录</dt><dd class="mono" id="path-data">-</dd></div>
+              <div><dt>配置文件</dt><dd class="mono" id="path-config">-</dd></div>
+              <div><dt>凭据目录</dt><dd class="mono" id="path-accounts">-</dd></div>
+              <div><dt>日志文件</dt><dd class="mono" id="path-log">-</dd></div>
+              <div><dt>程序版本</dt><dd id="path-version">-</dd></div>
+            </dl>
+          </div>
+
+          <div class="save-bar">
+            <button class="btn btn-primary" id="btn-save">保存设置</button>
+            <span class="hint" id="save-hint"></span>
+          </div>
+        </section>
+
+        <!-- 关于 -->
+        <section class="tab" id="tab-about">
+          <div class="card">
+            <div class="about-head">
+              <div class="brand-logo about-logo">R</div>
+              <div class="about-title">
+                <h2>RapidProxy</h2>
+                <span class="hint">把 WorkBuddy / CodeBuddy 背后的模型封装成 OpenAI 兼容的本地网关</span>
+              </div>
+            </div>
+            <dl class="kv about-kv">
+              <div><dt>当前版本</dt><dd id="about-version">-</dd></div>
+              <div><dt>运行平台</dt><dd id="about-platform">-</dd></div>
+              <div><dt>作者</dt><dd>Dr. Daniel</dd></div>
+              <div><dt>版权所有</dt><dd>© 2026 RapidAI Team</dd></div>
+            </dl>
+            <div class="row-actions about-actions">
+              <button class="btn btn-mini" id="btn-open-repo">访问 GitHub 仓库</button>
+              <span class="hint">本项目基于开源协议发布，请遵守上游服务的使用条款</span>
+            </div>
+          </div>
+
+          <div class="card">
             <div class="card-head">
               <h2>软件更新</h2>
               <span class="hint">检查 GitHub Releases 上的新版本</span>
@@ -237,22 +277,6 @@
               <div class="progress-bar" id="upd-bar"></div>
             </div>
             <div class="hint upd-message" id="upd-message"></div>
-          </div>
-
-          <div class="card">
-            <div class="card-head"><h2>文件位置</h2></div>
-            <dl class="kv">
-              <div><dt>数据目录</dt><dd class="mono" id="path-data">-</dd></div>
-              <div><dt>配置文件</dt><dd class="mono" id="path-config">-</dd></div>
-              <div><dt>凭据目录</dt><dd class="mono" id="path-accounts">-</dd></div>
-              <div><dt>日志文件</dt><dd class="mono" id="path-log">-</dd></div>
-              <div><dt>程序版本</dt><dd id="path-version">-</dd></div>
-            </dl>
-          </div>
-
-          <div class="save-bar">
-            <button class="btn btn-primary" id="btn-save">保存设置</button>
-            <span class="hint" id="save-hint"></span>
           </div>
         </section>
       </div>

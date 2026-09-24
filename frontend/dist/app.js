@@ -321,6 +321,8 @@ function renderSettings() {
   $('path-log').textContent = s.settings.logPath || '-';
   $('path-version').textContent = 'v' + s.settings.version + '（' + s.settings.platform + '）';
   $('version').textContent = 'v' + s.settings.version;
+  $('about-version').textContent = 'v' + s.settings.version;
+  $('about-platform').textContent = s.settings.platform;
 }
 
 function renderAll() {
@@ -528,6 +530,12 @@ function bindUI() {
   // 在线更新
   $('btn-check-update').onclick = checkUpdate;
   $('btn-do-update').onclick = doUpdate;
+
+  // 关于页：用系统浏览器打开 GitHub 仓库
+  $('btn-open-repo').onclick = () => {
+    try { window.runtime.BrowserOpenURL('https://github.com/RapidAI/RapidProxy'); }
+    catch (err) { toast('打开浏览器失败：' + err); }
+  };
 }
 
 async function runSync(message) {

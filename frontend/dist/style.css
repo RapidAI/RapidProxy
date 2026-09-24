@@ -242,6 +242,13 @@ html, body {
 .kv dd { margin: 0; font-size: 13px; text-align: right; word-break: break-all; }
 .kv dd.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
 
+/* 关于页 */
+.about-head { display: flex; align-items: center; gap: 14px; margin-bottom: 14px; }
+.about-logo { width: 52px; height: 52px; border-radius: 15px; font-size: 26px; flex: none; }
+.about-title h2 { margin: 0 0 4px; font-size: 18px; }
+.about-kv { margin-top: 4px; }
+.about-actions { margin-top: 14px; align-items: center; }
+
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
 @media (max-width: 900px) { .form-grid { grid-template-columns: 1fr; } }
 .form-item { display: flex; flex-direction: column; gap: 6px; }

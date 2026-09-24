@@ -82,11 +82,23 @@ jobs:
           Copy-Item README.md, LICENSE "$dest/"
           Compress-Archive -Path $dest -DestinationPath "$dest.zip"
 
-      - name: Package (macOS / Linux)
-        if: matrix.pkg == 'tar'
+      # macOS 上 Wails 产出 RapidProxy.app 应用包；做 ad-hoc 签名以免「已损坏」提示
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
         shell: bash
         run: |
-          dest="RapidProxy-${{ runner.os == 'macOS' && 'darwin' || 'linux' }}-${{ matrix.arch }}"
+          dest="RapidProxy-darwin-${{ matrix.arch }}"
+          mkdir "$dest"
+          codesign --force --deep -s - build/bin/RapidProxy.app
+          cp -R build/bin/RapidProxy.app "$dest/"
+          cp README.md LICENSE "$dest/"
+          tar czf "$dest.tar.gz" "$dest"
+
+      - name: Package (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dest="RapidProxy-linux-${{ matrix.arch }}"
           mkdir "$dest"
           cp build/bin/RapidProxy "$dest/"
           chmod +x "$dest/RapidProxy"

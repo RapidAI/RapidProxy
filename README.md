@@ -1,5 +1,7 @@
 # RapidProxy
 
+**中文** | [English](README_EN.md)
+
 把 **WorkBuddy**（国际版）与 **CodeBuddy**（国内版）账号背后的模型，转换成 **OpenAI 兼容 API** 的桌面代理程序。登录一次，任何支持「自定义 OpenAI 接口」的客户端（Cherry Studio、ChatBox、LobeChat、Open WebUI、Cursor、Cline、各种 SDK 与脚本……）都能直接调用。
 
 - 语言/框架：Go + Wails v2（原生 WebView，安装包小、内存占用低）

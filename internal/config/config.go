@@ -76,6 +76,8 @@ type Config struct {
 	ModelSyncHours int `json:"model_sync_hours"`
 	// AutoStart 打开程序时自动启动代理服务。
 	AutoStart *bool `json:"auto_start,omitempty"`
+	// LaunchAtLogin 开机自动启动程序（登录系统后静默运行在托盘），默认开启。
+	LaunchAtLogin *bool `json:"launch_at_login,omitempty"`
 	// Profiles 是上游服务列表，顺序决定同名模型的优先级。
 	Profiles []Profile `json:"profiles"`
 
@@ -284,6 +286,27 @@ func (c *Config) Normalize() { c.normalize() }
 func (c *Config) Clone() *Config {
 	cp := *c
 	cp.APIKeys = append([]string(nil), c.APIKeys...)
+	// 指针字段一并深拷贝，避免改副本时连带改到运行中的配置。
+	if c.CORS != nil {
+		v := *c.CORS
+		cp.CORS = &v
+	}
+	if c.SanitizeTemplates != nil {
+		v := *c.SanitizeTemplates
+		cp.SanitizeTemplates = &v
+	}
+	if c.ForceMaxThinking != nil {
+		v := *c.ForceMaxThinking
+		cp.ForceMaxThinking = &v
+	}
+	if c.AutoStart != nil {
+		v := *c.AutoStart
+		cp.AutoStart = &v
+	}
+	if c.LaunchAtLogin != nil {
+		v := *c.LaunchAtLogin
+		cp.LaunchAtLogin = &v
+	}
 	cp.Profiles = make([]Profile, len(c.Profiles))
 	copy(cp.Profiles, c.Profiles)
 	for i := range cp.Profiles {
@@ -343,6 +366,9 @@ func (c *Config) MaxThinkingEnabled() bool { return c.ForceMaxThinking == nil ||
 
 // AutoStartEnabled 返回是否随程序启动代理服务。
 func (c *Config) AutoStartEnabled() bool { return c.AutoStart == nil || *c.AutoStart }
+
+// LaunchAtLoginEnabled 返回是否开机自动启动（未配置时默认开启）。
+func (c *Config) LaunchAtLoginEnabled() bool { return c.LaunchAtLogin == nil || *c.LaunchAtLogin }
 
 // SyncInterval 返回模型同步周期，<=0 表示关闭同步。
 func (c *Config) SyncInterval() time.Duration {

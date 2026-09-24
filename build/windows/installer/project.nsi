@@ -1,4 +1,4 @@
-Unicode true
+﻿Unicode true
 
 ####
 ## Please note: Template replacements don't work in this file. They are provided with default defines like
@@ -56,6 +56,10 @@ ManifestDPIAware true
 !define MUI_FINISHPAGE_NOAUTOCLOSE # Wait on the INSTFILES page so the user can take a look into the details of the installation steps
 !define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
 
+# 安装完成后自动运行（完成页默认勾选的复选框）
+!define MUI_FINISHPAGE_RUN "$INSTDIR\${PRODUCT_EXECUTABLE}"
+!define MUI_FINISHPAGE_RUN_TEXT "安装完成后运行 ${INFO_PRODUCTNAME}"
+
 !insertmacro MUI_PAGE_WELCOME # Welcome to the installer page.
 # !insertmacro MUI_PAGE_LICENSE "resources\eula.txt" # Adds a EULA page to the installer
 !insertmacro MUI_PAGE_DIRECTORY # In which folder install page.
@@ -99,6 +103,9 @@ SectionEnd
 
 Section "uninstall"
     !insertmacro wails.setShellContext
+
+    # 清理应用写入的开机自启动条目（HKCU Run 键，见 internal/autostart）
+    DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RapidProxy"
 
     RMDir /r "$AppData\${PRODUCT_EXECUTABLE}" # Remove the WebView2 DataPath
 

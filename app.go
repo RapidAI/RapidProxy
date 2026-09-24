@@ -19,6 +19,7 @@ import (
 	wailsrt "github.com/wailsapp/wails/v2/pkg/runtime"
 
 	"github.com/znsoftm/RapidProxy/internal/applog"
+	"github.com/znsoftm/RapidProxy/internal/autostart"
 	"github.com/znsoftm/RapidProxy/internal/config"
 	"github.com/znsoftm/RapidProxy/internal/proxysrv"
 	"github.com/znsoftm/RapidProxy/internal/store"
@@ -37,7 +38,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.1.0"
+const Version = "1.2.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -109,6 +110,7 @@ type SettingsView struct {
 	Sanitize       bool   `json:"sanitize"`
 	MaxThinking    bool   `json:"maxThinking"`
 	AutoStart      bool   `json:"autoStart"`
+	LaunchAtLogin  bool   `json:"launchAtLogin"`
 	ConfigPath     string `json:"configPath"`
 	DataDir        string `json:"dataDir"`
 	LogPath        string `json:"logPath"`
@@ -174,6 +176,7 @@ type SettingsInput struct {
 	Sanitize       bool           `json:"sanitize"`
 	MaxThinking    bool           `json:"maxThinking"`
 	AutoStart      bool           `json:"autoStart"`
+	LaunchAtLogin  bool           `json:"launchAtLogin"`
 	Profiles       []ProfileInput `json:"profiles"`
 }
 
@@ -259,6 +262,9 @@ func (a *App) startup(ctx context.Context) {
 		a.emit(eventLog, line)
 	})
 
+	// 按配置同步系统自启动条目：既是首次启用的默认值落位，
+	// 也是程序升级（安装路径变化）后自动修正自启动指向。
+	a.applyLaunchAtLogin(a.cfg.LaunchAtLoginEnabled())
 	// 在界面真正显示出来之前收敛窗口尺寸（见 fitWindow 的注释）。
 	a.fitWindow(ctx)
 
@@ -576,6 +582,7 @@ func (a *App) GetState() StateView {
 		Sanitize:       cfg.SanitizeEnabled(),
 		MaxThinking:    cfg.MaxThinkingEnabled(),
 		AutoStart:      cfg.AutoStartEnabled(),
+		LaunchAtLogin:  cfg.LaunchAtLoginEnabled(),
 		ConfigPath:     cfg.Path(),
 		DataDir:        a.dataDir,
 		LogPath:        a.log.FilePath(),
@@ -992,6 +999,7 @@ func (a *App) SaveSettings(input SettingsInput) error {
 	cfg.SanitizeTemplates = boolPtr(input.Sanitize)
 	cfg.ForceMaxThinking = boolPtr(input.MaxThinking)
 	cfg.AutoStart = boolPtr(input.AutoStart)
+	cfg.LaunchAtLogin = boolPtr(input.LaunchAtLogin)
 
 	for _, in := range input.Profiles {
 		profile, ok := cfg.ProfileByID(in.ID)
@@ -1015,6 +1023,9 @@ func (a *App) SaveSettings(input SettingsInput) error {
 
 	a.log.Infof("设置已保存（监听 %s，上游 %d 个）", cfg.Listen, len(cfg.EnabledProfiles()))
 
+	// 开机自启动立即生效（注册 / 注销系统条目）。
+	a.applyLaunchAtLogin(cfg.LaunchAtLoginEnabled())
+
 	if a.srv.Running() {
 		if !sameListenAddr(cfg.Listen, a.srv.Addr()) {
 			// 只有监听地址真的变了才重启，否则 ":8787" 与 "[::]:8787"
@@ -1037,6 +1048,22 @@ func (a *App) SaveSettings(input SettingsInput) error {
 }
 
 func boolPtr(v bool) *bool { return &v }
+
+// applyLaunchAtLogin 把开机自启动设置落到系统（失败只记日志，不影响主流程）。
+func (a *App) applyLaunchAtLogin(enable bool) {
+	if err := autostart.Set(enable); err != nil {
+		a.log.Warnf("设置开机自启动（%v）失败: %v", enable, err)
+		return
+	}
+	a.log.Infof("开机自启动已%s", boolText(enable))
+}
+
+func boolText(v bool) string {
+	if v {
+		return "开启"
+	}
+	return "关闭"
+}
 
 // sameListenAddr 判断两个监听地址是否等价。
 //

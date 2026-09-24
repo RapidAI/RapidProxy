@@ -26,6 +26,7 @@ Turn **WorkBuddy** (international) and **CodeBuddy** (China) accounts into a loc
 - **Deep thinking & tool calls**: `hy3` models automatically request the highest reasoning effort; `delta.reasoning_content` is passed through; OpenAI-style `tool_calls` deltas are merged correctly by `index`.
 - **Request sanitization**: minimal word-level rewrites of fixed system-template sentences blacklisted upstream, reducing the chance of content blocking; max thinking effort can be forced globally.
 - **System tray**: show the main window / copy endpoint URL / reset window position / start-stop service / quit. The close button minimizes to the tray (with a first-time hint).
+- **Launch at login**: on by default; after you sign in to the OS, the app runs silently in the tray (no window). Toggle it off in Settings; the system autostart entry is cleaned up automatically and re-pointed after an update moves the install path.
 - **Optional CORS**: off by default; when enabled, only local pages (localhost/127.0.0.1) may call cross-origin, preventing random websites from abusing your local proxy.
 - **Window auto-fit**: the window size is converged to the current screen (size + DPI scale) and centered, so it never overflows on small screens or high-DPI setups.
 - **In-app updates**: new versions are checked on GitHub Releases automatically; the installer is downloaded, launched, and the app exits (NSIS wizard on Windows, PKG installer on macOS, in-place AppImage replacement on Linux).
@@ -56,7 +57,7 @@ Grab the **installer** (or portable archive) for your platform from [Releases](h
 
 | Platform | Installer | Portable | Notes |
 |---|---|---|---|
-| Windows | `RapidProxy-windows-amd64-setup.exe` (NSIS wizard) | `RapidProxy-windows-amd64.zip` | Requires WebView2 Runtime (preinstalled on Win10/11) |
+| Windows | `RapidProxy-windows-amd64-setup.exe` (NSIS wizard) | `RapidProxy-windows-amd64.zip` | Requires WebView2 Runtime (preinstalled on Win10/11); the finish page has "Run RapidProxy" checked by default |
 | macOS (Intel + Apple Silicon) | `RapidProxy-darwin-universal.pkg` (double-click, installs into Applications) | `RapidProxy-darwin-universal.tar.gz` | Universal binary; for the portable variant, drag `RapidProxy.app` into Applications |
 | Linux | `RapidProxy-linux-amd64.AppImage` (no install; `chmod +x` and run) | `RapidProxy-linux-amd64.tar.gz` | Requires WebKitGTK (`libwebkit2gtk-4.0`); the AppImage does not bundle the system WebView runtime |
 
@@ -181,12 +182,13 @@ curl ... -H "X-RapidProxy-Account: <account-id>" -d '{"model":"glm-5.3", ...}'
 | CORS | Off | When on, only local pages (localhost/127.0.0.1) may call cross-origin |
 | Provider proxy | Empty | Optional `http://` / `socks5://` proxy per provider |
 | API Key | Empty | Empty = no auth (loopback use only); multiple keys and one-click generation supported |
+| Launch at login | On | Runs silently in the tray after OS login (`--hidden`); turning it off removes the system autostart entry |
 
 ### In-app updates
 
 The app silently checks [GitHub Releases](https://github.com/znsoftm/RapidProxy/releases) once at startup; you can also click "Check for updates" under **Settings → Software update**. When a new version is found, click **Download & install**:
 
-- **Windows**: downloads `*-setup.exe`, launches the NSIS wizard, then exits the current app (follow the wizard; start the new version from the Start menu / desktop afterwards);
+- **Windows**: downloads `*-setup.exe`, launches the NSIS wizard, then exits the current app (the finish page has "Run RapidProxy" checked by default — click Finish to start the new version);
 - **macOS**: downloads `*-universal.pkg`, opens the system installer, then exits (installs into `/Applications`);
 - **Linux**: when running as an AppImage, the file is replaced in place and the app restarts; for other run modes the `*.AppImage` is downloaded into `<data dir>/update/` with a hint to run it manually.
 

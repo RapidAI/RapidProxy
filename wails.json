@@ -13,7 +13,7 @@
   "info": {
     "companyName": "RapidProxy",
     "productName": "WorkBuddy Proxy",
-    "productVersion": "1.0.0",
+    "productVersion": "1.2.0",
     "copyright": "MIT License",
     "comments": "把 WorkBuddy / CodeBuddy 封装成 OpenAI 兼容服务"
   }

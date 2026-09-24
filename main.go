@@ -7,6 +7,7 @@ package main
 import (
 	"embed"
 	"os"
+	"strings"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
@@ -15,6 +16,17 @@ import (
 
 //go:embed all:frontend/dist
 var assets embed.FS
+
+// wantHidden 判断是否以静默方式启动（开机自启动统一附带 --hidden：
+// 程序照常运行，只是不弹出主窗口，藏在系统托盘里）。
+func wantHidden() bool {
+	for _, arg := range os.Args[1:] {
+		if strings.EqualFold(strings.TrimSpace(arg), "--hidden") {
+			return true
+		}
+	}
+	return false
+}
 
 func main() {
 	application := NewApp()
@@ -31,6 +43,7 @@ func main() {
 		MinWidth:         windowMinWidth,
 		MinHeight:        windowMinHeight,
 		DisableResize:    false,
+		StartHidden:      wantHidden(),
 		AssetServer:      &assetserver.Options{Assets: assets},
 		BackgroundColour: &options.RGBA{R: 244, G: 245, B: 247, A: 255},
 		OnStartup:        application.startup,

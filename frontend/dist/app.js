@@ -290,6 +290,7 @@ function renderSettings() {
   $('set-sanitize').checked = s.settings.sanitize;
   $('set-thinking').checked = s.settings.maxThinking;
   $('set-autostart').checked = s.settings.autoStart;
+  $('set-launch').checked = s.settings.launchAtLogin !== false;
 
   const wrap = $('provider-config');
   wrap.innerHTML = '';
@@ -449,6 +450,7 @@ async function saveSettings() {
     sanitize: $('set-sanitize').checked,
     maxThinking: $('set-thinking').checked,
     autoStart: $('set-autostart').checked,
+    launchAtLogin: $('set-launch').checked,
     profiles,
   };
   $('btn-save').disabled = true;

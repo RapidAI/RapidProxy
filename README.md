@@ -25,6 +25,7 @@
 - **深度思考与工具调用**：`hy3` 系列自动按最高思考档请求；`delta.reasoning_content` 原样透传；OpenAI 风格 `tool_calls` 增量按 `index` 正确合并。
 - **请求净化**：可对上游黑名单的固定模板句做最小改写，降低触发内容拦截的概率；可全局强制开启最大思考档。
 - **系统托盘**：显示主界面 / 复制接口地址 / 重置窗口位置 / 启停服务 / 退出；关闭按钮收进托盘（首次有提示）。
+- **开机自启动**：默认开启，登录系统后静默运行在系统托盘（不弹窗口）；可在设置页关闭。程序升级换路径后自动修正自启动指向。
 - **CORS 可选**：默认关闭；开启时仅对本地页面（localhost/127.0.0.1）放行，避免任意网页盗用本机代理。
 - **窗口自适应**：按屏幕尺寸与系统缩放比例自动收敛窗口大小并居中，小屏 / 高 DPI 不会超出屏幕。
 - **在线更新**：自动检查 GitHub Releases 新版本，下载安装包后启动安装并退出（Windows 运行 NSIS 向导、macOS 打开 PKG 安装器、Linux 直接替换 AppImage 并重启）。
@@ -55,7 +56,7 @@
 
 | 平台 | 安装包 | 便携包 | 备注 |
 |---|---|---|---|
-| Windows | `RapidProxy-windows-amd64-setup.exe`（NSIS 安装向导） | `RapidProxy-windows-amd64.zip` | 需要 WebView2 Runtime（Win10/11 一般自带） |
+| Windows | `RapidProxy-windows-amd64-setup.exe`（NSIS 安装向导） | `RapidProxy-windows-amd64.zip` | 需要 WebView2 Runtime（Win10/11 一般自带）；安装完成页默认勾选「运行 RapidProxy」 |
 | macOS (Intel + Apple Silicon) | `RapidProxy-darwin-universal.pkg`（安装向导，双击安装到「应用程序」） | `RapidProxy-darwin-universal.tar.gz` | 通用二进制；便携方式解压后把 `RapidProxy.app` 拖入「应用程序」 |
 | Linux | `RapidProxy-linux-amd64.AppImage`（免安装，`chmod +x` 后直接运行） | `RapidProxy-linux-amd64.tar.gz` | 需要 WebKitGTK（`libwebkit2gtk-4.0`）；AppImage 未捆绑系统 WebView 运行库 |
 
@@ -180,12 +181,13 @@ curl ... -H "X-RapidProxy-Account: <账号ID>" -d '{"model":"glm-5.3", ...}'
 | CORS | 关 | 开启后仅本地页面（localhost/127.0.0.1）可跨域调用 |
 | 上游代理 | 空 | 可为某个上游单独填 `http://` / `socks5://` 代理 |
 | API Key | 空 | 为空则不鉴权（仅建议本机监听时使用）；可添加多条、一键生成 |
+| 开机自动启动 | 开 | 登录系统后静默运行在托盘（`--hidden`）；关闭后自动清理系统自启动条目 |
 
 ### 在线更新
 
 程序启动后会静默检查一次 [GitHub Releases](https://github.com/znsoftm/RapidProxy/releases)；也可以到 **设置 → 软件更新** 手动「检查更新」。发现新版本后点 **下载并安装**：
 
-- **Windows**：下载 `*-setup.exe`，自动运行 NSIS 安装向导，随后退出当前程序（安装时按向导下一步即可，完成后从开始菜单/桌面启动新版）；
+- **Windows**：下载 `*-setup.exe`，自动运行 NSIS 安装向导，随后退出当前程序（安装完成页默认勾选「安装完成后运行」，点完成即可启动新版）；
 - **macOS**：下载 `*-universal.pkg`，自动打开系统安装器，随后退出当前程序（安装位置 `/Applications`）；
 - **Linux**：以 AppImage 方式运行时自动替换当前文件并重启；其它运行方式会把 `*.AppImage` 下载到数据目录的 `update/` 下并提示手动运行。
 

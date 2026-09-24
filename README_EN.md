@@ -27,6 +27,7 @@ Turn **WorkBuddy** (international) and **CodeBuddy** (China) accounts into a loc
 - **Request sanitization**: minimal word-level rewrites of fixed system-template sentences blacklisted upstream, reducing the chance of content blocking; max thinking effort can be forced globally.
 - **System tray**: show the main window / copy endpoint URL / reset window position / start-stop service / quit. The close button minimizes to the tray (with a first-time hint).
 - **Launch at login**: on by default; after you sign in to the OS, the app runs silently in the tray (no window). Toggle it off in Settings; the system autostart entry is cleaned up automatically and re-pointed after an update moves the install path.
+- **Single instance**: launching a second copy detects the running one, shows a notice, and exits — no duplicate processes fighting over the port or config.
 - **Optional CORS**: off by default; when enabled, only local pages (localhost/127.0.0.1) may call cross-origin, preventing random websites from abusing your local proxy.
 - **Window auto-fit**: the window size is converged to the current screen (size + DPI scale) and centered, so it never overflows on small screens or high-DPI setups.
 - **In-app updates**: new versions are checked on GitHub Releases automatically; the installer is downloaded, launched, and the app exits (NSIS wizard on Windows, PKG installer on macOS, in-place AppImage replacement on Linux).

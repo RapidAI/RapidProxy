@@ -12,6 +12,7 @@ import (
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	"github.com/znsoftm/RapidProxy/internal/singleton"
 )
 
 //go:embed all:frontend/dist
@@ -29,6 +30,13 @@ func wantHidden() bool {
 }
 
 func main() {
+	// 单实例：第二份程序弹出提示后立即退出，避免重复的服务端口占用、
+	// 托盘图标和配置读写。锁随进程存活、崩溃自动释放，无需清理。
+	if !singleton.Acquire("RapidProxy") {
+		singleton.NotifyAlreadyRunning("RapidProxy")
+		return
+	}
+
 	application := NewApp()
 
 	// 托盘必须在主事件循环启动之前注册，由 Wails 的事件循环驱动。

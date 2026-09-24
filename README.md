@@ -53,8 +53,7 @@
 | 平台 | 文件 | 备注 |
 |---|---|---|
 | Windows | `RapidProxy-windows-amd64.zip` | 需要 WebView2 Runtime（Win10/11 一般自带） |
-| macOS (Intel) | `RapidProxy-darwin-amd64.tar.gz` | |
-| macOS (Apple Silicon) | `RapidProxy-darwin-arm64.tar.gz` | |
+| macOS (Intel + Apple Silicon) | `RapidProxy-darwin-universal.tar.gz` | 通用二进制，解压后把 `RapidProxy.app` 拖入「应用程序」 |
 | Linux | `RapidProxy-linux-amd64.tar.gz` | 需要 WebKitGTK（`libwebkit2gtk-4.0`） |
 
 ### 方式二：源码构建

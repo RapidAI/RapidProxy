@@ -36,13 +36,10 @@ jobs:
             arch: amd64
             platform: windows/amd64
             pkg: zip
-          - os: macos-14
-            arch: arm64
-            platform: darwin/arm64
-            pkg: tar
-          - os: macos-13
-            arch: amd64
-            platform: darwin/amd64
+          # macos-13（Intel runner）已停止提供，改在 macos-15 上构建 universal 双架构包
+          - os: macos-15
+            arch: universal
+            platform: darwin/universal
             pkg: tar
           - os: ubuntu-22.04
             arch: amd64

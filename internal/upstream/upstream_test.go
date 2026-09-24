@@ -1,6 +1,8 @@
 package upstream
 
 import (
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/znsoftm/RapidProxy/internal/config"
@@ -109,5 +111,37 @@ func TestBuildModelListIsStableAndUnique(t *testing.T) {
 		if first[i].ID != second[i].ID {
 			t.Fatalf("第 %d 项顺序不稳定: %s vs %s", i, first[i].ID, second[i].ID)
 		}
+	}
+}
+
+// 应用内 iframe 登录依赖官方 embed=iframe 协议：保留原有参数、追加 embed 与 parent_origin。
+func TestEmbeddedAuthURL(t *testing.T) {
+	s := &LoginSession{AuthURL: "https://www.workbuddy.ai/login?platform=CLI&state=abc123"}
+	got := s.EmbeddedAuthURL("http://wails.localhost")
+
+	u, err := url.Parse(got)
+	if err != nil {
+		t.Fatalf("构造的链接不合法: %v", err)
+	}
+	q := u.Query()
+	if u.Scheme != "https" || u.Host != "www.workbuddy.ai" || u.Path != "/login" {
+		t.Errorf("基础部分被破坏: %s", got)
+	}
+	if q.Get("platform") != "CLI" || q.Get("state") != "abc123" {
+		t.Errorf("原有参数丢失: %s", got)
+	}
+	if q.Get("embed") != "iframe" || q.Get("parent_origin") != "http://wails.localhost" {
+		t.Errorf("embed 参数缺失: %s", got)
+	}
+
+	// 非法原链接原样返回
+	broken := &LoginSession{AuthURL: "::::not-a-url"}
+	if broken.EmbeddedAuthURL("http://x") != "::::not-a-url" {
+		t.Error("非法 AuthURL 应原样返回")
+	}
+	// 空 origin 时不应写入空参数
+	empty := &LoginSession{AuthURL: "https://www.workbuddy.ai/login?state=s"}
+	if strings.Contains(empty.EmbeddedAuthURL(""), "parent_origin") {
+		t.Error("空 origin 不应写入 parent_origin")
 	}
 }

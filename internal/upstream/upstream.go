@@ -339,6 +339,25 @@ func (c *Client) StartLogin(ctx context.Context) (*LoginSession, error) {
 	}, nil
 }
 
+// EmbeddedAuthURL 返回可嵌入应用内 iframe 的授权链接。
+//
+// 官方登录页原生支持 embed=iframe 模式：登录完成后会向 parent_origin
+// postMessage 通知结果（login_success / login_fail）。token 本身仍由
+// Poll 轮询获取，postMessage 只用于应用内及时感知并关闭授权窗口。
+func (s *LoginSession) EmbeddedAuthURL(parentOrigin string) string {
+	u, err := url.Parse(s.AuthURL)
+	if err != nil {
+		return s.AuthURL
+	}
+	q := u.Query()
+	q.Set("embed", "iframe")
+	if parentOrigin != "" {
+		q.Set("parent_origin", parentOrigin)
+	}
+	u.RawQuery = q.Encode()
+	return u.String()
+}
+
 // Poll 轮询一次登录结果。
 //
 // 返回 (nil, nil) 表示用户尚未完成登录，应继续轮询。

@@ -58,6 +58,7 @@ export namespace main {
 	    active: boolean;
 	    provider: string;
 	    url: string;
+	    embedUrl: string;
 	    state: string;
 	    status: string;
 	    message: string;
@@ -73,6 +74,7 @@ export namespace main {
 	        this.active = source["active"];
 	        this.provider = source["provider"];
 	        this.url = source["url"];
+	        this.embedUrl = source["embedUrl"];
 	        this.state = source["state"];
 	        this.status = source["status"];
 	        this.message = source["message"];

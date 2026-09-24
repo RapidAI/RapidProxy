@@ -163,15 +163,48 @@ function renderLogin() {
   spinner.className = 'spinner' + (login.status === 'success' ? ' done' : login.status === 'failed' ? ' fail' : '');
 
   $('login-title').textContent =
-    login.status === 'pending' ? '等待在浏览器中完成登录' :
+    login.status === 'pending' ? '等待完成登录' :
     login.status === 'success' ? '登录成功' : '登录失败';
   $('login-message').textContent = login.message || '';
   $('login-expires').textContent = login.status === 'pending' ? '链接有效期至 ' + login.expiresAt : '';
+
+  // 应用内授权窗口：仅 pending 时展示，成功/失败后收起
+  const wrap = $('login-frame-wrap');
+  const frame = $('login-frame');
+  if (login.status === 'pending' && login.embedUrl) {
+    if (!frame.src || frame.src !== login.embedUrl) {
+      frame.src = login.embedUrl;
+    }
+    wrap.classList.remove('hidden');
+  } else {
+    wrap.classList.add('hidden');
+    if (frame.src) frame.removeAttribute('src');
+  }
 
   const urlNode = $('login-url');
   urlNode.textContent = login.url || '-';
   $('btn-open-login').disabled = login.status !== 'pending';
   $('btn-cancel-login').disabled = login.status !== 'pending';
+}
+
+// 官方登录页在应用内嵌入（embed=iframe）模式下，登录结果会 postMessage 给父页面。
+// token 本身由后端轮询获取，这里只负责及时感知结果、给出提示。
+function setupLoginMessageBridge() {
+  window.addEventListener('message', (ev) => {
+    const login = S.login;
+    if (!login || login.status !== 'pending' || !login.url) return;
+    let expected;
+    try { expected = new URL(login.url).origin; } catch { return; }
+    if (!expected || ev.origin !== expected) return;
+    const d = ev.data;
+    if (!d || typeof d !== 'object') return;
+    if (d.type === 'login_success') {
+      toast('授权成功，正在保存登录凭据…');
+    } else if (d.type === 'login_fail') {
+      const reason = d.errorDescription || d.error || '未知错误';
+      toast('授权失败：' + reason);
+    }
+  });
 }
 
 function renderLoginProviders() {
@@ -357,16 +390,11 @@ async function refresh() {
 
 async function startLogin(provider) {
   try {
-    const view = await call('StartLogin', provider);
+    // 传自己的 origin，Go 侧据此构造应用内 iframe 授权链接（官方 embed=iframe 协议）
+    const origin = (window.location && window.location.origin) || '';
+    const view = await call('StartLogin', provider, origin);
     S.login = view;
     renderLogin();
-    if (view.url) {
-      try {
-        await call('OpenURL', view.url);
-      } catch (err) {
-        /* 打开失败时用户可手动复制链接 */
-      }
-    }
   } catch (err) {
     toast('发起登录失败：' + err);
     await refresh();
@@ -559,6 +587,7 @@ async function main() {
   await waitForBackend();
   bindUI();
   bindEvents();
+  setupLoginMessageBridge();
   await refresh();
   setInterval(refresh, 20000);
 }

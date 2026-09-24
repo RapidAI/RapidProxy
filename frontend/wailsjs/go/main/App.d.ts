@@ -40,7 +40,7 @@ export function SaveSettings(arg1:main.SettingsInput):Promise<void>;
 
 export function ShowWindow():Promise<void>;
 
-export function StartLogin(arg1:string):Promise<main.LoginView>;
+export function StartLogin(arg1:string,arg2:string):Promise<main.LoginView>;
 
 export function StartService():Promise<void>;
 

@@ -278,6 +278,16 @@ html, body {
 .login-status { display: flex; align-items: center; gap: 9px; }
 .login-status strong { font-size: 13.5px; }
 
+/* 应用内授权窗口（iframe 嵌入官方登录页） */
+.login-frame-wrap { display: flex; flex-direction: column; gap: 6px; }
+.login-frame-wrap.hidden { display: none; }
+.login-frame-wrap iframe {
+  width: 100%; height: 460px; border: 1px solid var(--border);
+  border-radius: 10px; background: #fff;
+}
+.login-frame-tip { display: flex; }
+.login-frame-tip .hint { font-size: 11.5px; line-height: 1.5; }
+
 .spinner {
   width: 13px; height: 13px; border-radius: 50%;
   border: 2px solid var(--border-strong); border-top-color: var(--accent);

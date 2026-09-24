@@ -135,6 +135,7 @@ type LoginView struct {
 	Active    bool   `json:"active"`
 	Provider  string `json:"provider"`
 	URL       string `json:"url"`
+	EmbedURL  string `json:"embedUrl"`
 	State     string `json:"state"`
 	Status    string `json:"status"`
 	Message   string `json:"message"`
@@ -165,12 +166,13 @@ type SettingsInput struct {
 // -----------------------------------------------------------------------------
 
 type loginRun struct {
-	provider  string
-	session   *upstream.LoginSession
-	cancel    context.CancelFunc
-	status    string
-	message   string
-	accountID string
+	provider     string
+	session      *upstream.LoginSession
+	cancel       context.CancelFunc
+	status       string
+	message      string
+	accountID    string
+	parentOrigin string
 }
 
 // App 是绑定给前端的应用对象。
@@ -790,8 +792,9 @@ func maskKey(key string) string {
 // 账号与登录
 // -----------------------------------------------------------------------------
 
-// StartLogin 发起某个上游的登录流程，返回需要用户打开的授权链接。
-func (a *App) StartLogin(provider string) (LoginView, error) {
+// StartLogin 发起某个上游的登录流程。parentOrigin 是前端页面自己的 origin
+// （如 http://wails.localhost），用于构造应用内 iframe 授权链接；传空则只返回外部浏览器链接。
+func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 	cfg := a.settings()
 	profile, ok := cfg.ProfileByID(provider)
 	if !ok {
@@ -813,17 +816,18 @@ func (a *App) StartLogin(provider string) (LoginView, error) {
 	}
 
 	run := &loginRun{
-		provider: provider,
-		session:  session,
-		cancel:   cancel,
-		status:   "pending",
-		message:  "等待在浏览器中完成登录",
+		provider:     provider,
+		session:      session,
+		cancel:       cancel,
+		status:       "pending",
+		message:      "请在下方授权窗口内完成登录",
+		parentOrigin: strings.TrimSpace(parentOrigin),
 	}
 	a.loginMu.Lock()
 	a.login = run
 	a.loginMu.Unlock()
 
-	a.log.Infof("[%s] 已生成登录链接，请在浏览器中完成登录", profile.Name)
+	a.log.Infof("[%s] 已生成登录链接，等待用户完成授权", profile.Name)
 	a.pushLogin()
 
 	go a.pollLogin(ctx, run)
@@ -912,6 +916,7 @@ func (a *App) loginState() LoginView {
 		Active:    run.status == "pending",
 		Provider:  run.provider,
 		URL:       run.session.AuthURL,
+		EmbedURL:  run.session.EmbeddedAuthURL(run.parentOrigin),
 		State:     run.session.State,
 		Status:    run.status,
 		Message:   run.message,

@@ -78,8 +78,8 @@ export function ShowWindow() {
   return window['go']['main']['App']['ShowWindow']();
 }
 
-export function StartLogin(arg1) {
-  return window['go']['main']['App']['StartLogin'](arg1);
+export function StartLogin(arg1, arg2) {
+  return window['go']['main']['App']['StartLogin'](arg1, arg2);
 }
 
 export function StartService() {

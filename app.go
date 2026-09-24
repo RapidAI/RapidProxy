@@ -867,14 +867,22 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 		session:      session,
 		cancel:       cancel,
 		status:       "pending",
-		message:      "请在下方授权窗口内完成登录",
+		message:      "已在系统浏览器打开官方登录页，请在该窗口完成授权",
 		parentOrigin: strings.TrimSpace(parentOrigin),
 	}
 	a.loginMu.Lock()
 	a.login = run
 	a.loginMu.Unlock()
 
-	a.log.Infof("[%s] 已生成登录链接，等待用户完成授权", profile.Name)
+	// 内嵌 iframe 授权页会被上游安全策略（X-Frame-Options / CSP frame-ancestors）
+	// 拦截，无法在应用内显示；统一改用系统浏览器完成登录。
+	// 登录结果仍由后端轮询自动感知，不依赖浏览器回调。
+	if ctx := a.context(); ctx != nil {
+		wailsrt.BrowserOpenURL(ctx, session.AuthURL)
+		a.log.Infof("[%s] 已在系统浏览器打开登录页", profile.Name)
+	} else {
+		a.log.Warnf("[%s] 无法自动打开浏览器，请复制登录链接手动访问", profile.Name)
+	}
 	a.pushLogin()
 
 	go a.pollLogin(ctx, run)

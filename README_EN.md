@@ -17,7 +17,7 @@ Turn **WorkBuddy** (international) and **CodeBuddy** (China) accounts into a loc
 
 ## Features
 
-- **Graphical sign-in**: built-in presets for WorkBuddy (`www.workbuddy.ai`) and CodeBuddy (`copilot.tencent.com`). Click "Sign in" to open the official authorization page (Google / GitHub / QR code); tokens are saved and refreshed automatically.
+- **Graphical sign-in**: built-in presets for WorkBuddy (`www.workbuddy.ai`) and CodeBuddy (`copilot.tencent.com`). Click "Sign in" and the official authorization page (Google / GitHub / QR code) opens in your system browser; tokens are saved and refreshed automatically. Sign-in status is shown on the Overview tab.
 - **OpenAI-compatible service**: exposes `/v1/models`, `/v1/chat/completions` (plus equivalent paths without `/v1`) and `/healthz`. Both streaming and non-streaming requests are supported (the upstream only offers streaming; the proxy aggregates SSE server-side).
 - **Multi-account load balancing**: sign in with several accounts per provider; requests are served round-robin. Expired tokens are refreshed automatically and 401/403 responses are retried once.
 - **Multi-provider routing**: use the bare model name (auto-matched), or prefix it with `provider:model` / `provider/model`; you can also force routing with the `X-RapidProxy-Provider` header or `?provider=`, and pin an account with `X-RapidProxy-Account`.
@@ -86,9 +86,9 @@ The repo ships a GitHub Actions workflow: pushes to `main` run tests and build c
 
 1. Start the app (`RapidProxy.exe` on Windows). The proxy service starts automatically and listens on `http://127.0.0.1:8787`.
 2. Go to the **Accounts** tab, pick "WorkBuddy (International)" or "CodeBuddy (China)", and click **Sign in**:
-   - The official authorization page (Google / GitHub / WeChat QR) opens **inside the app window**; credentials are saved automatically when you finish — you never leave the app;
-   - If a sign-in method (e.g. Google) is blocked inside the embedded page, click "Open sign-in in external browser" to finish in your system browser;
-   - You can also copy the sign-in link and open it in any browser (including on your phone); the app polls for the result automatically;
+   - The official authorization page (Google / GitHub / WeChat QR) opens automatically in your **system default browser**; once you finish there, credentials are saved and the app picks up the result automatically;
+   - If the browser does not open by itself, copy the sign-in link into any browser (including on your phone); the app polls for the result automatically;
+   - The **Overview** tab shows each provider's sign-in status live (`Signed in · N accounts` / `Not signed in`);
    - Once signed in, the account appears in the list and its tokens are refreshed automatically.
 3. Back on the **Overview** tab you will find the access info:
 

@@ -130,19 +130,15 @@
                 <strong id="login-title">等待登录</strong>
                 <span class="hint" id="login-message"></span>
               </div>
-              <div class="login-frame-wrap hidden" id="login-frame-wrap">
-                <iframe id="login-frame" title="登录授权窗口"
-                        sandbox="allow-scripts allow-same-origin allow-forms allow-popups allow-popups-to-escape-sandbox allow-downloads"></iframe>
-                <div class="login-frame-tip">
-                  <span class="hint">上方是官方授权页，仅嵌入显示，凭据不会经过本程序。若 Google 登录被拦截，可用下方按钮在外部浏览器完成。</span>
-                </div>
+              <div class="login-frame-tip">
+                <span class="hint">已在你系统的默认浏览器中打开官方登录页（Google / GitHub / 微信扫码）。在浏览器里完成授权后，本程序会自动感知并保存凭据；若浏览器没有自动打开，可复制下方链接手动访问。</span>
               </div>
               <div class="copy-line">
                 <code id="login-url">-</code>
                 <button class="btn btn-mini" data-copy="login-url">复制链接</button>
               </div>
               <div class="row-actions">
-                <button class="btn btn-mini" id="btn-open-login">在外部浏览器打开登录</button>
+                <button class="btn btn-mini" id="btn-open-login">重新打开登录页</button>
                 <button class="btn btn-mini" id="btn-cancel-login">取消</button>
                 <span class="hint" id="login-expires"></span>
               </div>

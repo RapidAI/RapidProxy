@@ -126,7 +126,8 @@ function renderOverview() {
   $('ov-running').textContent = s.running ? '运行中' : '已停止';
   $('ov-listen').textContent = s.listen;
   $('ov-models').textContent = (s.models || []).length + ' 个';
-  $('ov-accounts').textContent = (s.accounts || []).length + ' 个';
+  const accCount = (s.accounts || []).length;
+  $('ov-accounts').textContent = accCount > 0 ? accCount + ' 个' : '尚未登录';
   $('ov-sync').textContent = s.settings.modelSyncHours > 0 ? '每 ' + s.settings.modelSyncHours + ' 小时' : '已关闭';
 
   const list = $('ov-providers');
@@ -140,7 +141,10 @@ function renderOverview() {
     const ops = el('div', 'ops');
     const tag = el('span', 'tag' + (p.enabled ? ' on' : ''), p.enabled ? '已启用' : '未启用');
     ops.appendChild(tag);
-    ops.appendChild(el('span', 'tag', p.accountCount + ' 账号'));
+    // 登录状态：有账号即视为已登录（绿色），否则醒目提示未登录
+    const logged = p.accountCount > 0;
+    ops.appendChild(el('span', 'tag' + (logged ? ' on' : ' warn'),
+      logged ? '已登录 · ' + p.accountCount + ' 账号' : '未登录'));
     ops.appendChild(el('span', 'tag', p.modelCount + ' 模型'));
     item.appendChild(ops);
     list.appendChild(item);
@@ -164,48 +168,15 @@ function renderLogin() {
   spinner.className = 'spinner' + (login.status === 'success' ? ' done' : login.status === 'failed' ? ' fail' : '');
 
   $('login-title').textContent =
-    login.status === 'pending' ? '等待完成登录' :
+    login.status === 'pending' ? '等待在浏览器中完成授权' :
     login.status === 'success' ? '登录成功' : '登录失败';
   $('login-message').textContent = login.message || '';
   $('login-expires').textContent = login.status === 'pending' ? '链接有效期至 ' + login.expiresAt : '';
-
-  // 应用内授权窗口：仅 pending 时展示，成功/失败后收起
-  const wrap = $('login-frame-wrap');
-  const frame = $('login-frame');
-  if (login.status === 'pending' && login.embedUrl) {
-    if (!frame.src || frame.src !== login.embedUrl) {
-      frame.src = login.embedUrl;
-    }
-    wrap.classList.remove('hidden');
-  } else {
-    wrap.classList.add('hidden');
-    if (frame.src) frame.removeAttribute('src');
-  }
 
   const urlNode = $('login-url');
   urlNode.textContent = login.url || '-';
   $('btn-open-login').disabled = login.status !== 'pending';
   $('btn-cancel-login').disabled = login.status !== 'pending';
-}
-
-// 官方登录页在应用内嵌入（embed=iframe）模式下，登录结果会 postMessage 给父页面。
-// token 本身由后端轮询获取，这里只负责及时感知结果、给出提示。
-function setupLoginMessageBridge() {
-  window.addEventListener('message', (ev) => {
-    const login = S.login;
-    if (!login || login.status !== 'pending' || !login.url) return;
-    let expected;
-    try { expected = new URL(login.url).origin; } catch { return; }
-    if (!expected || ev.origin !== expected) return;
-    const d = ev.data;
-    if (!d || typeof d !== 'object') return;
-    if (d.type === 'login_success') {
-      toast('授权成功，正在保存登录凭据…');
-    } else if (d.type === 'login_fail') {
-      const reason = d.errorDescription || d.error || '未知错误';
-      toast('授权失败：' + reason);
-    }
-  });
 }
 
 function renderLoginProviders() {
@@ -649,7 +620,6 @@ async function main() {
   await waitForBackend();
   bindUI();
   bindEvents();
-  setupLoginMessageBridge();
   await refresh();
   setInterval(refresh, 20000);
 }

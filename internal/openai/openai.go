@@ -71,9 +71,32 @@ var blockedTemplates = []struct{ from, to string }{
 	},
 }
 
+// defaultSystemPrompt 是客户端没有携带 system 消息时自动补齐的内容。
+// 上游要求第一条消息必须是 system prompt（否则报 code=11128 first message
+// is not system prompt），而不少客户端的连通性测试只发一条 user 消息。
+const defaultSystemPrompt = "You are a helpful assistant."
+
+// ensureSystemPrompt 保证 messages 的第一条是 system 消息：
+// 客户端没带时在开头补一条默认的，带了则原样保留。
+func ensureSystemPrompt(obj map[string]any) {
+	messages, ok := obj["messages"].([]any)
+	if !ok {
+		return
+	}
+	if len(messages) > 0 {
+		if msg, ok := messages[0].(map[string]any); ok {
+			if role, _ := msg["role"].(string); role == "system" {
+				return
+			}
+		}
+	}
+	prepended := append([]any{map[string]any{"role": "system", "content": defaultSystemPrompt}}, messages...)
+	obj["messages"] = prepended
+}
+
 // PrepareRequestBody 把客户端请求体整理成上游可接受的形式：
-// 强制 stream（上游拒绝非流式）、按需改写模板句与思考档位。
-// 返回处理后的请求体与请求对象。
+// 强制 stream（上游拒绝非流式）、补齐首条 system 消息、
+// 按需改写模板句与思考档位。返回处理后的请求体与请求对象。
 func PrepareRequestBody(payload []byte, opts TransformOptions) ([]byte, map[string]any, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(payload, &obj); err != nil {
@@ -81,6 +104,7 @@ func PrepareRequestBody(payload []byte, opts TransformOptions) ([]byte, map[stri
 	}
 	obj["stream"] = true
 
+	ensureSystemPrompt(obj)
 	if opts.Sanitize {
 		rewriteMessages(obj)
 	}

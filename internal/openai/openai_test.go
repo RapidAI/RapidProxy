@@ -165,3 +165,48 @@ func TestAggregateFallsBackModel(t *testing.T) {
 		t.Errorf("应回退到请求的模型名，实际 %v", completion["model"])
 	}
 }
+
+// 客户端不带 system 消息时应自动补齐首条 system（上游 code=11128）。
+func TestPrepareRequestBodyEnsuresSystemPrompt(t *testing.T) {
+	base := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}`
+
+	out, _, err := PrepareRequestBody([]byte(base), TransformOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+	msgs := obj["messages"].([]any)
+	first := msgs[0].(map[string]any)
+	if role, _ := first["role"].(string); role != "system" {
+		t.Fatalf("首条消息应为 system，实际 %v", first["role"])
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("应保留原有 user 消息，实际 %d 条", len(msgs))
+	}
+	if role, _ := msgs[1].(map[string]any)["role"].(string); role != "user" {
+		t.Fatalf("第二条应为 user，实际 %v", msgs[1])
+	}
+}
+
+// 已有 system 开头时不应重复补齐，也不应打乱顺序。
+func TestPrepareRequestBodyKeepsExistingSystemPrompt(t *testing.T) {
+	base := `{"model":"m","messages":[{"role":"system","content":"You are Claude Code."},{"role":"user","content":"hi"}]}`
+	out, _, err := PrepareRequestBody([]byte(base), TransformOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var obj map[string]any
+	if err := json.Unmarshal(out, &obj); err != nil {
+		t.Fatal(err)
+	}
+	msgs := obj["messages"].([]any)
+	if len(msgs) != 2 {
+		t.Fatalf("消息数量不应变化，实际 %d", len(msgs))
+	}
+	if role, _ := msgs[0].(map[string]any)["role"].(string); role != "system" {
+		t.Fatalf("首条应保持 system，实际 %v", msgs[0])
+	}
+}

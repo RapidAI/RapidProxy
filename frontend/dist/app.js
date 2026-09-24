@@ -244,7 +244,9 @@ function renderModels() {
     const row = el('tr');
     row.appendChild(el('td', 'mono', m.id));
     row.appendChild(el('td', null, m.name || '-'));
-    row.appendChild(el('td', null, m.provider || '-'));
+    const pcell = el('td');
+    pcell.appendChild(el('span', 'tag on', m.provider || '-'));
+    row.appendChild(pcell);
     row.appendChild(el('td', 'mono', formatTokens(m.context)));
     row.appendChild(el('td', 'mono', formatTokens(m.maxOut)));
     row.appendChild(el('td', null, m.images ? '支持' : '—'));

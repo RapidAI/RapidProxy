@@ -226,19 +226,34 @@ func (s *Server) ModelsFor(providerID string) []upstream.ModelInfo {
 	return s.modelsFor(providerID)
 }
 
-// AllModels 汇总所有已启用上游的模型（同名模型以配置中靠前的上游为准）。
+// AllModels 汇总所有已启用上游的模型。
+// 同一模型 ID 被多个启用上游同时提供时，各上游的副本输出为 "provider:model"
+// 前缀形式（路由端可解析该形式），方便客户端区分国际版/国内版；
+// 仅被单个上游提供的模型保持原始 ID，旧配置完全兼容。
 func (s *Server) AllModels() []openai.Model {
 	cfg := s.Config()
-	seen := map[string]bool{}
+	enabled := cfg.EnabledProfiles()
+
+	// 第一遍：统计每个模型 ID 被几个启用上游提供。
+	count := map[string]int{}
+	lists := make([][]upstream.ModelInfo, len(enabled))
+	for i, p := range enabled {
+		lists[i] = s.modelsFor(p.ID)
+		for _, m := range lists[i] {
+			count[m.ID]++
+		}
+	}
+
+	// 第二遍：重名模型加 "provider:" 前缀，独有模型保持原 ID。
 	out := make([]openai.Model, 0, 32)
-	for _, p := range cfg.EnabledProfiles() {
-		for _, m := range s.modelsFor(p.ID) {
-			if seen[m.ID] {
-				continue
+	for i, p := range enabled {
+		for _, m := range lists[i] {
+			id := m.ID
+			if count[m.ID] > 1 {
+				id = p.ID + ":" + m.ID
 			}
-			seen[m.ID] = true
 			out = append(out, openai.Model{
-				ID:              m.ID,
+				ID:              id,
 				Object:          "model",
 				Created:         m.Created,
 				OwnedBy:         m.OwnedBy,

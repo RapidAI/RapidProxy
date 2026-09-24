@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/znsoftm/RapidProxy/internal/applog"
 	"github.com/znsoftm/RapidProxy/internal/config"
 	"github.com/znsoftm/RapidProxy/internal/store"
+	"github.com/znsoftm/RapidProxy/internal/upstream"
 )
 
 // newTestServer 启动一个监听随机端口的代理服务，返回服务实例与访问地址。
@@ -321,5 +323,55 @@ func TestTolerantPathSuffixRouting(t *testing.T) {
 	}
 	if !strings.Contains(string(body), "/v1") {
 		t.Errorf("404 提示里应包含 base_url 提示: %s", body)
+	}
+}
+
+// 同一模型 ID 被多个启用上游提供时，/v1/models 应输出 "provider:model"
+// 前缀形式区分国际版/国内版；独有模型保持原 ID。
+func TestAllModelsTagsSharedModelIDs(t *testing.T) {
+	srv, _ := newTestServer(t, func(cfg *config.Config) {
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].Enabled = true
+		}
+	})
+	srv.setModels("workbuddy", []upstream.ModelInfo{
+		{ID: "shared-model", Name: "Shared"},
+		{ID: "only-wb", Name: "OnlyWB"},
+	})
+	srv.setModels("codebuddy", []upstream.ModelInfo{
+		{ID: "shared-model", Name: "Shared"},
+		{ID: "only-cb", Name: "OnlyCB"},
+	})
+
+	got := map[string]string{} // id -> provider
+	for _, m := range srv.AllModels() {
+		got[m.ID] = m.Provider
+	}
+
+	if got["workbuddy:shared-model"] != "workbuddy" || got["codebuddy:shared-model"] != "codebuddy" {
+		t.Fatalf("重名模型应带上游前缀且各保留一份，实际 %v", got)
+	}
+	if got["only-wb"] != "workbuddy" || got["only-cb"] != "codebuddy" {
+		t.Fatalf("独有模型应保持原 ID，实际 %v", got)
+	}
+	if _, ok := got["shared-model"]; ok {
+		t.Error("重名模型不应再输出裸 ID")
+	}
+}
+
+// 前缀形式的模型 ID 应能被路由解析到对应上游。
+func TestResolveModelWithProviderPrefix(t *testing.T) {
+	srv, _ := newTestServer(t, func(cfg *config.Config) {
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].Enabled = true
+		}
+	})
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	profile, model, err := srv.resolveModel("codebuddy:shared-model", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.ID != "codebuddy" || model != "shared-model" {
+		t.Fatalf("应解析为 codebuddy/shared-model，实际 %s/%s", profile.ID, model)
 	}
 }

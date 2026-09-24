@@ -42,8 +42,17 @@ func TestAssetFor(t *testing.T) {
 		{Name: "RapidProxy-windows-amd64-setup.exe", BrowserDownloadURL: "https://x/win.exe"},
 		{Name: "RapidProxy-windows-amd64.zip", BrowserDownloadURL: "https://x/win.zip"}, // 便携包不可选
 	}
+	// 只有旧命名（仅 amd64 安装包）时通过回退逻辑选中
 	if a := assetFor(assets, "windows", "amd64"); a == nil || a.Name != "RapidProxy-windows-amd64-setup.exe" {
-		t.Errorf("windows 选包错误: %+v", a)
+		t.Errorf("windows 旧命名应回退选中: %+v", a)
+	}
+	if a := assetFor(assets, "windows", "386"); a == nil || a.Name != "RapidProxy-windows-amd64-setup.exe" {
+		t.Errorf("windows/386 应回退选中双架构安装包: %+v", a)
+	}
+	// 新命名（双架构合一）优先
+	dual := append([]ghAsset{{Name: "RapidProxy-windows-setup.exe", BrowserDownloadURL: "https://x/win-dual.exe"}}, assets...)
+	if a := assetFor(dual, "windows", "amd64"); a == nil || a.Name != "RapidProxy-windows-setup.exe" {
+		t.Errorf("windows 应优先选双架构安装包: %+v", a)
 	}
 	if a := assetFor(assets, "darwin", "arm64"); a == nil || !strings.HasSuffix(a.Name, "universal.pkg") {
 		t.Errorf("darwin 应选 universal pkg: %+v", a)
@@ -72,7 +81,7 @@ func platformAsset(name, url string) string {
 func expectedAsset() string {
 	switch runtime.GOOS {
 	case "windows":
-		return "RapidProxy-windows-amd64-setup.exe"
+		return "RapidProxy-windows-setup.exe"
 	case "darwin":
 		return "RapidProxy-darwin-universal.pkg"
 	default:

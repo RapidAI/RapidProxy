@@ -60,7 +60,7 @@ Grab the **installer** (or portable archive) for your platform from [Releases](h
 
 | Platform | Installer | Portable | Notes |
 |---|---|---|---|
-| Windows | `RapidProxy-windows-amd64-setup.exe` (NSIS wizard) | `RapidProxy-windows-amd64.zip` | Requires WebView2 Runtime (preinstalled on Win10/11); the finish page has "Run RapidProxy" checked by default |
+| Windows | `RapidProxy-windows-setup.exe` (dual-arch NSIS installer, auto-detects x86/x64) | `RapidProxy-windows-amd64.zip` / `RapidProxy-windows-386.zip` | Requires WebView2 Runtime (preinstalled on Win10/11); the finish page has "Run RapidProxy" checked by default |
 | macOS (Intel + Apple Silicon) | `RapidProxy-darwin-universal.pkg` (double-click, installs into Applications) | `RapidProxy-darwin-universal.tar.gz` | Universal binary; for the portable variant, drag `RapidProxy.app` into Applications |
 | Linux | `RapidProxy-linux-amd64.AppImage` (no install; `chmod +x` and run) | `RapidProxy-linux-amd64.tar.gz` | Requires WebKitGTK (`libwebkit2gtk-4.0`); the AppImage does not bundle the system WebView runtime |
 

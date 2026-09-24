@@ -59,7 +59,7 @@
 
 | 平台 | 安装包 | 便携包 | 备注 |
 |---|---|---|---|
-| Windows | `RapidProxy-windows-amd64-setup.exe`（NSIS 安装向导） | `RapidProxy-windows-amd64.zip` | 需要 WebView2 Runtime（Win10/11 一般自带）；安装完成页默认勾选「运行 RapidProxy」 |
+| Windows | `RapidProxy-windows-setup.exe`（NSIS 双架构安装包，自动检测 x86/x64） | `RapidProxy-windows-amd64.zip` / `RapidProxy-windows-386.zip` | 需要 WebView2 Runtime（Win10/11 一般自带）；安装完成页默认勾选「运行 RapidProxy」 |
 | macOS (Intel + Apple Silicon) | `RapidProxy-darwin-universal.pkg`（安装向导，双击安装到「应用程序」） | `RapidProxy-darwin-universal.tar.gz` | 通用二进制；便携方式解压后把 `RapidProxy.app` 拖入「应用程序」 |
 | Linux | `RapidProxy-linux-amd64.AppImage`（免安装，`chmod +x` 后直接运行） | `RapidProxy-linux-amd64.tar.gz` | 需要 WebKitGTK（`libwebkit2gtk-4.0`）；AppImage 未捆绑系统 WebView 运行库 |
 

@@ -1,21 +1,10 @@
 ﻿Unicode true
 
 ####
-## Please note: Template replacements don't work in this file. They are provided with default defines like
-## mentioned underneath.
-## If the keyword is not defined, "wails_tools.nsh" will populate them with the values from ProjectInfo.
-## If they are defined here, "wails_tools.nsh" will not touch them. This allows to use this project.nsi manually
-## from outside of Wails for debugging and development of the installer.
-##
-## For development first make a wails nsis build to populate the "wails_tools.nsh":
-## > wails build --target windows/amd64 --nsis
-## Then you can call makensis on this file with specifying the path to your binary:
-## For a AMD64 only installer:
-## > makensis -DARG_WAILS_AMD64_BINARY=..\..\bin\app.exe
-## For a ARM64 only installer:
-## > makensis -DARG_WAILS_ARM64_BINARY=..\..\bin\app.exe
-## For a installer with both architectures:
-## > makensis -DARG_WAILS_AMD64_BINARY=..\..\bin\app-amd64.exe -DARG_WAILS_ARM64_BINARY=..\..\bin\app-arm64.exe
+## RapidProxy 双架构安装包：内含 amd64 + 386 两个程序，安装时自动检测
+## 系统（处理器）架构选择对应版本。手动编译示例：
+## > makensis -DARG_WAILS_AMD64_BINARY=..\..\bin\RapidProxy-amd64.exe ^
+##            -DARG_RAPIDPROXY_386_BINARY=..\..\bin\RapidProxy-386.exe project.nsi
 ####
 ## The following information is taken from the ProjectInfo file, but they can be overwritten here.
 ####
@@ -33,6 +22,11 @@
 ## Include the wails tools
 ####
 !include "wails_tools.nsh"
+
+# 32 位（386）程序路径：未提供时安装包仅支持 64 位系统
+!ifdef ARG_RAPIDPROXY_386_BINARY
+    !define SUPPORTS_X86
+!endif
 
 # The version information for this two must consist of 4 parts
 VIProductVersion "${INFO_PRODUCTVERSION}.0"
@@ -75,12 +69,25 @@ ManifestDPIAware true
 #!finalize 'signtool --file "%1"'
 
 Name "${INFO_PRODUCTNAME}"
-OutFile "..\..\bin\${INFO_PROJECTNAME}-${ARCH}-installer.exe" # Name of the installer's file.
-InstallDir "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}" # Default installing folder ($PROGRAMFILES is Program Files folder).
+OutFile "..\..\bin\${INFO_PROJECTNAME}-windows-setup.exe" # 双架构合一安装包
+InstallDir "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}" # .onInit 按架构重设
 ShowInstDetails show # This will always show the installation details.
 
 Function .onInit
-   !insertmacro wails.checkArchitecture
+    # 注意：不使用 wails.checkArchitecture（它不支持 32 位系统）。
+    ${If} ${AtLeastWin10}
+        ; x86 / x64 均受支持
+    ${Else}
+        MessageBox MB_OK "${INFO_PRODUCTNAME} 需要 Windows 10（Server 2016）或更高版本。"
+        Quit
+    ${EndIf}
+
+    # 按系统架构选择安装目录（32 位系统上 $PROGRAMFILES32 即 $PROGRAMFILES）
+    ${If} ${RunningX64}
+        StrCpy $INSTDIR "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}"
+    ${Else}
+        StrCpy $INSTDIR "$PROGRAMFILES32\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}"
+    ${EndIf}
 FunctionEnd
 
 Section
@@ -90,7 +97,14 @@ Section
 
     SetOutPath $INSTDIR
 
-    !insertmacro wails.files
+    # 按运行时架构安装对应版本的程序
+    ${If} ${RunningX64}
+        File "/oname=${PRODUCT_EXECUTABLE}" "${ARG_WAILS_AMD64_BINARY}"
+    ${Else}
+        !ifdef SUPPORTS_X86
+            File "/oname=${PRODUCT_EXECUTABLE}" "${ARG_RAPIDPROXY_386_BINARY}"
+        !endif
+    ${EndIf}
 
     CreateShortcut "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"
     CreateShortCut "$DESKTOP\${INFO_PRODUCTNAME}.lnk" "$INSTDIR\${PRODUCT_EXECUTABLE}"

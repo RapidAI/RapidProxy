@@ -115,20 +115,24 @@ func Check(ctx context.Context, client *http.Client, apiBase, repo, currentVersi
 
 // assetFor 按平台选择安装包资产，找不到返回 nil。
 func assetFor(assets []ghAsset, goos, goarch string) *Asset {
-	var want string
+	// wants 按优先级排列：Windows 安装包内含 amd64+386（架构由安装程序
+	// 自动选择），并兼容仅 amd64 的旧版命名。
+	var wants []string
 	switch {
-	case goos == "windows" && goarch == "amd64":
-		want = "RapidProxy-windows-amd64-setup.exe"
+	case goos == "windows":
+		wants = []string{"RapidProxy-windows-setup.exe", "RapidProxy-windows-amd64-setup.exe"}
 	case goos == "darwin": // universal 包同时覆盖 amd64 / arm64
-		want = "RapidProxy-darwin-universal.pkg"
+		wants = []string{"RapidProxy-darwin-universal.pkg"}
 	case goos == "linux" && goarch == "amd64":
-		want = "RapidProxy-linux-amd64.AppImage"
+		wants = []string{"RapidProxy-linux-amd64.AppImage"}
 	default:
 		return nil
 	}
-	for i := range assets {
-		if assets[i].Name == want {
-			return &Asset{Name: assets[i].Name, URL: assets[i].BrowserDownloadURL, Size: assets[i].Size}
+	for _, want := range wants {
+		for i := range assets {
+			if assets[i].Name == want {
+				return &Asset{Name: assets[i].Name, URL: assets[i].BrowserDownloadURL, Size: assets[i].Size}
+			}
 		}
 	}
 	return nil

@@ -77,12 +77,17 @@ jobs:
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
 
-      - name: Build (Windows, with NSIS installer)
+      - name: Build (Windows, dual-arch amd64 + 386)
         if: runner.os == 'Windows'
         shell: bash
         run: |
-          export PATH="$PATH:$(go env GOPATH)/bin:/c/Program Files (x86)/NSIS"
-          wails build -clean -nocolour -skipbindings -nsis -platform ${{ matrix.platform }}
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          # 64 位：走 Wails 完整构建
+          wails build -clean -nocolour -skipbindings -platform windows/amd64
+          cp build/bin/RapidProxy.exe build/bin/RapidProxy-amd64.exe
+          # 32 位：前端为纯静态内嵌，直接用 go build 交叉编译
+          GOOS=windows GOARCH=386 go build -tags desktop,production \
+            -ldflags "-w -s -H windowsgui" -o build/bin/RapidProxy-386.exe .
 
       - name: Build (macOS / Linux)
         if: runner.os != 'Windows'
@@ -91,22 +96,30 @@ jobs:
           export PATH="$PATH:$(go env GOPATH)/bin"
           wails build -clean -nocolour -skipbindings -platform ${{ matrix.platform }}
 
-      # ---------------- Windows：NSIS 安装包 + 便携 zip ----------------
+      # ---------------- Windows：双架构 NSIS 安装包 + 便携 zip ----------------
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $dest = "RapidProxy-windows-${{ matrix.arch }}"
-          New-Item -ItemType Directory -Path $dest | Out-Null
-          Copy-Item build/bin/RapidProxy.exe "$dest/"
-          Copy-Item README.md, LICENSE "$dest/"
-          Compress-Archive -Path $dest -DestinationPath "$dest.zip"
-          # Wails -nsis 产出 build/bin/RapidProxy-amd64-installer.exe
-          Get-ChildItem build/bin/*installer*.exe | ForEach-Object {
-            Copy-Item $_.FullName "RapidProxy-windows-${{ matrix.arch }}-setup.exe"
-          }
-          if (-not (Test-Path "RapidProxy-windows-${{ matrix.arch }}-setup.exe")) {
-            throw "NSIS 安装包未生成"
+          # 双架构合一安装包：安装时自动检测 x86/x64 选择对应 exe
+          $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          & $nsis `
+            -DARG_WAILS_AMD64_BINARY="build/bin/RapidProxy-amd64.exe" `
+            -DARG_RAPIDPROXY_386_BINARY="build/bin/RapidProxy-386.exe" `
+            build/windows/installer/project.nsi
+          if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败" }
+
+          Copy-Item build/bin/RapidProxy-windows-setup.exe "RapidProxy-windows-setup.exe"
+          # 旧命名别名：v1.2.1 及更早版本的在线更新按 amd64-setup 文件名找包
+          Copy-Item build/bin/RapidProxy-windows-setup.exe "RapidProxy-windows-amd64-setup.exe"
+
+          # 便携 zip（按架构各一份）
+          foreach ($a in "amd64", "386") {
+            $dest = "RapidProxy-windows-$a"
+            New-Item -ItemType Directory -Path $dest | Out-Null
+            Copy-Item "build/bin/RapidProxy-$a.exe" "$dest/RapidProxy.exe"
+            Copy-Item README.md, LICENSE "$dest/"
+            Compress-Archive -Path $dest -DestinationPath "$dest.zip"
           }
 
       # ---------------- macOS：PKG 安装包（universal）+ 便携 tar.gz ----------------

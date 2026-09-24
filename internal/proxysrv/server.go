@@ -443,8 +443,25 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	p := strings.TrimSuffix(r.URL.Path, "/")
+	// 容错：不少客户端会把 base_url 配成 http://host/v1/models 之类，
+	// 再在后面拼接 /chat/completions。只要尾巴对得上就直接按对应端点处理。
+	if strings.HasSuffix(p, "/chat/completions") && r.Method == http.MethodPost {
+		s.handleChat(w, r)
+		return
+	}
+	if strings.HasSuffix(p, "/models") && r.Method == http.MethodGet {
+		s.handleModels(w, r)
+		return
+	}
+	if strings.HasSuffix(p, "/chat/completions") || strings.HasSuffix(p, "/models") {
+		writeError(w, http.StatusMethodNotAllowed, "该端点不支持 "+r.Method+" 请求", "invalid_request_error", "method_not_allowed")
+		return
+	}
 	if r.URL.Path != "/" {
-		writeError(w, http.StatusNotFound, "未知路径: "+r.URL.Path, "invalid_request_error", "not_found")
+		writeError(w, http.StatusNotFound,
+			"未知路径: "+r.URL.Path+"（提示：base_url 应填 "+s.Config().OpenAIBaseURL()+"，不要带上 /models 或 /chat/completions）",
+			"invalid_request_error", "not_found")
 		return
 	}
 	cfg := s.Config()

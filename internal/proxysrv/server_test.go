@@ -281,3 +281,45 @@ func TestCORSAllowsAnyOriginWhenAPIKeyConfigured(t *testing.T) {
 		t.Errorf("已配置密钥时应回显来源，实际 %q", got)
 	}
 }
+
+// 客户端常把 base_url 配成 http://host/v1/models 再拼 /chat/completions，
+// 服务端要按路径后缀容错，而不是返回 404。
+func TestTolerantPathSuffixRouting(t *testing.T) {
+	_, base := newTestServer(t, nil)
+
+	// GET <任意前缀>/models 都按模型列表处理
+	status, _ := get(t, base+"/v1/models/models", nil)
+	if status != http.StatusOK {
+		t.Errorf("/v1/models/models 应按 /models 处理，实际 %d", status)
+	}
+	status, _ = get(t, base+"/whatever/models/", nil)
+	if status != http.StatusOK {
+		t.Errorf("/whatever/models/ 应按 /models 处理，实际 %d", status)
+	}
+
+	// POST <任意前缀>/chat/completions 不应 404（无上游凭据时是别的业务错误）
+	status, body := postJSON(t, base+"/v1/models/chat/completions",
+		`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if status == http.StatusNotFound {
+		t.Errorf("/v1/models/chat/completions 不应 404: %s", body)
+	}
+	status, _ = postJSON(t, base+"/x/y/chat/completions", `{"model":"m"}`, nil)
+	if status == http.StatusNotFound {
+		t.Error("/x/y/chat/completions 不应 404")
+	}
+
+	// 后缀匹配但方法不对 → 405
+	status, _ = get(t, base+"/v1/models/chat/completions", nil)
+	if status != http.StatusMethodNotAllowed {
+		t.Errorf("对 chat 端点发 GET 应 405，实际 %d", status)
+	}
+
+	// 完全未知的路径仍 404，且提示 base_url
+	status, body = get(t, base+"/no/such/path", nil)
+	if status != http.StatusNotFound {
+		t.Errorf("未知路径应 404，实际 %d", status)
+	}
+	if !strings.Contains(string(body), "/v1") {
+		t.Errorf("404 提示里应包含 base_url 提示: %s", body)
+	}
+}

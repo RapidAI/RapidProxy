@@ -1,0 +1,19 @@
+# 构建产物
+/dist/
+/bin/
+build/bin/
+RapidProxy
+RapidProxy.exe
+
+# 本地配置与凭据（切勿提交）
+config.json
+accounts/
+*.local.json
+
+# 工作区本地数据
+.workbuddy/
+
+# 编辑器
+.idea/
+.vscode/
+.DS_Store

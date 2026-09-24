@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "RapidProxy",
+  "outputfilename": "RapidProxy",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "RapidProxy",
+    "email": "noreply@example.com"
+  },
+  "info": {
+    "companyName": "RapidProxy",
+    "productName": "WorkBuddy Proxy",
+    "productVersion": "1.0.0",
+    "copyright": "MIT License",
+    "comments": "把 WorkBuddy / CodeBuddy 封装成 OpenAI 兼容服务"
+  }
+}

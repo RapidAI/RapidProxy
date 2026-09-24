@@ -1,0 +1,121 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Run unit tests
+        run: go test ./...
+
+  build:
+    name: Build ${{ matrix.os }} / ${{ matrix.arch }}
+    needs: test
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            arch: amd64
+            platform: windows/amd64
+            pkg: zip
+          - os: macos-14
+            arch: arm64
+            platform: darwin/arm64
+            pkg: tar
+          - os: macos-13
+            arch: amd64
+            platform: darwin/amd64
+            pkg: tar
+          - os: ubuntu-22.04
+            arch: amd64
+            platform: linux/amd64
+            pkg: tar
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+
+      # Linux 需要 WebKitGTK 开发包（Wails v2 前端依赖）
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
+
+      - name: Build
+        shell: bash
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin"
+          wails build -clean -nocolour -skipbindings -platform ${{ matrix.platform }}
+
+      - name: Package (Windows)
+        if: matrix.pkg == 'zip'
+        shell: pwsh
+        run: |
+          $dest = "RapidProxy-windows-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Path $dest | Out-Null
+          Copy-Item build/bin/RapidProxy.exe "$dest/"
+          Copy-Item README.md, LICENSE "$dest/"
+          Compress-Archive -Path $dest -DestinationPath "$dest.zip"
+
+      - name: Package (macOS / Linux)
+        if: matrix.pkg == 'tar'
+        shell: bash
+        run: |
+          dest="RapidProxy-${{ runner.os == 'macOS' && 'darwin' || 'linux' }}-${{ matrix.arch }}"
+          mkdir "$dest"
+          cp build/bin/RapidProxy "$dest/"
+          chmod +x "$dest/RapidProxy"
+          cp README.md LICENSE "$dest/"
+          tar czf "$dest.tar.gz" "$dest"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: RapidProxy-${{ matrix.os }}-${{ matrix.arch }}
+          path: |
+            RapidProxy-*.zip
+            RapidProxy-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/RapidProxy-*
+          generate_release_notes: true

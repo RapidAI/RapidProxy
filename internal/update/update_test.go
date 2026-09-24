@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -59,12 +60,46 @@ func TestAssetFor(t *testing.T) {
 	}
 }
 
+// platformAsset 返回当前测试平台的安装包资产 JSON；name 为空时返回不含资产的片段。
+func platformAsset(name, url string) string {
+	if name == "" {
+		return ""
+	}
+	return `{"name":"` + name + `","browser_download_url":"` + url + `","size":20}`
+}
+
+// expectedAsset 按 runtime.GOOS 返回 assetFor 应选中的资产名。
+func expectedAsset() string {
+	switch runtime.GOOS {
+	case "windows":
+		return "RapidProxy-windows-amd64-setup.exe"
+	case "darwin":
+		return "RapidProxy-darwin-universal.pkg"
+	default:
+		return "RapidProxy-linux-amd64.AppImage"
+	}
+}
+
+// anotherAsset 返回一个「别的平台」的资产名（用于测试缺平台资产）。
+func anotherAsset() string {
+	if runtime.GOOS == "windows" {
+		return "RapidProxy-linux-amd64.AppImage"
+	}
+	return "RapidProxy-windows-amd64-setup.exe"
+}
+
 // Check：有新版返回 hasUpdate=true；同版本 false；平台无资产报错。
 func TestCheck(t *testing.T) {
-	mk := func(tag string, withWinAsset bool) *httptest.Server {
+	mk := func(tag string, withPlatformAsset bool) *httptest.Server {
+		want := ""
+		if withPlatformAsset {
+			want = platformAsset(expectedAsset(), "https://x/match")
+		} else {
+			want = platformAsset(anotherAsset(), "https://x/other")
+		}
 		body := `{"tag_name":"` + tag + `","html_url":"https://github.com/r/r/releases/tag/` + tag + `","body":"notes","assets":[` +
-			`{"name":"RapidProxy-darwin-universal.pkg","browser_download_url":"https://x/darwin.pkg","size":10}` +
-			maybeAsset(withWinAsset, `,{"name":"RapidProxy-windows-amd64-setup.exe","browser_download_url":"https://x/win.exe","size":20}`) +
+			`{"name":"RapidProxy-darwin-universal.pkg","browser_download_url":"https://x/darwin.pkg","size":10},` +
+			want +
 			`]}`
 		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
@@ -72,13 +107,13 @@ func TestCheck(t *testing.T) {
 		}))
 	}
 
-	// 新版本且有 windows 资产（测试进程是 windows）
+	// 新版本且包含当前平台的安装包
 	srv := mk("v9.9.9", true)
 	rel, has, err := Check(context.Background(), srv.Client(), srv.URL, "r/r", "1.0.0")
 	if err != nil || !has {
 		t.Fatalf("应检出更新: has=%v err=%v", has, err)
 	}
-	if rel.Version != "9.9.9" || rel.Asset.URL != "https://x/win.exe" {
+	if rel.Version != "9.9.9" || rel.Asset.Name != expectedAsset() || rel.Asset.URL != "https://x/match" {
 		t.Errorf("解析错误: %+v", rel)
 	}
 
@@ -89,13 +124,13 @@ func TestCheck(t *testing.T) {
 	}
 	srv.Close()
 
-	// 新版本但缺 windows 资产 → 报错提示
+	// 新版本但缺当前平台的资产 → 报错提示
 	srv2 := mk("v9.9.9", false)
 	_, has, err = Check(context.Background(), srv2.Client(), srv2.URL, "r/r", "1.0.0")
 	if err == nil || has {
 		t.Fatalf("缺平台资产应报错: has=%v err=%v", has, err)
 	}
-	if !strings.Contains(err.Error(), "windows") {
+	if !strings.Contains(err.Error(), runtime.GOOS) {
 		t.Errorf("错误信息应包含平台名: %v", err)
 	}
 
@@ -106,13 +141,6 @@ func TestCheck(t *testing.T) {
 	if _, _, err := Check(context.Background(), srv404.Client(), srv404.URL, "r/r", "1.0.0"); err == nil {
 		t.Fatal("404 应返回错误")
 	}
-}
-
-func maybeAsset(cond bool, s string) string {
-	if cond {
-		return s
-	}
-	return ""
 }
 
 // Download：写入内容、进度回调、.part 清理、大小校验。

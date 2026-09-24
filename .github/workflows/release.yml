@@ -11,6 +11,9 @@ on:
 permissions:
   contents: write
 
+env:
+  APP_ID: ai.rapidai.rapidproxy
+
 jobs:
   test:
     name: Test
@@ -35,16 +38,13 @@ jobs:
           - os: windows-latest
             arch: amd64
             platform: windows/amd64
-            pkg: zip
           # macos-13（Intel runner）已停止提供，改在 macos-15 上构建 universal 双架构包
           - os: macos-15
             arch: universal
             platform: darwin/universal
-            pkg: tar
           - os: ubuntu-22.04
             arch: amd64
             platform: linux/amd64
-            pkg: tar
 
     steps:
       - uses: actions/checkout@v4
@@ -60,17 +60,31 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.0-dev pkg-config
 
+      - name: Install NSIS (Windows installer)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install nsis -y --no-progress
+
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@v2.10.2
 
-      - name: Build
+      - name: Build (Windows, with NSIS installer)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          export PATH="$PATH:$(go env GOPATH)/bin:/c/Program Files (x86)/NSIS"
+          wails build -clean -nocolour -skipbindings -nsis -platform ${{ matrix.platform }}
+
+      - name: Build (macOS / Linux)
+        if: runner.os != 'Windows'
         shell: bash
         run: |
           export PATH="$PATH:$(go env GOPATH)/bin"
           wails build -clean -nocolour -skipbindings -platform ${{ matrix.platform }}
 
+      # ---------------- Windows：NSIS 安装包 + 便携 zip ----------------
       - name: Package (Windows)
-        if: matrix.pkg == 'zip'
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $dest = "RapidProxy-windows-${{ matrix.arch }}"
@@ -78,12 +92,24 @@ jobs:
           Copy-Item build/bin/RapidProxy.exe "$dest/"
           Copy-Item README.md, LICENSE "$dest/"
           Compress-Archive -Path $dest -DestinationPath "$dest.zip"
+          # Wails -nsis 产出 build/bin/RapidProxy-amd64-installer.exe
+          Get-ChildItem build/bin/*installer*.exe | ForEach-Object {
+            Copy-Item $_.FullName "RapidProxy-windows-${{ matrix.arch }}-setup.exe"
+          }
+          if (-not (Test-Path "RapidProxy-windows-${{ matrix.arch }}-setup.exe")) {
+            throw "NSIS 安装包未生成"
+          }
 
-      # macOS 上 Wails 产出 RapidProxy.app 应用包；做 ad-hoc 签名以免「已损坏」提示
+      # ---------------- macOS：PKG 安装包（universal）+ 便携 tar.gz ----------------
       - name: Package (macOS)
         if: runner.os == 'macOS'
         shell: bash
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
+          set -e
+          VER="${VERSION#v}"; [ "$VER" = "$VERSION" ] && VER="1.0.0"
+
           dest="RapidProxy-darwin-${{ matrix.arch }}"
           mkdir "$dest"
           codesign --force --deep -s - build/bin/RapidProxy.app
@@ -91,10 +117,53 @@ jobs:
           cp README.md LICENSE "$dest/"
           tar czf "$dest.tar.gz" "$dest"
 
+          # ---- PKG 安装包 ----
+          # payload 根目录即 /Applications 的内容
+          mkdir -p pkgroot
+          cp -R build/bin/RapidProxy.app pkgroot/
+
+          # Ad-hoc 签名 .app（免「已损坏」提示）
+          codesign --force --deep -s - pkgroot/RapidProxy.app
+
+          pkgbuild \
+            --root pkgroot \
+            --identifier "$APP_ID" \
+            --version "$VER" \
+            --install-location /Applications \
+            RapidProxy-component.pkg
+
+          cat > distribution.xml <<'XML'
+          <?xml version="1.0" encoding="utf-8"?>
+          <installer-gui-script minSpecVersion="1">
+            <title>RapidProxy</title>
+            <options customize="never" require-scripts="false"/>
+            <domains enable_localSystem="true"/>
+            <choices-outline>
+              <line choice="default"/>
+            </choices-outline>
+            <choice id="default" visible="false">
+              <pkg-ref id="APP_ID_PLACEHOLDER"/>
+            </choice>
+            <pkg-ref id="APP_ID_PLACEHOLDER" version="VER_PLACEHOLDER">RapidProxy-component.pkg</pkg-ref>
+          </installer-gui-script>
+          XML
+          sed -i '' -e "s/APP_ID_PLACEHOLDER/$APP_ID/g" -e "s/VER_PLACEHOLDER/$VER/g" distribution.xml
+
+          productbuild \
+            --distribution distribution.xml \
+            --package-path . \
+            --sign - \
+            "RapidProxy-darwin-${{ matrix.arch }}.pkg"
+
+          rm -rf pkgroot RapidProxy-component.pkg distribution.xml
+          ls -l RapidProxy-darwin-*.pkg
+
+      # ---------------- Linux：AppImage + 便携 tar.gz ----------------
       - name: Package (Linux)
         if: runner.os == 'Linux'
         shell: bash
         run: |
+          set -e
           dest="RapidProxy-linux-${{ matrix.arch }}"
           mkdir "$dest"
           cp build/bin/RapidProxy "$dest/"
@@ -102,13 +171,48 @@ jobs:
           cp README.md LICENSE "$dest/"
           tar czf "$dest.tar.gz" "$dest"
 
+          # ---- AppImage ----
+          # AppDir 布局：AppRun + .desktop + 图标
+          mkdir -p AppDir/usr/bin
+          cp build/bin/RapidProxy AppDir/rapidproxy
+          chmod +x AppDir/rapidproxy
+          cp build/appicon.png AppDir/rapidproxy.png
+
+          cat > AppDir/rapidproxy.desktop <<'DESKTOP'
+          [Desktop Entry]
+          Type=Application
+          Name=RapidProxy
+          Comment=OpenAI-compatible API proxy for WorkBuddy / CodeBuddy
+          Exec=rapidproxy
+          Icon=rapidproxy
+          Categories=Network;Development;Utility;
+          Terminal=false
+          DESKTOP
+
+          cat > AppDir/AppRun <<'APPRUN'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/rapidproxy" "$@"
+          APPRUN
+          chmod +x AppDir/AppRun
+
+          # 无 FUSE 的 runner 上用 --appimage-extract-and-run 执行打包工具
+          curl -sL -o appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ./appimagetool --appimage-extract-and-run AppDir "RapidProxy-linux-${{ matrix.arch }}.AppImage"
+          ls -l RapidProxy-linux-*.AppImage
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: RapidProxy-${{ matrix.os }}-${{ matrix.arch }}
           path: |
             RapidProxy-*.zip
+            RapidProxy-*.exe
             RapidProxy-*.tar.gz
+            RapidProxy-*.pkg
+            RapidProxy-*.AppImage
           if-no-files-found: error
 
   release:

@@ -48,13 +48,13 @@
 
 ### 方式一：下载预编译包（推荐）
 
-到 [Releases](https://github.com/znsoftm/RapidProxy/releases) 下载对应平台压缩包，解压即用：
+到 [Releases](https://github.com/znsoftm/RapidProxy/releases) 下载对应平台的**安装包**（或便携压缩包）：
 
-| 平台 | 文件 | 备注 |
-|---|---|---|
-| Windows | `RapidProxy-windows-amd64.zip` | 需要 WebView2 Runtime（Win10/11 一般自带） |
-| macOS (Intel + Apple Silicon) | `RapidProxy-darwin-universal.tar.gz` | 通用二进制，解压后把 `RapidProxy.app` 拖入「应用程序」 |
-| Linux | `RapidProxy-linux-amd64.tar.gz` | 需要 WebKitGTK（`libwebkit2gtk-4.0`） |
+| 平台 | 安装包 | 便携包 | 备注 |
+|---|---|---|---|
+| Windows | `RapidProxy-windows-amd64-setup.exe`（NSIS 安装向导） | `RapidProxy-windows-amd64.zip` | 需要 WebView2 Runtime（Win10/11 一般自带） |
+| macOS (Intel + Apple Silicon) | `RapidProxy-darwin-universal.pkg`（安装向导，双击安装到「应用程序」） | `RapidProxy-darwin-universal.tar.gz` | 通用二进制；便携方式解压后把 `RapidProxy.app` 拖入「应用程序」 |
+| Linux | `RapidProxy-linux-amd64.AppImage`（免安装，`chmod +x` 后直接运行） | `RapidProxy-linux-amd64.tar.gz` | 需要 WebKitGTK（`libwebkit2gtk-4.0`）；AppImage 未捆绑系统 WebView 运行库 |
 
 ### 方式二：源码构建
 

@@ -326,8 +326,7 @@ func TestTolerantPathSuffixRouting(t *testing.T) {
 	}
 }
 
-// 同一模型 ID 被多个启用上游提供时，/v1/models 应输出 "provider:model"
-// 前缀形式区分国际版/国内版；独有模型保持原 ID。
+// 多上游启用时：国际版模型统一加 intl: 前缀，国内版保持裸 ID（默认路由）。
 func TestAllModelsTagsSharedModelIDs(t *testing.T) {
 	srv, _ := newTestServer(t, func(cfg *config.Config) {
 		for i := range cfg.Profiles {
@@ -348,18 +347,31 @@ func TestAllModelsTagsSharedModelIDs(t *testing.T) {
 		got[m.ID] = m.Provider
 	}
 
-	if got["workbuddy:shared-model"] != "workbuddy" || got["codebuddy:shared-model"] != "codebuddy" {
-		t.Fatalf("重名模型应带上游前缀且各保留一份，实际 %v", got)
+	if got["intl:shared-model"] != "workbuddy" || got["intl:only-wb"] != "workbuddy" {
+		t.Fatalf("国际版模型应统一带 intl: 前缀，实际 %v", got)
 	}
-	if got["only-wb"] != "workbuddy" || got["only-cb"] != "codebuddy" {
-		t.Fatalf("独有模型应保持原 ID，实际 %v", got)
+	if got["shared-model"] != "codebuddy" || got["only-cb"] != "codebuddy" {
+		t.Fatalf("国内版模型应保持裸 ID，实际 %v", got)
 	}
-	if _, ok := got["shared-model"]; ok {
-		t.Error("重名模型不应再输出裸 ID")
+	if _, ok := got["workbuddy:shared-model"]; ok {
+		t.Error("不应再使用 workbuddy: 前缀（国际版统一为 intl:）")
 	}
 }
 
-// 前缀形式的模型 ID 应能被路由解析到对应上游。
+// 仅启用单个上游时，所有模型保持裸 ID。
+func TestAllModelsPlainWhenSingleProvider(t *testing.T) {
+	srv, _ := newTestServer(t, nil) // 默认仅 workbuddy 启用
+	srv.setModels("workbuddy", []upstream.ModelInfo{
+		{ID: "solo", Name: "Solo"},
+	})
+	for _, m := range srv.AllModels() {
+		if m.ID != "solo" {
+			t.Fatalf("单上游时不应加前缀，实际 %s", m.ID)
+		}
+	}
+}
+
+// 前缀形式的模型 ID 应能被路由解析到对应上游（含国际版 intl 别名）。
 func TestResolveModelWithProviderPrefix(t *testing.T) {
 	srv, _ := newTestServer(t, func(cfg *config.Config) {
 		for i := range cfg.Profiles {
@@ -367,11 +379,31 @@ func TestResolveModelWithProviderPrefix(t *testing.T) {
 		}
 	})
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
 	profile, model, err := srv.resolveModel("codebuddy:shared-model", req)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if profile.ID != "codebuddy" || model != "shared-model" {
 		t.Fatalf("应解析为 codebuddy/shared-model，实际 %s/%s", profile.ID, model)
+	}
+
+	// 国际版 intl 别名
+	profile, model, err = srv.resolveModel("intl:shared-model", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.ID != "workbuddy" || model != "shared-model" {
+		t.Fatalf("intl: 应解析为 workbuddy/shared-model，实际 %s/%s", profile.ID, model)
+	}
+
+	// X-RapidProxy-Provider 头同样兼容 intl
+	req.Header.Set("X-RapidProxy-Provider", "intl")
+	profile, model, err = srv.resolveModel("shared-model", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if profile.ID != "workbuddy" || model != "shared-model" {
+		t.Fatalf("请求头 intl 应解析为 workbuddy，实际 %s/%s", profile.ID, model)
 	}
 }

@@ -19,8 +19,8 @@
 - **图形化登录**：内置 WorkBuddy（`www.workbuddy.ai`）与 CodeBuddy（`copilot.tencent.com`）两个上游预设，点「登录」打开浏览器完成授权（Google / GitHub / 扫码），令牌自动保存并自动刷新。
 - **OpenAI 兼容服务**：提供 `/v1/models`、`/v1/chat/completions`（及不带 `/v1` 的等价路径）与 `/healthz`，流式与非流式请求都支持（上游仅提供流式接口，程序在服务端自动聚合）。
 - **多账号负载均衡**：同一上游可登录多个账号，请求按序轮询；单个账号令牌失效自动刷新，401/403 自动重试。
-- **多上游路由**：模型名直接写（自动匹配）、或用 `上游ID:模型名` / `上游ID/模型名` 前缀显式指定；也可用请求头 `X-RapidProxy-Provider` 或 `?provider=` 强制路由，`X-RapidProxy-Account` 指定账号。
-- **同名模型自动区分**：同一模型 ID 被多个已启用上游提供时（如国际版与国内版都登录），`/v1/models` 会输出为 `上游ID:模型名` 形式各保留一份，客户端里可直接选中指定上游的副本；仅单个上游提供的模型保持原 ID。
+- **多上游路由**：模型名直接写（自动匹配）、或用 `上游ID:模型名` / `上游ID/模型名` 前缀显式指定（国际版可用 `intl:` 简写）；也可用请求头 `X-RapidProxy-Provider`（兼容 `intl`）或 `?provider=` 强制路由，`X-RapidProxy-Account` 指定账号。
+- **国际版/国内版模型区分**：多个上游同时启用时，国际版（workbuddy）的模型统一以 `intl:模型名` 呈现，国内版（codebuddy）保持裸模型名作为默认路由；仅启用单个上游时全部保持原 ID。
 - **API Key 鉴权**：可配置多个 Key，支持一键生成；不配置则无需密钥（建议仅本机监听时使用）。
 - **内置 + 自动同步模型清单**：内置白名单保证上游配置接口漏报时仍可调用；定期从上游拉取新模型，也支持手动「额外模型」与「禁用模型」。
 - **深度思考与工具调用**：`hy3` 系列自动按最高思考档请求；`delta.reasoning_content` 原样透传；OpenAI 风格 `tool_calls` 增量按 `index` 正确合并。
@@ -151,9 +151,10 @@ print(resp.choices[0].message.content)
 ### 多上游 / 多账号路由
 
 ```bash
-# 显式指定上游（workbuddy / codebuddy），两种写法等价
+# 显式指定上游（国际版可用 intl 简写），两种写法等价
 curl ... -d '{"model":"codebuddy:glm-5.3", ...}'
 curl ... -d '{"model":"codebuddy/glm-5.3", ...}'
+curl ... -d '{"model":"intl:claude-sonnet-4-5", ...}'
 
 # 或用请求头 / 查询参数
 curl ... -H "X-RapidProxy-Provider: codebuddy" -d '{"model":"glm-5.3", ...}'

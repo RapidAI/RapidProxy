@@ -227,30 +227,30 @@ func (s *Server) ModelsFor(providerID string) []upstream.ModelInfo {
 }
 
 // AllModels 汇总所有已启用上游的模型。
-// 同一模型 ID 被多个启用上游同时提供时，各上游的副本输出为 "provider:model"
-// 前缀形式（路由端可解析该形式），方便客户端区分国际版/国内版；
-// 仅被单个上游提供的模型保持原始 ID，旧配置完全兼容。
+//
+// 命名规则：多个上游同时启用时，国际版（workbuddy）的模型统一加 "intl:"
+// 前缀，国内版等其他上游保持裸模型名（裸名默认路由到国内版）；
+// 仅启用单个上游时全部保持原样。
 func (s *Server) AllModels() []openai.Model {
 	cfg := s.Config()
 	enabled := cfg.EnabledProfiles()
 
-	// 第一遍：统计每个模型 ID 被几个启用上游提供。
-	count := map[string]int{}
-	lists := make([][]upstream.ModelInfo, len(enabled))
-	for i, p := range enabled {
-		lists[i] = s.modelsFor(p.ID)
-		for _, m := range lists[i] {
-			count[m.ID]++
+	// 多上游场景下国际版需要前缀区分。
+	tag := map[string]bool{}
+	if len(enabled) > 1 {
+		for _, p := range enabled {
+			if p.ID == intlProviderID {
+				tag[p.ID] = true
+			}
 		}
 	}
 
-	// 第二遍：重名模型加 "provider:" 前缀，独有模型保持原 ID。
 	out := make([]openai.Model, 0, 32)
-	for i, p := range enabled {
-		for _, m := range lists[i] {
+	for _, p := range enabled {
+		for _, m := range s.modelsFor(p.ID) {
 			id := m.ID
-			if count[m.ID] > 1 {
-				id = p.ID + ":" + m.ID
+			if tag[p.ID] {
+				id = intlModelPrefix + ":" + m.ID
 			}
 			out = append(out, openai.Model{
 				ID:              id,
@@ -617,12 +617,35 @@ func (s *Server) pipeSSE(w http.ResponseWriter, resp *http.Response) {
 // 模型解析与账号选择
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// 模型命名与路由别名
+// -----------------------------------------------------------------------------
+
+const (
+	// intlModelPrefix 是国际版模型在多上游场景下的前缀；
+	// 国内版不使用前缀（裸模型名默认路由到国内版）。
+	intlModelPrefix = "intl"
+	// intlProviderID 是国际版的上游 ID。
+	intlProviderID = "workbuddy"
+)
+
+// profileByIDOrAlias 按上游 ID 解析配置，兼容国际版的 "intl" 别名。
+func (s *Server) profileByIDOrAlias(cfg *config.Config, id string) (config.Profile, bool) {
+	if p, ok := cfg.ProfileByID(id); ok {
+		return p, true
+	}
+	if id == intlModelPrefix {
+		return cfg.ProfileByID(intlProviderID)
+	}
+	return config.Profile{}, false
+}
+
 // resolveModel 把客户端传来的模型名映射到具体上游。
 //
 // 支持三种写法：
 //  1. 直接写模型名（按已启用上游的模型列表匹配）
-//  2. "上游ID:模型名" 或 "上游ID/模型名" 强制指定
-//  3. 请求头 X-RapidProxy-Provider 或查询参数 ?provider= 强制指定
+//  2. "上游ID:模型名" 或 "上游ID/模型名" 强制指定（国际版可用 "intl:模型名"）
+//  3. 请求头 X-RapidProxy-Provider 或查询参数 ?provider= 强制指定（同样兼容 intl）
 func (s *Server) resolveModel(name string, r *http.Request) (config.Profile, string, error) {
 	cfg := s.Config()
 	enabled := cfg.EnabledProfiles()
@@ -636,13 +659,13 @@ func (s *Server) resolveModel(name string, r *http.Request) (config.Profile, str
 		forced = strings.TrimSpace(r.URL.Query().Get("provider"))
 	}
 	if idx := strings.IndexAny(model, ":/"); idx > 0 {
-		if p, ok := cfg.ProfileByID(model[:idx]); ok && p.Enabled {
+		if p, ok := s.profileByIDOrAlias(cfg, model[:idx]); ok && p.Enabled {
 			forced = p.ID
 			model = model[idx+1:]
 		}
 	}
 	if forced != "" {
-		profile, ok := cfg.ProfileByID(forced)
+		profile, ok := s.profileByIDOrAlias(cfg, forced)
 		if !ok {
 			return config.Profile{}, "", fmt.Errorf("未知的上游: %s", forced)
 		}

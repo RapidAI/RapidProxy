@@ -149,10 +149,11 @@ jobs:
           XML
           sed -i '' -e "s/APP_ID_PLACEHOLDER/$APP_ID/g" -e "s/VER_PLACEHOLDER/$VER/g" distribution.xml
 
+          # productbuild 不支持 ad-hoc（--sign -），产出未签名 PKG：
+          # 首次打开若提示「无法验证开发者」，到 系统设置 → 隐私与安全性 → 仍要打开
           productbuild \
             --distribution distribution.xml \
             --package-path . \
-            --sign - \
             "RapidProxy-darwin-${{ matrix.arch }}.pkg"
 
           rm -rf pkgroot RapidProxy-component.pkg distribution.xml

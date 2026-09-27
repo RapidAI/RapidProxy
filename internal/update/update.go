@@ -268,13 +268,14 @@ func Download(ctx context.Context, client *http.Client, a Asset, dest string, pr
 
 // LaunchInstaller 启动已下载的安装包（不等待安装完成）。
 //
-//   - windows：直接运行 NSIS 安装向导（调用方随后应退出本程序，避免文件被占用）
+//   - windows：以 runas 启动 NSIS 安装向导（弹出 UAC 授权；调用方随后应退出
+//     本程序，避免文件被占用）
 //   - darwin：用 open 打开 PKG 安装器
 //   - linux：AppImage 不走安装器，由调用方做原地替换（返回 ErrNoInstaller）
 func LaunchInstaller(path string) error {
 	switch runtime.GOOS {
 	case "windows":
-		return exec.Command(path).Start()
+		return launchWindows(path)
 	case "darwin":
 		return exec.Command("open", path).Start()
 	default:

@@ -19,6 +19,11 @@
 ####
 ## !define REQUEST_EXECUTION_LEVEL "admin"            # Default "admin"  see also https://nsis.sourceforge.io/Docs/Chapter4.html
 ####
+## 清单用 asInvoker（user）：允许普通权限进程直接拉起安装包——旧版本的
+## 在线更新就是 fork/exec 本安装包，requireAdministrator 清单会被 Windows
+## 直接拒绝（requires elevation）。真正的提权在 .onInit 里做（自提权）。
+####
+!define REQUEST_EXECUTION_LEVEL "user"
 ## Include the wails tools
 ####
 !include "wails_tools.nsh"
@@ -74,6 +79,16 @@ InstallDir "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}" # .onInit �
 ShowInstDetails show # This will always show the installation details.
 
 Function .onInit
+    # 自提权：非提权会话（管理员普通运行、标准用户、旧版本在线更新直接
+    # exec 本安装包）在写 Program Files 前必须提升为管理员。用 runas 重新
+    # 拉起自己触发 UAC；用户取消授权则直接退出，不进安装向导。
+    UserInfo::GetAccountType
+    Pop $0
+    ${If} $0 != "admin"
+        ExecShell "runas" "$EXEPATH"
+        Quit
+    ${EndIf}
+
     # 注意：不使用 wails.checkArchitecture（它不支持 32 位系统）。
     ${If} ${AtLeastWin10}
         ; x86 / x64 均受支持
@@ -91,7 +106,10 @@ Function .onInit
 FunctionEnd
 
 Section
-    !insertmacro wails.setShellContext
+    # 本安装包始终以管理员身份运行（见 .onInit 自提权），且历史版本均按
+    # 全机（all）上下文安装，这里固定 all，保持与既有安装一致；
+    # 不用 wails.setShellContext（它会按 REQUEST_EXECUTION_LEVEL=user 走 current）。
+    SetShellVarContext all
 
     !insertmacro wails.webview2runtime
 
@@ -116,7 +134,8 @@ Section
 SectionEnd
 
 Section "uninstall"
-    !insertmacro wails.setShellContext
+    # 与安装侧一致：固定全机上下文（卸载器已随安装提权）。
+    SetShellVarContext all
 
     # 清理应用写入的开机自启动条目（HKCU Run 键，见 internal/autostart）
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RapidProxy"

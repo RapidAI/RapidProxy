@@ -103,9 +103,11 @@ jobs:
         run: |
           # 双架构合一安装包：安装时自动检测 x86/x64 选择对应 exe
           $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
+          # makensis 的 File 相对路径以脚本所在目录为基准（不是仓库根），
+          # 必须传 ..\..\bin\ 形式，等价于仓库根的 build\bin\。
           & $nsis `
-            -DARG_WAILS_AMD64_BINARY="build/bin/RapidProxy-amd64.exe" `
-            -DARG_RAPIDPROXY_386_BINARY="build/bin/RapidProxy-386.exe" `
+            -DARG_WAILS_AMD64_BINARY="..\..\bin\RapidProxy-amd64.exe" `
+            -DARG_RAPIDPROXY_386_BINARY="..\..\bin\RapidProxy-386.exe" `
             build/windows/installer/project.nsi
           if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败" }
 

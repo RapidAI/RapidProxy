@@ -78,6 +78,9 @@ type Config struct {
 	AutoStart *bool `json:"auto_start,omitempty"`
 	// LaunchAtLogin 开机自动启动程序（登录系统后静默运行在托盘），默认开启。
 	LaunchAtLogin *bool `json:"launch_at_login,omitempty"`
+	// Language 界面语言：system 跟随系统 / zh 简体中文 / en 英文。
+	// 保存的是「偏好」，实际语言由各侧自行解析（Go 侧见 internal/locale）。
+	Language string `json:"language,omitempty"`
 	// Profiles 是上游服务列表，顺序决定同名模型的优先级。
 	Profiles []Profile `json:"profiles"`
 
@@ -203,6 +206,11 @@ func (c *Config) normalize() {
 	// 一旦在这里把 0 重置成默认值，用户就永远关不掉同步。
 	if c.ModelSyncHours < 0 {
 		c.ModelSyncHours = 0
+	}
+	// Language 只认 system / zh / en；空值与未知值一律归一成 system（跟随系统）。
+	c.Language = strings.ToLower(strings.TrimSpace(c.Language))
+	if c.Language != "zh" && c.Language != "en" {
+		c.Language = "system"
 	}
 	if len(c.Profiles) == 0 {
 		c.Profiles = []Profile{WorkBuddyPreset(), CodeBuddyPreset()}

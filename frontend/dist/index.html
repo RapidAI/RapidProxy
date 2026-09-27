@@ -13,34 +13,34 @@
         <div class="brand-logo">R</div>
         <div class="brand-text">
           <strong>RapidProxy</strong>
-          <span>OpenAI 兼容网关</span>
+          <span data-i18n="brand.subtitle">OpenAI 兼容网关</span>
         </div>
       </div>
 
       <nav class="nav" id="nav">
-        <button class="nav-item active" data-tab="overview"><span class="nav-dot"></span>概览</button>
-        <button class="nav-item" data-tab="accounts"><span class="nav-dot"></span>账号</button>
-        <button class="nav-item" data-tab="models"><span class="nav-dot"></span>模型</button>
-        <button class="nav-item" data-tab="settings"><span class="nav-dot"></span>设置</button>
-        <button class="nav-item" data-tab="about"><span class="nav-dot"></span>关于</button>
+        <button class="nav-item active" data-tab="overview"><span class="nav-dot"></span><span data-i18n="nav.overview">概览</span></button>
+        <button class="nav-item" data-tab="accounts"><span class="nav-dot"></span><span data-i18n="nav.accounts">账号</span></button>
+        <button class="nav-item" data-tab="models"><span class="nav-dot"></span><span data-i18n="nav.models">模型</span></button>
+        <button class="nav-item" data-tab="settings"><span class="nav-dot"></span><span data-i18n="nav.settings">设置</span></button>
+        <button class="nav-item" data-tab="about"><span class="nav-dot"></span><span data-i18n="nav.about">关于</span></button>
       </nav>
 
       <div class="sidebar-footer">
         <div class="version" id="version">v-</div>
-        <button class="btn btn-ghost btn-block" id="btn-quit">退出程序</button>
+        <button class="btn btn-ghost btn-block" id="btn-quit" data-i18n="btn.quit">退出程序</button>
       </div>
     </aside>
 
     <main class="main">
       <header class="topbar">
         <div class="status-group">
-          <span class="status-pill" id="status-pill"><i></i><em>已停止</em></span>
+          <span class="status-pill" id="status-pill"><i></i><em data-i18n="status.stopped">已停止</em></span>
           <span class="status-addr" id="status-addr">-</span>
         </div>
         <div class="topbar-actions">
-          <button class="btn btn-ghost" id="btn-reset-window" title="窗口超出屏幕时把窗口缩小并居中">重置窗口</button>
-          <button class="btn btn-ghost" id="btn-hide">最小化到托盘</button>
-          <button class="btn btn-primary" id="btn-toggle">启动服务</button>
+          <button class="btn btn-ghost" id="btn-reset-window" data-i18n="btn.resetWindow" data-i18n-title="btn.resetWindow.tip" title="窗口超出屏幕时把窗口缩小并居中">重置窗口</button>
+          <button class="btn btn-ghost" id="btn-hide" data-i18n="btn.hide">最小化到托盘</button>
+          <button class="btn btn-primary" id="btn-toggle" data-i18n="btn.start">启动服务</button>
         </div>
       </header>
 
@@ -49,37 +49,37 @@
         <section class="tab active" id="tab-overview">
           <div class="card highlight">
             <div class="card-head">
-              <h2>接入信息</h2>
-              <span class="hint">把下面两项填入任意支持自定义 API 的软件</span>
+              <h2 data-i18n="ov.access.title">接入信息</h2>
+              <span class="hint" data-i18n="ov.access.hint">把下面两项填入任意支持自定义 API 的软件</span>
             </div>
             <div class="field-row">
               <label>OpenAI Base URL</label>
               <div class="copy-line">
                 <code id="info-openai-url">-</code>
-                <button class="btn btn-mini" data-copy="info-openai-url">复制</button>
+                <button class="btn btn-mini" data-copy="info-openai-url" data-i18n="btn.copy">复制</button>
               </div>
             </div>
             <div class="field-row">
               <label>API Key</label>
               <div class="copy-line">
                 <code id="info-api-key">-</code>
-                <button class="btn btn-mini" id="btn-eye">显示</button>
-                <button class="btn btn-mini" data-copy="info-api-key">复制</button>
-                <button class="btn btn-mini" id="btn-regen-key">重新生成</button>
+                <button class="btn btn-mini" id="btn-eye" data-i18n="btn.show">显示</button>
+                <button class="btn btn-mini" data-copy="info-api-key" data-i18n="btn.copy">复制</button>
+                <button class="btn btn-mini" id="btn-regen-key" data-i18n="key.regen">重新生成</button>
               </div>
             </div>
             <div class="field-row">
-              <label>模型列表</label>
+              <label data-i18n="label.models">模型列表</label>
               <div class="copy-line">
                 <code id="info-models-url">-</code>
-                <button class="btn btn-mini" data-copy="info-models-url">复制</button>
+                <button class="btn btn-mini" data-copy="info-models-url" data-i18n="btn.copy">复制</button>
               </div>
             </div>
             <div class="field-row column">
-              <label>调用示例</label>
+              <label data-i18n="label.sample">调用示例</label>
               <pre class="code-block" id="info-sample">-</pre>
               <div class="row-actions">
-                <button class="btn btn-mini" data-copy="info-sample">复制示例</button>
+                <button class="btn btn-mini" data-copy="info-sample" data-i18n="btn.copySample">复制示例</button>
                 <span class="hint" id="info-require-key">-</span>
               </div>
             </div>
@@ -87,30 +87,30 @@
 
           <div class="grid-2">
             <div class="card">
-              <div class="card-head"><h2>服务状态</h2></div>
+              <div class="card-head"><h2 data-i18n="ov.status.title">服务状态</h2></div>
               <dl class="kv">
-                <div><dt>运行状态</dt><dd id="ov-running">-</dd></div>
-                <div><dt>监听地址</dt><dd id="ov-listen">-</dd></div>
-                <div><dt>可用模型</dt><dd id="ov-models">-</dd></div>
-                <div><dt>已登录账号</dt><dd id="ov-accounts">-</dd></div>
-                <div><dt>模型同步间隔</dt><dd id="ov-sync">-</dd></div>
+                <div><dt data-i18n="ov.dt.running">运行状态</dt><dd id="ov-running">-</dd></div>
+                <div><dt data-i18n="ov.dt.listen">监听地址</dt><dd id="ov-listen">-</dd></div>
+                <div><dt data-i18n="ov.dt.models">可用模型</dt><dd id="ov-models">-</dd></div>
+                <div><dt data-i18n="ov.dt.accounts">已登录账号</dt><dd id="ov-accounts">-</dd></div>
+                <div><dt data-i18n="ov.dt.sync">模型同步间隔</dt><dd id="ov-sync">-</dd></div>
               </dl>
               <div class="row-actions">
-                <button class="btn btn-mini" id="btn-refresh">立即同步模型</button>
-                <button class="btn btn-mini" id="btn-open-dir">打开数据目录</button>
+                <button class="btn btn-mini" id="btn-refresh" data-i18n="btn.syncNow">立即同步模型</button>
+                <button class="btn btn-mini" id="btn-open-dir" data-i18n="btn.openDataDir">打开数据目录</button>
               </div>
             </div>
 
             <div class="card">
-              <div class="card-head"><h2>上游</h2></div>
+              <div class="card-head"><h2 data-i18n="ov.providers.title">上游</h2></div>
               <div class="provider-list" id="ov-providers"></div>
             </div>
           </div>
 
           <div class="card">
             <div class="card-head">
-              <h2>运行日志</h2>
-              <button class="btn btn-mini" id="btn-clear-log">清空</button>
+              <h2 data-i18n="ov.logs.title">运行日志</h2>
+              <button class="btn btn-mini" id="btn-clear-log" data-i18n="btn.clear">清空</button>
             </div>
             <pre class="log-view" id="log-view"></pre>
           </div>
@@ -120,27 +120,27 @@
         <section class="tab" id="tab-accounts">
           <div class="card">
             <div class="card-head">
-              <h2>登录账号</h2>
-              <span class="hint">登录后即可把该平台背后的模型作为 OpenAI 接口使用</span>
+              <h2 data-i18n="acc.login.title">登录账号</h2>
+              <span class="hint" data-i18n="acc.login.hint">登录后即可把该平台背后的模型作为 OpenAI 接口使用</span>
             </div>
             <div class="provider-picker" id="login-providers"></div>
 
             <div class="login-box hidden" id="login-box">
               <div class="login-status">
                 <span class="spinner" id="login-spinner"></span>
-                <strong id="login-title">等待登录</strong>
+                <strong id="login-title" data-i18n="login.waiting">等待登录</strong>
                 <span class="hint" id="login-message"></span>
               </div>
               <div class="login-frame-tip">
-                <span class="hint">已在你系统的默认浏览器中打开官方登录页（Google / GitHub / 微信扫码）。在浏览器里完成授权后，本程序会自动感知并保存凭据；若浏览器没有自动打开，可复制下方链接手动访问。</span>
+                <span class="hint" data-i18n="login.browserTip">已在你系统的默认浏览器中打开官方登录页（Google / GitHub / 微信扫码）。在浏览器里完成授权后，本程序会自动感知并保存凭据；若浏览器没有自动打开，可复制下方链接手动访问。</span>
               </div>
               <div class="copy-line">
                 <code id="login-url">-</code>
-                <button class="btn btn-mini" data-copy="login-url">复制链接</button>
+                <button class="btn btn-mini" data-copy="login-url" data-i18n="btn.copyLink">复制链接</button>
               </div>
               <div class="row-actions">
-                <button class="btn btn-mini" id="btn-open-login">重新打开登录页</button>
-                <button class="btn btn-mini" id="btn-cancel-login">取消</button>
+                <button class="btn btn-mini" id="btn-open-login" data-i18n="btn.reopenLogin">重新打开登录页</button>
+                <button class="btn btn-mini" id="btn-cancel-login" data-i18n="btn.cancel">取消</button>
                 <span class="hint" id="login-expires"></span>
               </div>
             </div>
@@ -148,7 +148,7 @@
 
           <div class="card">
             <div class="card-head">
-              <h2>已登录账号</h2>
+              <h2 data-i18n="acc.list.title">已登录账号</h2>
               <span class="hint" id="accounts-count"></span>
             </div>
             <div class="account-list" id="account-list"></div>
@@ -159,16 +159,23 @@
         <section class="tab" id="tab-models">
           <div class="card">
             <div class="card-head">
-              <h2>可用模型</h2>
+              <h2 data-i18n="models.title">可用模型</h2>
               <div class="row-actions">
-                <input class="input" id="model-search" placeholder="搜索模型…" />
-                <button class="btn btn-mini" id="btn-sync-models">立即同步</button>
+                <input class="input" id="model-search" data-i18n-ph="models.search" placeholder="搜索模型…" />
+                <button class="btn btn-mini" id="btn-sync-models" data-i18n="btn.sync">立即同步</button>
               </div>
             </div>
             <div class="table-wrap">
               <table class="table">
                 <thead>
-                  <tr><th>模型 ID</th><th>名称</th><th>上游</th><th>上下文</th><th>最大输出</th><th>图片</th></tr>
+                  <tr>
+                    <th data-i18n="th.id">模型 ID</th>
+                    <th data-i18n="th.name">名称</th>
+                    <th data-i18n="th.provider">上游</th>
+                    <th data-i18n="th.context">上下文</th>
+                    <th data-i18n="th.maxOut">最大输出</th>
+                    <th data-i18n="th.images">图片</th>
+                  </tr>
                 </thead>
                 <tbody id="model-body"></tbody>
               </table>
@@ -179,62 +186,71 @@
         <!-- 设置 -->
         <section class="tab" id="tab-settings">
           <div class="card">
-            <div class="card-head"><h2>服务设置</h2></div>
+            <div class="card-head"><h2 data-i18n="set.service.title">服务设置</h2></div>
             <div class="form-grid">
               <label class="form-item">
-                <span>监听地址</span>
-                <input class="input" id="set-listen" placeholder="127.0.0.1:8787" />
-                <em>只监听本机时填写 127.0.0.1:端口</em>
+                <span data-i18n="set.language">语言</span>
+                <select class="input" id="set-language">
+                  <option value="system" data-i18n="set.language.system">跟随系统</option>
+                  <option value="zh" data-i18n="set.language.zh">简体中文</option>
+                  <option value="en" data-i18n="set.language.en">English</option>
+                </select>
+                <em data-i18n="set.language.hint">修改后立即生效，托盘菜单同步切换</em>
               </label>
               <label class="form-item">
-                <span>模型同步间隔（小时）</span>
+                <span data-i18n="set.syncHours">模型同步间隔（小时）</span>
                 <input class="input" id="set-sync" type="number" min="0" max="168" />
-                <em>填 0 表示不自动同步</em>
+                <em data-i18n="set.syncHours.hint">填 0 表示不自动同步</em>
+              </label>
+              <label class="form-item">
+                <span data-i18n="set.listen">监听地址</span>
+                <input class="input" id="set-listen" placeholder="127.0.0.1:8787" />
+                <em data-i18n="set.listen.hint">只监听本机时填写 127.0.0.1:端口</em>
               </label>
             </div>
             <div class="switch-list">
-              <label class="switch"><input type="checkbox" id="set-cors" /><span>允许浏览器跨域调用（CORS）</span></label>
-              <label class="switch"><input type="checkbox" id="set-sanitize" /><span>自动规避上游内容审核的固定模板句</span></label>
-              <label class="switch"><input type="checkbox" id="set-thinking" /><span>hy3 系列强制使用最高档思考</span></label>
-              <label class="switch"><input type="checkbox" id="set-autostart" /><span>打开程序时自动启动服务</span></label>
-              <label class="switch"><input type="checkbox" id="set-launch" /><span>开机自动启动（登录系统后静默运行在托盘）</span></label>
+              <label class="switch"><input type="checkbox" id="set-cors" /><span data-i18n="set.cors">允许浏览器跨域调用（CORS）</span></label>
+              <label class="switch"><input type="checkbox" id="set-sanitize" /><span data-i18n="set.sanitize">自动规避上游内容审核的固定模板句</span></label>
+              <label class="switch"><input type="checkbox" id="set-thinking" /><span data-i18n="set.thinking">hy3 系列强制使用最高档思考</span></label>
+              <label class="switch"><input type="checkbox" id="set-autostart" /><span data-i18n="set.autostart">打开程序时自动启动服务</span></label>
+              <label class="switch"><input type="checkbox" id="set-launch" /><span data-i18n="set.launch">开机自动启动（登录系统后静默运行在托盘）</span></label>
             </div>
           </div>
 
           <div class="card">
             <div class="card-head">
-              <h2>上游配置</h2>
-              <span class="hint">启用后其模型才会出现在 /v1/models 中</span>
+              <h2 data-i18n="set.upstream.title">上游配置</h2>
+              <span class="hint" data-i18n="set.upstream.hint">启用后其模型才会出现在 /v1/models 中</span>
             </div>
             <div class="provider-config" id="provider-config"></div>
           </div>
 
           <div class="card">
             <div class="card-head">
-              <h2>API Key</h2>
-              <span class="hint">留空表示不校验；设置后客户端必须携带</span>
+              <h2 data-i18n="set.key.title">API Key</h2>
+              <span class="hint" data-i18n="set.key.hint">留空表示不校验；设置后客户端必须携带</span>
             </div>
             <div class="key-list" id="key-list"></div>
             <div class="copy-line">
-              <input class="input" id="new-key" placeholder="粘贴自定义密钥，或点右侧生成" />
-              <button class="btn btn-mini" id="btn-add-key">添加</button>
-              <button class="btn btn-mini" id="btn-gen-key">随机生成</button>
+              <input class="input" id="new-key" data-i18n-ph="set.key.newPlaceholder" placeholder="粘贴自定义密钥，或点右侧生成" />
+              <button class="btn btn-mini" id="btn-add-key" data-i18n="btn.add">添加</button>
+              <button class="btn btn-mini" id="btn-gen-key" data-i18n="btn.genKey">随机生成</button>
             </div>
           </div>
 
           <div class="card">
-            <div class="card-head"><h2>文件位置</h2></div>
+            <div class="card-head"><h2 data-i18n="set.paths.title">文件位置</h2></div>
             <dl class="kv">
-              <div><dt>数据目录</dt><dd class="mono" id="path-data">-</dd></div>
-              <div><dt>配置文件</dt><dd class="mono" id="path-config">-</dd></div>
-              <div><dt>凭据目录</dt><dd class="mono" id="path-accounts">-</dd></div>
-              <div><dt>日志文件</dt><dd class="mono" id="path-log">-</dd></div>
-              <div><dt>程序版本</dt><dd id="path-version">-</dd></div>
+              <div><dt data-i18n="set.paths.data">数据目录</dt><dd class="mono" id="path-data">-</dd></div>
+              <div><dt data-i18n="set.paths.config">配置文件</dt><dd class="mono" id="path-config">-</dd></div>
+              <div><dt data-i18n="set.paths.accounts">凭据目录</dt><dd class="mono" id="path-accounts">-</dd></div>
+              <div><dt data-i18n="set.paths.log">日志文件</dt><dd class="mono" id="path-log">-</dd></div>
+              <div><dt data-i18n="set.paths.version">程序版本</dt><dd id="path-version">-</dd></div>
             </dl>
           </div>
 
           <div class="save-bar">
-            <button class="btn btn-primary" id="btn-save">保存设置</button>
+            <button class="btn btn-primary" id="btn-save" data-i18n="btn.save">保存设置</button>
             <span class="hint" id="save-hint"></span>
           </div>
         </section>
@@ -246,31 +262,31 @@
               <div class="brand-logo about-logo">R</div>
               <div class="about-title">
                 <h2>RapidProxy</h2>
-                <span class="hint">把 WorkBuddy / CodeBuddy 背后的模型封装成 OpenAI 兼容的本地网关</span>
+                <span class="hint" data-i18n="about.tagline">把 WorkBuddy / CodeBuddy 背后的模型封装成 OpenAI 兼容的本地网关</span>
               </div>
             </div>
             <dl class="kv about-kv">
-              <div><dt>当前版本</dt><dd id="about-version">-</dd></div>
-              <div><dt>运行平台</dt><dd id="about-platform">-</dd></div>
-              <div><dt>作者</dt><dd>Dr. Daniel</dd></div>
-              <div><dt>版权所有</dt><dd>© 2026 RapidAI Team</dd></div>
+              <div><dt data-i18n="about.version">当前版本</dt><dd id="about-version">-</dd></div>
+              <div><dt data-i18n="about.platform">运行平台</dt><dd id="about-platform">-</dd></div>
+              <div><dt data-i18n="about.author">作者</dt><dd>Dr. Daniel</dd></div>
+              <div><dt data-i18n="about.copyright">版权所有</dt><dd>© 2026 RapidAI Team</dd></div>
             </dl>
             <div class="row-actions about-actions">
-              <button class="btn btn-mini" id="btn-open-repo">访问 GitHub 仓库</button>
-              <span class="hint">本项目基于开源协议发布，请遵守上游服务的使用条款</span>
+              <button class="btn btn-mini" id="btn-open-repo" data-i18n="btn.openRepo">访问 GitHub 仓库</button>
+              <span class="hint" data-i18n="about.licenseHint">本项目基于开源协议发布，请遵守上游服务的使用条款</span>
             </div>
           </div>
 
           <div class="card">
             <div class="card-head">
-              <h2>软件更新</h2>
-              <span class="hint">检查 GitHub Releases 上的新版本</span>
+              <h2 data-i18n="about.update.title">软件更新</h2>
+              <span class="hint" data-i18n="about.update.hint">检查 GitHub Releases 上的新版本</span>
             </div>
             <div class="upd-row">
-              <span id="upd-status">当前版本 v-</span>
+              <span id="upd-status">-</span>
               <span class="row-actions">
-                <button class="btn btn-mini" id="btn-check-update">检查更新</button>
-                <button class="btn btn-primary btn-mini hidden" id="btn-do-update">下载并安装</button>
+                <button class="btn btn-mini" id="btn-check-update" data-i18n="btn.checkUpdate">检查更新</button>
+                <button class="btn btn-primary btn-mini hidden" id="btn-do-update" data-i18n="btn.doUpdate">下载并安装</button>
               </span>
             </div>
             <div class="progress hidden" id="upd-progress">
@@ -284,6 +300,7 @@
   </div>
 
   <div class="toast" id="toast"></div>
+  <script src="i18n.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -21,6 +21,7 @@ import (
 	"github.com/znsoftm/RapidProxy/internal/applog"
 	"github.com/znsoftm/RapidProxy/internal/autostart"
 	"github.com/znsoftm/RapidProxy/internal/config"
+	"github.com/znsoftm/RapidProxy/internal/locale"
 	"github.com/znsoftm/RapidProxy/internal/proxysrv"
 	"github.com/znsoftm/RapidProxy/internal/store"
 	"github.com/znsoftm/RapidProxy/internal/tray"
@@ -38,7 +39,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.2.3"
+const Version = "1.2.4"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -111,12 +112,14 @@ type SettingsView struct {
 	MaxThinking    bool   `json:"maxThinking"`
 	AutoStart      bool   `json:"autoStart"`
 	LaunchAtLogin  bool   `json:"launchAtLogin"`
-	ConfigPath     string `json:"configPath"`
-	DataDir        string `json:"dataDir"`
-	LogPath        string `json:"logPath"`
-	AccountDir     string `json:"accountDir"`
-	Version        string `json:"version"`
-	Platform       string `json:"platform"`
+	// Language 是界面语言偏好：system / zh / en（前端据此渲染界面）。
+	Language   string `json:"language"`
+	ConfigPath string `json:"configPath"`
+	DataDir    string `json:"dataDir"`
+	LogPath    string `json:"logPath"`
+	AccountDir string `json:"accountDir"`
+	Version    string `json:"version"`
+	Platform   string `json:"platform"`
 }
 
 // StateView 是界面一次拉取的全部状态。
@@ -236,6 +239,8 @@ func NewApp() *App {
 		// 带上路径，否则界面上的「配置文件路径」会是空的，保存时也会写到别处。
 		cfg = config.DefaultAt(cfgPath)
 	}
+	// 界面语言尽早定下来：托盘菜单、更新提示等 Go 侧文案在窗口出现前后都会用到。
+	locale.Set(locale.FromPref(cfg.Language))
 
 	credStore, err := store.New(dataDir)
 	if err != nil {
@@ -298,7 +303,7 @@ func (a *App) startup(ctx context.Context) {
 			a.emitUpdate(UpdateView{
 				Phase: "available", Current: Version, Latest: rel.Version,
 				HasUpdate: true, Page: rel.Page, AssetName: rel.Asset.Name, Notes: rel.Notes,
-				Message: fmt.Sprintf("发现新版本 v%s，可在「设置」页下载安装", rel.Version),
+				Message: locale.T("upd.availableSettings", rel.Version),
 			})
 		}
 	}()
@@ -378,9 +383,9 @@ func (a *App) hintTrayOnce(ctx context.Context) {
 	}
 	_, _ = wailsrt.MessageDialog(ctx, wailsrt.MessageDialogOptions{
 		Type:    wailsrt.InfoDialog,
-		Title:   "RapidProxy 仍在运行",
-		Message: "程序已最小化到系统托盘，代理服务继续在后台运行。\n\n要重新打开界面，请点击或双击托盘图标；要完全退出，请在托盘图标右键菜单中选择「退出」。",
-		Buttons: []string{"知道了"},
+		Title:   locale.T("dlg.minimized.title"),
+		Message: locale.T("dlg.minimized.msg"),
+		Buttons: []string{locale.T("dlg.minimized.ok")},
 	})
 }
 
@@ -600,6 +605,7 @@ func (a *App) GetState() StateView {
 		MaxThinking:    cfg.MaxThinkingEnabled(),
 		AutoStart:      cfg.AutoStartEnabled(),
 		LaunchAtLogin:  cfg.LaunchAtLoginEnabled(),
+		Language:       cfg.Language,
 		ConfigPath:     cfg.Path(),
 		DataDir:        a.dataDir,
 		LogPath:        a.log.FilePath(),
@@ -804,11 +810,11 @@ func (a *App) GenerateAPIKey() (string, error) {
 func (a *App) AddAPIKey(key string) error {
 	key = strings.TrimSpace(key)
 	if key == "" {
-		return errors.New("API Key 不能为空")
+		return errors.New(locale.T("key.empty"))
 	}
 	cfg := a.settings().Clone()
 	if !cfg.AddAPIKey(key) {
-		return errors.New("该 API Key 已存在")
+		return errors.New(locale.T("key.duplicate"))
 	}
 	if err := cfg.Save(); err != nil {
 		return err
@@ -826,7 +832,7 @@ func (a *App) AddAPIKey(key string) error {
 func (a *App) RemoveAPIKey(key string) error {
 	cfg := a.settings().Clone()
 	if !cfg.RemoveAPIKey(key) {
-		return errors.New("未找到该 API Key")
+		return errors.New(locale.T("key.notFound"))
 	}
 	if err := cfg.Save(); err != nil {
 		return err
@@ -862,7 +868,7 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 	cfg := a.settings()
 	profile, ok := cfg.ProfileByID(provider)
 	if !ok {
-		return LoginView{}, fmt.Errorf("未知的上游: %s", provider)
+		return LoginView{}, fmt.Errorf("%s", locale.T("login.unknownProvider", provider))
 	}
 	client, err := a.srv.ClientFor(provider)
 	if err != nil {
@@ -884,7 +890,7 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 		session:      session,
 		cancel:       cancel,
 		status:       "pending",
-		message:      "已在系统浏览器打开官方登录页，请在该窗口完成授权",
+		message:      locale.T("login.browserOpened"),
 		parentOrigin: strings.TrimSpace(parentOrigin),
 	}
 	a.loginMu.Lock()
@@ -912,13 +918,13 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 	for {
 		select {
 		case <-ctx.Done():
-			a.finishLogin(run, "failed", "登录超时或已取消", "")
+			a.finishLogin(run, "failed", locale.T("login.timeout"), "")
 			return
 		case <-ticker.C:
 			cred, err := run.session.Poll(ctx)
 			if err != nil {
 				if errors.Is(err, upstream.ErrLoginTimeout) {
-					a.finishLogin(run, "failed", "登录链接已过期，请重新发起登录", "")
+					a.finishLogin(run, "failed", locale.T("login.expired"), "")
 					return
 				}
 				a.finishLogin(run, "failed", err.Error(), "")
@@ -928,11 +934,11 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 				continue
 			}
 			if err := a.store.Save(cred); err != nil {
-				a.finishLogin(run, "failed", "保存凭据失败: "+err.Error(), "")
+				a.finishLogin(run, "failed", locale.T("login.saveFailed", err.Error()), "")
 				return
 			}
 			a.log.Infof("登录成功: %s（%s）", cred.DisplayName(), cred.ID)
-			a.finishLogin(run, "success", "登录成功", cred.ID)
+			a.finishLogin(run, "success", locale.T("login.success"), cred.ID)
 			go func() {
 				refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 				defer cancel()
@@ -1168,7 +1174,7 @@ func (a *App) CheckUpdate() (UpdateView, error) {
 		a.updMu.Lock()
 		a.upd = nil
 		a.updMu.Unlock()
-		view.Phase, view.Message = "none", "当前已是最新版本"
+		view.Phase, view.Message = "none", locale.T("upd.latest")
 		a.emitUpdate(view)
 		return view, nil
 	}
@@ -1179,7 +1185,7 @@ func (a *App) CheckUpdate() (UpdateView, error) {
 	view.Phase = "available"
 	view.HasUpdate = true
 	view.AssetName = rel.Asset.Name
-	view.Message = fmt.Sprintf("发现新版本 v%s，可下载安装包（%s）", rel.Version, rel.Asset.Name)
+	view.Message = locale.T("upd.available", rel.Version, rel.Asset.Name)
 	a.log.Infof("检查到新版本 v%s（当前 %s）", rel.Version, Version)
 	a.emitUpdate(view)
 	return view, nil
@@ -1196,14 +1202,14 @@ func (a *App) DoUpdate() error {
 	rel := a.upd
 	a.updMu.Unlock()
 	if rel == nil {
-		return fmt.Errorf("请先检查更新")
+		return fmt.Errorf("%s", locale.T("upd.checkFirst"))
 	}
 
 	dest := filepath.Join(a.dataDir, "update", rel.Asset.Name)
 	a.emitUpdate(UpdateView{
 		Phase: "downloading", Current: Version, Latest: rel.Version,
 		AssetName: rel.Asset.Name, Progress: -1,
-		Message: "开始下载 " + rel.Asset.Name,
+		Message: locale.T("upd.downloadStart", rel.Asset.Name),
 	})
 
 	err := update.Download(context.Background(), nil, rel.Asset, dest, func(done, total int64) {
@@ -1214,12 +1220,12 @@ func (a *App) DoUpdate() error {
 		a.emitUpdate(UpdateView{
 			Phase: "downloading", Current: Version, Latest: rel.Version,
 			AssetName: rel.Asset.Name, Progress: pct,
-			Message: fmt.Sprintf("下载中 %s / %s", humanBytes(done), humanBytes(total)),
+			Message: locale.T("upd.downloading", humanBytes(done), humanBytes(total)),
 		})
 	})
 	if err != nil {
 		a.log.Errorf("下载更新失败: %v", err)
-		a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Latest: rel.Version, Message: "下载失败：" + err.Error()})
+		a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Latest: rel.Version, Message: locale.T("upd.downloadFailed", err.Error())})
 		return err
 	}
 	a.log.Infof("更新包已下载: %s", dest)
@@ -1228,11 +1234,11 @@ func (a *App) DoUpdate() error {
 		return a.applyLinuxUpdate(rel, dest)
 	}
 
-	a.emitUpdate(UpdateView{Phase: "installing", Current: Version, Latest: rel.Version, Message: "正在启动安装程序…"})
+	a.emitUpdate(UpdateView{Phase: "installing", Current: Version, Latest: rel.Version, Message: locale.T("upd.launching")})
 	a.log.Infof("启动安装程序: %s", dest)
 	if err := update.LaunchInstaller(dest); err != nil {
 		a.log.Errorf("启动安装程序失败: %v", err)
-		a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Latest: rel.Version, Message: "启动安装程序失败：" + err.Error()})
+		a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Latest: rel.Version, Message: locale.T("upd.launchFailed", err.Error())})
 		return err
 	}
 	a.log.Infof("安装程序已启动，程序即将退出")
@@ -1247,17 +1253,17 @@ func (a *App) applyLinuxUpdate(rel *update.Release, dest string) error {
 		exe, err = filepath.EvalSymlinks(exe)
 	}
 	if err == nil && strings.EqualFold(filepath.Ext(exe), ".appimage") {
-		a.emitUpdate(UpdateView{Phase: "installing", Current: Version, Latest: rel.Version, Message: "正在替换 AppImage…"})
+		a.emitUpdate(UpdateView{Phase: "installing", Current: Version, Latest: rel.Version, Message: locale.T("upd.replacingAppImage")})
 		if err := os.Chmod(dest, 0o755); err != nil {
-			a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Message: "设置执行权限失败：" + err.Error()})
+			a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Message: locale.T("upd.chmodFailed", err.Error())})
 			return err
 		}
 		if err := os.Rename(dest, exe); err != nil {
-			a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Message: "替换程序失败：" + err.Error()})
+			a.emitUpdate(UpdateView{Phase: "failed", Current: Version, Message: locale.T("upd.replaceFailed", err.Error())})
 			return err
 		}
 		a.log.Infof("AppImage 已替换为 v%s，正在重启", rel.Version)
-		a.emitUpdate(UpdateView{Phase: "done", Current: rel.Version, Latest: rel.Version, Message: "更新完成，正在重启…"})
+		a.emitUpdate(UpdateView{Phase: "done", Current: rel.Version, Latest: rel.Version, Message: locale.T("upd.doneRestarting")})
 		if err := exec.Command(exe).Start(); err != nil {
 			a.log.Warnf("自动重启失败，请手动启动: %v", err)
 		}
@@ -1268,7 +1274,7 @@ func (a *App) applyLinuxUpdate(rel *update.Release, dest string) error {
 	// 非 AppImage 运行方式（如源码/压缩包运行）：交给用户手动安装
 	a.emitUpdate(UpdateView{
 		Phase: "done", Current: Version, Latest: rel.Version,
-		Message: "安装包已下载到 " + dest + "，请手动运行安装",
+		Message: locale.T("upd.manualInstall", dest),
 	})
 	return nil
 }
@@ -1309,17 +1315,52 @@ func (a *App) OpenDataDir() {
 
 func humanDuration(d time.Duration) string {
 	if d <= 0 {
-		return "已过期"
+		return locale.T("dur.expired")
 	}
 	days := int(d.Hours()) / 24
 	hours := int(d.Hours()) % 24
 	minutes := int(d.Minutes()) % 60
 	switch {
 	case days > 0:
-		return fmt.Sprintf("%d 天 %d 小时后过期", days, hours)
+		return locale.T("dur.dayHour", days, hours)
 	case hours > 0:
-		return fmt.Sprintf("%d 小时 %d 分钟后过期", hours, minutes)
+		return locale.T("dur.hourMin", hours, minutes)
 	default:
-		return fmt.Sprintf("%d 分钟后过期", minutes)
+		return locale.T("dur.minute", minutes)
 	}
+}
+
+// -----------------------------------------------------------------------------
+// 语言
+// -----------------------------------------------------------------------------
+
+// SetLanguage 切换界面语言（system / zh / en）。
+//
+// 立即写回配置并刷新托盘菜单文案；前端收到新的 state 后会同步整页翻译。
+// 返回解析后的实际语言（zh / en），供前端直接应用翻译。
+func (a *App) SetLanguage(lang string) (string, error) {
+	v := strings.ToLower(strings.TrimSpace(lang))
+	switch v {
+	case locale.PrefSystem, locale.PrefZh, locale.PrefEn:
+	default:
+		return "", errors.New(locale.T("lang.invalid", lang))
+	}
+
+	cfg := a.settings().Clone()
+	cfg.Language = v
+	if err := cfg.Save(); err != nil {
+		a.log.Errorf("保存语言设置失败: %v", err)
+		return "", err
+	}
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+
+	locale.Set(locale.FromPref(v))
+	if a.tray != nil {
+		a.tray.Retitle()
+	}
+	a.log.Infof("界面语言已切换为 %s", locale.Current())
+	a.pushState()
+	return string(locale.Current()), nil
 }

@@ -3,10 +3,11 @@
 package singleton
 
 import (
-	"fmt"
 	"time"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/znsoftm/RapidProxy/internal/locale"
 )
 
 // mutexName 用户会话级命名互斥体：同一 Windows 会话内全局唯一，
@@ -106,9 +107,11 @@ func Activate(name string) bool {
 }
 
 // NotifyAlreadyRunning 弹出系统对话框提示用户程序已在运行。
+//
+// 该入口在配置加载之前（第二实例即将退出），语言只能按系统探测。
 func NotifyAlreadyRunning(name string) {
 	title, err16 := windows.UTF16PtrFromString(name)
-	text, err2 := windows.UTF16PtrFromString(fmt.Sprintf("%s 已经在运行了（见系统托盘）。\n无需重复启动。", name))
+	text, err2 := windows.UTF16PtrFromString(locale.T("dlg.alreadyRunning", name))
 	if err16 != nil || err2 != nil {
 		return
 	}

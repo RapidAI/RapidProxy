@@ -1,5 +1,6 @@
 /* RapidProxy 界面逻辑
- * 与 Go 后端通过 Wails 注入的 window.go.main.App.* 通信。 */
+ * 与 Go 后端通过 Wails 注入的 window.go.main.App.* 通信。
+ * 文案统一走 i18n.js 的 I18N.t()；语言偏好存于 Go 配置（设置页可切换）。 */
 
 const S = {
   state: null,
@@ -18,6 +19,8 @@ const el = (tag, cls, text) => {
   if (text !== undefined) node.textContent = text;
   return node;
 };
+/* 取当前语言文案的简写。 */
+const t = (key, params) => I18N.t(key, params);
 
 /* ------------------------------- 后端调用 ------------------------------- */
 
@@ -28,7 +31,7 @@ function backend() {
 async function call(method, ...args) {
   const api = backend();
   if (!api || typeof api[method] !== 'function') {
-    throw new Error('后端尚未就绪，请稍后重试');
+    throw new Error(t('toast.backendNotReady'));
   }
   return api[method](...args);
 }
@@ -56,9 +59,9 @@ async function copyFrom(node) {
   if (!value || value === '-') return;
   try {
     await call('CopyText', value);
-    toast('已复制到剪贴板');
+    toast(t('toast.copied'));
   } catch (err) {
-    toast('复制失败：' + err);
+    toast(t('toast.copyFailedFmt', { err: String(err) }));
   }
 }
 
@@ -79,13 +82,22 @@ function maskKey(key) {
 
 /* ------------------------------- 渲染 ------------------------------- */
 
+/* 每次渲染前同步语言偏好并刷新静态文案。
+ * 语言偏好保存在 Go 配置里（state.settings.language），这里同步到 I18N；
+ * localStorage 里还留有一份缓存供下次启动时提前生效（见 i18n.js）。 */
+function syncLanguage() {
+  const pref = (S.state && S.state.settings && S.state.settings.language) || 'system';
+  if (pref !== I18N.pref) I18N.setPref(pref);
+  I18N.apply();
+}
+
 function renderStatus() {
   const s = S.state;
   const pill = $('status-pill');
   pill.classList.toggle('on', !!s.running);
-  pill.querySelector('em').textContent = s.running ? '运行中' : '已停止';
-  $('status-addr').textContent = s.running ? s.openaiUrl : '服务未启动';
-  $('btn-toggle').textContent = s.running ? '停止服务' : '启动服务';
+  pill.querySelector('em').textContent = s.running ? t('status.running') : t('status.stopped');
+  $('status-addr').textContent = s.running ? s.openaiUrl : t('status.serviceDown');
+  $('btn-toggle').textContent = s.running ? t('btn.stop') : t('btn.start');
 }
 
 function renderAccess() {
@@ -104,31 +116,31 @@ function renderAccess() {
   const keyNode = $('info-api-key');
   const keys = s.apiKeys || [];
   if (keys.length === 0) {
-    keyNode.textContent = '未设置（任何密钥均可访问）';
+    keyNode.textContent = t('key.none');
     delete keyNode.dataset.raw;
-    $('btn-regen-key').textContent = '生成密钥';
+    $('btn-regen-key').textContent = t('key.gen');
     $('btn-eye').disabled = true;
   } else {
     keyNode.dataset.raw = keys[0];
     keyNode.textContent = S.revealKey ? keys[0] : maskKey(keys[0]);
     keyNode.classList.toggle('secret', !S.revealKey);
-    $('btn-regen-key').textContent = '重新生成';
+    $('btn-regen-key').textContent = t('key.regen');
     $('btn-eye').disabled = false;
   }
-  $('btn-eye').textContent = S.revealKey ? '隐藏' : '显示';
+  $('btn-eye').textContent = S.revealKey ? t('btn.hideKey') : t('btn.show');
   $('info-require-key').textContent = keys.length
-    ? '客户端需要在请求头携带该密钥'
-    : '当前不校验密钥，便于本地调试';
+    ? t('ov.requireKey.yes')
+    : t('ov.requireKey.no');
 }
 
 function renderOverview() {
   const s = S.state;
-  $('ov-running').textContent = s.running ? '运行中' : '已停止';
+  $('ov-running').textContent = s.running ? t('status.running') : t('status.stopped');
   $('ov-listen').textContent = s.listen;
-  $('ov-models').textContent = (s.models || []).length + ' 个';
+  $('ov-models').textContent = t('count.unit', { n: (s.models || []).length });
   const accCount = (s.accounts || []).length;
-  $('ov-accounts').textContent = accCount > 0 ? accCount + ' 个' : '尚未登录';
-  $('ov-sync').textContent = s.settings.modelSyncHours > 0 ? '每 ' + s.settings.modelSyncHours + ' 小时' : '已关闭';
+  $('ov-accounts').textContent = accCount > 0 ? t('count.unit', { n: accCount }) : t('ov.notLoggedIn');
+  $('ov-sync').textContent = s.settings.modelSyncHours > 0 ? t('sync.every', { n: s.settings.modelSyncHours }) : t('sync.off');
 
   const list = $('ov-providers');
   list.innerHTML = '';
@@ -139,13 +151,13 @@ function renderOverview() {
     meta.appendChild(el('span', null, p.baseUrl));
     item.appendChild(meta);
     const ops = el('div', 'ops');
-    const tag = el('span', 'tag' + (p.enabled ? ' on' : ''), p.enabled ? '已启用' : '未启用');
+    const tag = el('span', 'tag' + (p.enabled ? ' on' : ''), p.enabled ? t('tag.enabled') : t('tag.disabled'));
     ops.appendChild(tag);
     // 登录状态：有账号即视为已登录（绿色），否则醒目提示未登录
     const logged = p.accountCount > 0;
     ops.appendChild(el('span', 'tag' + (logged ? ' on' : ' warn'),
-      logged ? '已登录 · ' + p.accountCount + ' 账号' : '未登录'));
-    ops.appendChild(el('span', 'tag', p.modelCount + ' 模型'));
+      logged ? t('tag.logged', { n: p.accountCount }) : t('tag.notLogged')));
+    ops.appendChild(el('span', 'tag', t('tag.models', { n: p.modelCount })));
     item.appendChild(ops);
     list.appendChild(item);
   });
@@ -168,10 +180,10 @@ function renderLogin() {
   spinner.className = 'spinner' + (login.status === 'success' ? ' done' : login.status === 'failed' ? ' fail' : '');
 
   $('login-title').textContent =
-    login.status === 'pending' ? '等待在浏览器中完成授权' :
-    login.status === 'success' ? '登录成功' : '登录失败';
+    login.status === 'pending' ? t('login.pending') :
+    login.status === 'success' ? t('login.success') : t('login.failed');
   $('login-message').textContent = login.message || '';
-  $('login-expires').textContent = login.status === 'pending' ? '链接有效期至 ' + login.expiresAt : '';
+  $('login-expires').textContent = login.status === 'pending' ? t('login.expiresFmt', { time: login.expiresAt }) : '';
 
   const urlNode = $('login-url');
   urlNode.textContent = login.url || '-';
@@ -184,11 +196,11 @@ function renderLoginProviders() {
   wrap.innerHTML = '';
   (S.state.providers || []).forEach((p) => {
     const btn = el('button', 'btn');
-    btn.textContent = '登录 ' + p.name;
+    btn.textContent = t('btn.loginFmt', { name: p.name });
     btn.onclick = () => startLogin(p.id);
     wrap.appendChild(btn);
     if (!p.enabled) {
-      const note = el('span', 'hint', '（未启用，登录后可到设置里启用）');
+      const note = el('span', 'hint', t('acc.loginDisabled'));
       wrap.appendChild(note);
     }
   });
@@ -198,10 +210,10 @@ function renderAccounts() {
   const list = $('account-list');
   list.innerHTML = '';
   const accounts = S.state.accounts || [];
-  $('accounts-count').textContent = accounts.length ? accounts.length + ' 个账号' : '';
+  $('accounts-count').textContent = accounts.length ? t('acc.countFmt', { n: accounts.length }) : '';
 
   if (!accounts.length) {
-    list.appendChild(el('div', 'empty', '还没有登录任何账号，点击上方按钮开始登录'));
+    list.appendChild(el('div', 'empty', t('acc.empty')));
     return;
   }
 
@@ -209,14 +221,14 @@ function renderAccounts() {
     const item = el('div', 'account-item');
     const who = el('div', 'who');
     who.appendChild(el('strong', null, a.nickname || a.uid || a.id));
-    who.appendChild(el('span', null, (a.providerName || a.provider) + ' · UID ' + (a.uid || '未知')));
-    who.appendChild(el('span', null, '登录于 ' + (a.createdAt || '-')));
+    who.appendChild(el('span', null, (a.providerName || a.provider) + ' · UID ' + (a.uid || t('acc.uidUnknown'))));
+    who.appendChild(el('span', null, t('acc.signedAtFmt', { time: a.createdAt || '-' })));
     item.appendChild(who);
 
     const ops = el('div', 'ops');
-    const badge = el('span', 'badge' + (a.expired ? ' warn' : ''), a.expiresIn || '有效期未知');
+    const badge = el('span', 'badge' + (a.expired ? ' warn' : ''), a.expiresIn || t('acc.expiresUnknown'));
     ops.appendChild(badge);
-    const del = el('button', 'btn btn-mini btn-danger', '删除');
+    const del = el('button', 'btn btn-mini btn-danger', t('btn.delete'));
     del.onclick = () => removeAccount(a.provider, a.id, a.nickname || a.id);
     ops.appendChild(del);
     item.appendChild(ops);
@@ -234,7 +246,7 @@ function renderModels() {
   });
   if (!models.length) {
     const row = el('tr');
-    const cell = el('td', 'empty', '没有匹配的模型');
+    const cell = el('td', 'empty', t('models.noMatch'));
     cell.colSpan = 6;
     row.appendChild(cell);
     body.appendChild(row);
@@ -249,7 +261,7 @@ function renderModels() {
     row.appendChild(pcell);
     row.appendChild(el('td', 'mono', formatTokens(m.context)));
     row.appendChild(el('td', 'mono', formatTokens(m.maxOut)));
-    row.appendChild(el('td', null, m.images ? '支持' : '—'));
+    row.appendChild(el('td', null, m.images ? t('models.imgYes') : '—'));
     body.appendChild(row);
   });
 }
@@ -257,6 +269,7 @@ function renderModels() {
 function renderSettings() {
   const s = S.state;
   if (S.dirty) return; // 用户正在编辑时不要覆盖输入
+  $('set-language').value = s.settings.language || 'system';
   $('set-listen').value = s.settings.listen;
   $('set-sync').value = s.settings.modelSyncHours;
   $('set-cors').checked = s.settings.cors;
@@ -271,14 +284,14 @@ function renderSettings() {
     const item = el('div', 'provider-item');
     const meta = el('div', 'meta');
     meta.appendChild(el('strong', null, p.name));
-    meta.appendChild(el('span', null, (p.enabled ? '已启用 · ' : '未启用 · ') + p.accountCount + ' 个账号'));
+    meta.appendChild(el('span', null, t(p.enabled ? 'set.provider.enabledFmt' : 'set.provider.disabledFmt', { n: p.accountCount })));
     item.appendChild(meta);
 
     const ops = el('div', 'ops');
     const proxy = el('input', 'input');
     proxy.type = 'text';
     proxy.style.maxWidth = '230px';
-    proxy.placeholder = p.needsProxy ? '代理，如 http://127.0.0.1:7890' : '代理（留空跟随系统）';
+    proxy.placeholder = p.needsProxy ? t('set.proxyNeeded') : t('set.proxyOptional');
     proxy.value = p.proxy || '';
     proxy.dataset.provider = p.id;
     proxy.oninput = () => { S.dirty = true; };
@@ -291,7 +304,7 @@ function renderSettings() {
     check.dataset.provider = p.id;
     check.onchange = () => { S.dirty = true; };
     toggle.appendChild(check);
-    toggle.appendChild(el('span', null, '启用'));
+    toggle.appendChild(el('span', null, t('set.enable')));
     ops.appendChild(toggle);
     item.appendChild(ops);
     wrap.appendChild(item);
@@ -301,16 +314,16 @@ function renderSettings() {
   keyList.innerHTML = '';
   const keys = s.apiKeys || [];
   if (!keys.length) {
-    keyList.appendChild(el('div', 'empty', '尚未设置 API Key，任何人都可以访问本代理'));
+    keyList.appendChild(el('div', 'empty', t('set.key.empty')));
   } else {
     keys.forEach((key) => {
       const item = el('div', 'key-item');
       const code = el('code', null, key);
       item.appendChild(code);
-      const copy = el('button', 'btn btn-mini', '复制');
+      const copy = el('button', 'btn btn-mini', t('btn.copy'));
       copy.onclick = () => copyFrom(code);
       item.appendChild(copy);
-      const del = el('button', 'btn btn-mini btn-danger', '删除');
+      const del = el('button', 'btn btn-mini btn-danger', t('btn.delete'));
       del.onclick = () => removeKey(key);
       item.appendChild(del);
       keyList.appendChild(item);
@@ -321,7 +334,7 @@ function renderSettings() {
   $('path-config').textContent = s.settings.configPath;
   $('path-accounts').textContent = s.settings.accountDir;
   $('path-log').textContent = s.settings.logPath || '-';
-  $('path-version').textContent = 'v' + s.settings.version + '（' + s.settings.platform + '）';
+  $('path-version').textContent = t('ver.fmt', { v: s.settings.version, p: s.settings.platform });
   $('version').textContent = 'v' + s.settings.version;
   $('about-version').textContent = 'v' + s.settings.version;
   $('about-platform').textContent = s.settings.platform;
@@ -329,6 +342,7 @@ function renderSettings() {
 
 function renderAll() {
   if (!S.state) return;
+  syncLanguage();
   renderStatus();
   renderAccess();
   renderOverview();
@@ -361,7 +375,7 @@ async function refresh() {
     S.login = S.state.login || { status: 'idle' };
     renderAll();
   } catch (err) {
-    toast('读取状态失败：' + err);
+    toast(t('toast.stateFailedFmt', { err: String(err) }));
   }
 }
 
@@ -373,29 +387,29 @@ async function startLogin(provider) {
     S.login = view;
     renderLogin();
   } catch (err) {
-    toast('发起登录失败：' + err);
+    toast(t('toast.loginStartFailedFmt', { err: String(err) }));
     await refresh();
   }
 }
 
 async function removeAccount(provider, id, name) {
-  if (!confirm('确定删除账号「' + name + '」吗？')) return;
+  if (!confirm(t('confirm.deleteAccountFmt', { name: name }))) return;
   try {
     await call('DeleteAccount', provider, id);
-    toast('已删除账号');
+    toast(t('toast.accountDeleted'));
     await refresh();
   } catch (err) {
-    toast('删除失败：' + err);
+    toast(t('toast.deleteFailedFmt', { err: String(err) }));
   }
 }
 
 async function removeKey(key) {
   try {
     await call('RemoveAPIKey', key);
-    toast('已删除密钥');
+    toast(t('toast.keyDeleted'));
     await refresh();
   } catch (err) {
-    toast('删除失败：' + err);
+    toast(t('toast.deleteFailedFmt', { err: String(err) }));
   }
 }
 
@@ -403,10 +417,10 @@ async function toggleService() {
   $('btn-toggle').disabled = true;
   try {
     const running = await call('ToggleService');
-    toast(running ? '服务已启动' : '服务已停止');
+    toast(running ? t('toast.serviceStarted') : t('toast.serviceStopped'));
     await refresh();
   } catch (err) {
-    toast('操作失败：' + err);
+    toast(t('toast.opFailedFmt', { err: String(err) }));
   } finally {
     $('btn-toggle').disabled = false;
   }
@@ -429,19 +443,36 @@ async function saveSettings() {
     profiles,
   };
   $('btn-save').disabled = true;
-  $('save-hint').textContent = '正在保存…';
+  $('save-hint').textContent = t('save.saving');
   try {
     await call('SaveSettings', input);
     S.dirty = false;
-    $('save-hint').textContent = '已保存';
-    toast('设置已保存');
+    $('save-hint').textContent = t('save.done');
+    toast(t('save.done'));
     await refresh();
     setTimeout(() => { $('save-hint').textContent = ''; }, 2500);
   } catch (err) {
-    $('save-hint').textContent = '保存失败：' + err;
-    toast('保存失败：' + err);
+    $('save-hint').textContent = t('toast.opFailedFmt', { err: String(err) });
+    toast(t('toast.opFailedFmt', { err: String(err) }));
   } finally {
     $('btn-save').disabled = false;
+  }
+}
+
+/* 切换界面语言：保存到 Go 配置（托盘菜单同步切换），
+ * 成功后立即应用翻译；Go 侧随后推送的新 state 会再次校准。 */
+async function changeLanguage(value) {
+  try {
+    await call('SetLanguage', value);
+    I18N.setPref(value);
+    I18N.apply();
+    if (S.state && S.state.settings) S.state.settings.language = value;
+    $('set-language').value = value;
+    toast(t('toast.langChanged'));
+    await refresh();
+  } catch (err) {
+    toast(t('toast.opFailedFmt', { err: String(err) }));
+    await refresh();
   }
 }
 
@@ -466,32 +497,32 @@ function bindUI() {
   $('btn-reset-window').onclick = async () => {
     try {
       await call('ResetWindow');
-      toast('窗口已按当前屏幕重新居中');
+      toast(t('toast.windowReset'));
     } catch (err) {
-      toast('重置窗口失败：' + err);
+      toast(t('toast.windowResetFailedFmt', { err: String(err) }));
     }
   };
   $('btn-quit').onclick = () => {
-    if (confirm('确定退出 RapidProxy 吗？退出后代理服务将停止。')) {
+    if (confirm(t('confirm.quit'))) {
       call('QuitApp').catch(() => {});
     }
   };
   $('btn-eye').onclick = () => { S.revealKey = !S.revealKey; renderAccess(); };
   $('btn-regen-key').onclick = async () => {
     const keys = S.state.apiKeys || [];
-    if (keys.length && !confirm('重新生成会替换当前密钥，已配置的软件需要同步更新。继续吗？')) return;
+    if (keys.length && !confirm(t('confirm.regenKey'))) return;
     try {
       if (keys.length) await call('RemoveAPIKey', keys[0]);
       const key = await call('GenerateAPIKey');
       S.revealKey = true;
-      toast('新密钥已生成：' + maskKey(key));
+      toast(t('toast.newKeyFmt', { key: maskKey(key) }));
       await refresh();
     } catch (err) {
-      toast('生成失败：' + err);
+      toast(t('toast.genFailedFmt', { err: String(err) }));
     }
   };
-  $('btn-refresh').onclick = () => runSync('模型已同步');
-  $('btn-sync-models').onclick = () => runSync('模型已同步');
+  $('btn-refresh').onclick = () => runSync();
+  $('btn-sync-models').onclick = () => runSync();
   $('btn-open-dir').onclick = () => call('OpenDataDir').catch(() => {});
   $('btn-clear-log').onclick = () => call('ClearLogs').then(refresh).catch(() => {});
   $('btn-cancel-login').onclick = () => call('CancelLogin').then(refresh).catch(() => {});
@@ -500,7 +531,10 @@ function bindUI() {
   };
   $('model-search').oninput = (e) => { S.modelFilter = e.target.value; renderModels(); };
 
+  // 语言切换即时生效；其余设置项保持「编辑后点保存」的节奏
+  $('set-language').onchange = (e) => changeLanguage(e.target.value);
   document.querySelectorAll('#tab-settings input, #tab-settings select').forEach((node) => {
+    if (node.id === 'set-language') return;
     node.addEventListener('input', () => { S.dirty = true; });
     node.addEventListener('change', () => { S.dirty = true; });
   });
@@ -508,24 +542,24 @@ function bindUI() {
 
   $('btn-add-key').onclick = async () => {
     const value = $('new-key').value.trim();
-    if (!value) return toast('请先填写密钥');
+    if (!value) return toast(t('toast.keyEmpty'));
     try {
       await call('AddAPIKey', value);
       $('new-key').value = '';
-      toast('已添加密钥');
+      toast(t('toast.keyAdded'));
       await refresh();
     } catch (err) {
-      toast('添加失败：' + err);
+      toast(t('toast.addFailedFmt', { err: String(err) }));
     }
   };
   $('btn-gen-key').onclick = async () => {
     try {
       const key = await call('GenerateAPIKey');
       S.revealKey = true;
-      toast('已生成：' + maskKey(key));
+      toast(t('toast.keyGeneratedFmt', { key: maskKey(key) }));
       await refresh();
     } catch (err) {
-      toast('生成失败：' + err);
+      toast(t('toast.genFailedFmt', { err: String(err) }));
     }
   };
 
@@ -536,18 +570,18 @@ function bindUI() {
   // 关于页：用系统浏览器打开 GitHub 仓库
   $('btn-open-repo').onclick = () => {
     try { window.runtime.BrowserOpenURL('https://github.com/RapidAI/RapidProxy'); }
-    catch (err) { toast('打开浏览器失败：' + err); }
+    catch (err) { toast(t('toast.browserFailedFmt', { err: String(err) })); }
   };
 }
 
-async function runSync(message) {
+async function runSync() {
   try {
-    toast('正在同步…');
+    toast(t('toast.syncing'));
     await call('RefreshModels');
-    toast(message);
+    toast(t('toast.synced'));
     await refresh();
   } catch (err) {
-    toast('同步失败：' + err);
+    toast(t('toast.syncFailedFmt', { err: String(err) }));
   }
 }
 
@@ -561,8 +595,8 @@ function bindEvents() {
   window.runtime.EventsOn('login', (payload) => {
     S.login = payload;
     renderLogin();
-    if (payload.status === 'success') toast('登录成功');
-    if (payload.status === 'failed') toast('登录失败：' + (payload.message || ''));
+    if (payload.status === 'success') toast(t('login.success'));
+    if (payload.status === 'failed') toast(t('login.failed') + (payload.message ? ': ' + payload.message : ''));
   });
   window.runtime.EventsOn('log', (line) => {
     S.logs.push(line);
@@ -572,8 +606,8 @@ function bindEvents() {
   window.runtime.EventsOn('update', (payload) => {
     S.update = payload;
     renderUpdate();
-    if (payload.phase === 'available') toast(payload.message || '发现新版本');
-    if (payload.phase === 'failed') toast('更新失败：' + (payload.message || ''));
+    if (payload.phase === 'available') toast(payload.message || t('toast.updateAvailable'));
+    if (payload.phase === 'failed') toast(t('toast.updateFailedFmt', { err: payload.message || '' }));
   });
 }
 
@@ -590,11 +624,13 @@ function renderUpdate() {
   if (!status) return;
 
   const cur = (S.state && S.state.settings && S.state.settings.version) || '';
-  status.textContent = '当前版本 v' + cur + (u.latest ? '　·　最新版本 v' + u.latest : '');
+  status.textContent = u.latest
+    ? t('upd.status.fmt', { cur: cur, latest: u.latest })
+    : t('upd.status.curOnly', { cur: cur });
 
   const busy = u.phase === 'checking' || u.phase === 'downloading' || u.phase === 'installing';
   btnCheck.disabled = busy;
-  btnCheck.textContent = u.phase === 'checking' ? '检查中…' : '检查更新';
+  btnCheck.textContent = u.phase === 'checking' ? t('btn.checking') : t('btn.checkUpdate');
   btnDo.classList.toggle('hidden', u.phase !== 'available');
 
   bar.classList.toggle('hidden', u.phase !== 'downloading');
@@ -627,6 +663,8 @@ async function doUpdate() {
 }
 
 async function main() {
+  // 后端就绪前先按缓存的偏好应用语言，避免启动闪变
+  I18N.apply();
   await waitForBackend();
   bindUI();
   bindEvents();

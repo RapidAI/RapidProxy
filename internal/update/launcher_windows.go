@@ -7,6 +7,8 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+
+	"github.com/znsoftm/RapidProxy/internal/locale"
 )
 
 // shellExecuteInfoW 对应 Win32 的 SHELLEXECUTEINFOW 结构（x64 布局，
@@ -64,9 +66,9 @@ func launchWindows(path string) error {
 	ret, _, errNo := procShellExecuteW.Call(uintptr(unsafe.Pointer(&info)))
 	if ret == 0 {
 		if errNo == windows.ERROR_CANCELLED {
-			return fmt.Errorf("已取消安装授权（UAC）")
+			return fmt.Errorf("%s", locale.T("launcher.cancelled"))
 		}
-		return fmt.Errorf("启动安装包失败: %v", errNo)
+		return fmt.Errorf("%s", locale.T("launcher.failed", errNo))
 	}
 	return nil
 }

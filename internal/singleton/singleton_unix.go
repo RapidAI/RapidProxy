@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"github.com/znsoftm/RapidProxy/internal/locale"
 )
 
 // Acquire 尝试对锁文件加 flock 排它锁（LOCK_NB 非阻塞）。
@@ -38,11 +40,9 @@ func Acquire(name string) bool {
 var held *os.File
 
 // NotifyAlreadyRunning 尽力弹一个图形提示；没有任何通知工具时静默退出。
+// 该入口在配置加载之前（第二实例即将退出），语言只能按系统探测。
 func NotifyAlreadyRunning(name string) {
-	_, err := osUserHomeDir()
-	_ = err // 家目录仅用于构造文案，失败也不影响提示
-	msg := name + " is already running (see the system tray)."
-	tryNotify(msg)
+	tryNotify(locale.T("dlg.alreadyRunning", name))
 }
 
 // activateSocketPath 返回激活监听 Unix 域 socket 的路径（与锁文件同目录）。

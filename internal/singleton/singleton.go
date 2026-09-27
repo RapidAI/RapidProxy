@@ -5,6 +5,13 @@
 //   - macOS / Linux：对数据目录下的 singleton.lock 加 flock 排它锁，
 //     进程退出（含崩溃）时由内核自动释放，不会留下“死锁文件”。
 //
+// 除互斥外还提供一条「激活通道」，让后来的实例唤醒已有实例：
+//   - Windows：命名管道 \\.\pipe\<name>-SingleInstance-Activate（连接即激活）；
+//   - macOS / Linux：锁目录下的 Unix 域 socket activate.sock。
+//
+// 用法：持有锁的实例先调用 Listen 注册回调；后来实例 Acquire 失败后调用
+// Activate 通知，成功则静默退出，失败再退化为 NotifyAlreadyRunning 提示框。
+//
 // Acquire 成功后锁随进程存活，无需（也没有必要）显式释放。
 package singleton
 
@@ -13,6 +20,10 @@ import (
 	"path/filepath"
 	"strings"
 )
+
+// activateCmd 是激活通道上约定的命令文本。当前「连接本身」就是激活信号
+// （Windows 端不读内容），命令文本仅为以后的协议扩展（如转发 --quit）预留。
+const activateCmd = "show"
 
 // osUserHomeDir 返回当前用户主目录。
 func osUserHomeDir() (string, error) {

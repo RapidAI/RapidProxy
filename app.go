@@ -208,12 +208,13 @@ type App struct {
 	cfgMu sync.RWMutex
 	cfg   *config.Config
 
-	quitting atomic.Bool
-	headless atomic.Bool
-	trayHint atomic.Bool
-	unsubLog func()
-	loginMu  sync.Mutex
-	login    *loginRun
+	quitting    atomic.Bool
+	headless    atomic.Bool
+	trayHint    atomic.Bool
+	pendingShow atomic.Bool // 窗口就绪前收到的显示请求，startup 末尾补显
+	unsubLog    func()
+	loginMu     sync.Mutex
+	login       *loginRun
 
 	updMu sync.Mutex
 	upd   *update.Release // 最近一次检查到的可用更新
@@ -274,6 +275,12 @@ func (a *App) startup(ctx context.Context) {
 		}
 	}
 	a.pushState()
+
+	// 启动期间收到的激活请求（第二份程序抢在窗口就绪前启动了本实例）
+	// 在这里补上：窗口几何已在 fitWindow 收敛完毕，直接显示即可。
+	if a.pendingShow.CompareAndSwap(true, false) {
+		wailsrt.WindowShow(ctx)
+	}
 
 	// 后台静默检查一次更新（失败不打扰用户，结果通过 update 事件推送）
 	go func() {
@@ -505,6 +512,16 @@ func (a *App) ShowWindow() {
 	}
 	wailsrt.WindowUnminimise(ctx)
 	wailsrt.WindowShow(ctx)
+	a.pendingShow.Store(false)
+}
+
+// HandleSecondInstance 处理后续实例的激活请求：把主窗口带到前台。
+//
+// 第二份程序启动时发现已有实例，会通过 singleton 包通知本实例。若通知到达
+// 时窗口尚未创建完（ctx 为空），请求会被记住，startup 末尾再补一次显示。
+func (a *App) HandleSecondInstance() {
+	a.pendingShow.Store(true)
+	a.ShowWindow()
 }
 
 // HideWindow 隐藏主窗口到托盘。

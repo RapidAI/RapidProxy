@@ -30,10 +30,13 @@ func wantHidden() bool {
 }
 
 func main() {
-	// 单实例：第二份程序弹出提示后立即退出，避免重复的服务端口占用、
-	// 托盘图标和配置读写。锁随进程存活、崩溃自动释放，无需清理。
+	// 单实例：第二份程序把已有实例的界面弹到前台后立即退出，避免重复的
+	// 服务端口占用、托盘图标和配置读写。锁随进程存活、崩溃自动释放，无需清理。
 	if !singleton.Acquire("RapidProxy") {
-		singleton.NotifyAlreadyRunning("RapidProxy")
+		if !singleton.Activate("RapidProxy") {
+			// 唤醒失败（首实例是旧版本、或激活监听异常）：退化为提示框。
+			singleton.NotifyAlreadyRunning("RapidProxy")
+		}
 		return
 	}
 
@@ -41,6 +44,9 @@ func main() {
 
 	// 托盘必须在主事件循环启动之前注册，由 Wails 的事件循环驱动。
 	application.startTray()
+
+	// 监听后续实例的激活请求：收到后把主窗口弹到前台（见 HandleSecondInstance）。
+	singleton.Listen("RapidProxy", application.HandleSecondInstance)
 
 	err := wails.Run(&options.App{
 		Title: "RapidProxy",

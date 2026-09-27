@@ -55,9 +55,10 @@ ManifestDPIAware true
 !define MUI_FINISHPAGE_NOAUTOCLOSE # Wait on the INSTFILES page so the user can take a look into the details of the installation steps
 !define MUI_ABORTWARNING # This will warn the user if they exit from the installer.
 
-# 安装完成后自动运行（完成页默认勾选的复选框）
+# 安装完成后自动运行（完成页默认勾选的复选框）。
+# 复选框文本不自定义：MUI2 默认取各语言文件的 $(MUI_TEXT_FINISH_RUN)，
+# 随安装器语言自动本地化（英文 "&Run ..."，中文 "运行 ...(&R)"）。
 !define MUI_FINISHPAGE_RUN "$INSTDIR\${PRODUCT_EXECUTABLE}"
-!define MUI_FINISHPAGE_RUN_TEXT "安装完成后运行 ${INFO_PRODUCTNAME}"
 
 !insertmacro MUI_PAGE_WELCOME # Welcome to the installer page.
 # !insertmacro MUI_PAGE_LICENSE "resources\eula.txt" # Adds a EULA page to the installer
@@ -67,7 +68,12 @@ ManifestDPIAware true
 
 !insertmacro MUI_UNPAGE_INSTFILES # Uinstalling page
 
-!insertmacro MUI_LANGUAGE "English" # Set the Language of the installer
+!insertmacro MUI_LANGUAGE "English" # 非中文环境的回退语言
+!insertmacro MUI_LANGUAGE "SimpChinese" # 简体中文（中文环境自动选用，见 .onInit）
+
+# 双语文案：运行时按 $LANGUAGE 取值（.onInit 里按系统 UI 语言决定）。
+LangString MsgWin10Required ${LANG_ENGLISH} "${INFO_PRODUCTNAME} requires Windows 10 (Server 2016) or later."
+LangString MsgWin10Required ${LANG_SIMPCHINESE} "${INFO_PRODUCTNAME} 需要 Windows 10（Server 2016）或更高版本。"
 
 ## The following two statements can be used to sign the installer and the uninstaller. The path to the binaries are provided in %1
 #!uninstfinalize 'signtool --file "%1"'
@@ -89,11 +95,21 @@ Function .onInit
         Quit
     ${EndIf}
 
+    # 双语：中文（含全部 zh 变体，主语言 ID 0x0004）环境显示简体中文，
+    # 其它显示英文。不弹语言选择框，按系统 UI 语言静默决定。
+    System::Call 'kernel32::GetUserDefaultUILanguage() i .r0'
+    IntOp $0 $0 & 0x03FF # 提取主语言 ID
+    ${If} $0 = 0x0004
+        StrCpy $LANGUAGE ${LANG_SIMPCHINESE}
+    ${Else}
+        StrCpy $LANGUAGE ${LANG_ENGLISH}
+    ${EndIf}
+
     # 注意：不使用 wails.checkArchitecture（它不支持 32 位系统）。
     ${If} ${AtLeastWin10}
         ; x86 / x64 均受支持
     ${Else}
-        MessageBox MB_OK "${INFO_PRODUCTNAME} 需要 Windows 10（Server 2016）或更高版本。"
+        MessageBox MB_OK "$(MsgWin10Required)"
         Quit
     ${EndIf}
 

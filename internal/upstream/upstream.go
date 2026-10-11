@@ -540,6 +540,12 @@ func (c *Client) startTraeLogin(ctx context.Context) (*LoginSession, error) {
 					Nickname:     token.DisplayName,
 				},
 			}
+			if cred.Auth.ExpiresAt <= 0 {
+				// 上游沉默时按 2 小时保守估计：NeedsRefresh 依赖这个值做
+				// 主动刷新，否则只剩 401 兜底重试（与 lobsterai /
+				// workbuddy 协议族的登录路径一致）。
+				cred.Auth.ExpiresAt = time.Now().Add(2 * time.Hour).Unix()
+			}
 			c.Finalize(cred)
 			return cred, nil
 		},

@@ -422,9 +422,9 @@ func postJSON(ctx context.Context, hc *http.Client, endpoint string, body any) (
 }
 
 // truncateForError 保留错误正文的前 512 个 rune，中文服务端消息不会切在
-// 半个字符上。
+// 半个字符上。先脱敏再截断：截断可能把键值对切成两半，脱敏正则会漏掉残段。
 func truncateForError(body []byte) string {
-	text := strings.TrimSpace(string(body))
+	text := strings.TrimSpace(hx.RedactTokens(string(body)))
 	runes := []rune(text)
 	if len(runes) > 512 {
 		runes = runes[:512]

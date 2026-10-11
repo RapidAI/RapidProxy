@@ -505,3 +505,75 @@ func TestChatJSONAfterLeadingBlankLine(t *testing.T) {
 		t.Fatalf("空白行后的 JSON 信封应按业务码映射（402），实际 %d: %s", resp.StatusCode, raw)
 	}
 }
+
+// 回调 CSRF：loginTraceID 是唯一防线。不带或对不上 trace 的回调一律不采信
+// ——之前「当作拒绝处理」会把会话整个打断，等于给本机可达的任意网页一个
+// 打断登录或投递自己 refreshToken 的开关。
+func TestReceiveCallbackIgnoresUntrustedTrace(t *testing.T) {
+	newSession := func() *LoginSession {
+		return &LoginSession{TraceID: "trace-1", MachineID: "m", DeviceID: "d", notify: make(chan struct{})}
+	}
+
+	// 对不上 trace 的凭据回调：忽略，会话保持等待。
+	s := newSession()
+	if s.receiveCallback(map[string]string{"refreshToken": "attacker", "loginTraceID": "trace-2"}) {
+		t.Fatal("trace 不匹配的凭据回调应被忽略")
+	}
+	if s.done {
+		t.Fatal("trace 不匹配的回调不应结束会话")
+	}
+
+	// 不带 trace 的凭据回调（攻击者可伪造的最简形态）：同样忽略。
+	s = newSession()
+	if s.receiveCallback(map[string]string{"refreshToken": "attacker"}) {
+		t.Fatal("不带 trace 的凭据回调应被忽略")
+	}
+	if s.done {
+		t.Fatal("不带 trace 的回调不应结束会话")
+	}
+
+	// 不带 trace 的拒绝回调（?code=x&error=denied 可打断登录）：忽略。
+	s = newSession()
+	if s.receiveCallback(map[string]string{"code": "x", "error": "denied"}) {
+		t.Fatal("不带 trace 的拒绝回调应被忽略")
+	}
+	if s.done {
+		t.Fatal("不带 trace 的拒绝回调不应结束会话")
+	}
+
+	// 带上正确 trace 的凭据回调：正常停靠（返回值 false = 未被拒绝）。
+	s = newSession()
+	if denied := s.receiveCallback(map[string]string{"refreshToken": "real", "loginTraceID": "trace-1"}); denied {
+		t.Fatal("trace 匹配的凭据回调不应标记为拒绝")
+	}
+	if !s.done || s.details == nil || s.details.RefreshToken != "real" {
+		t.Fatalf("trace 匹配的回调应携带凭据: done=%v details=%v", s.done, s.details)
+	}
+
+	// 带正确 trace 的拒绝回调：如实上报（真实用户的「取消授权」路径）。
+	// 注意回调里同时带 code 时会先按 AuthCode 处理，deny 只有无凭据时生效。
+	s = newSession()
+	if denied := s.receiveCallback(map[string]string{"error": "denied", "loginTraceID": "trace-1"}); !denied {
+		t.Fatal("trace 匹配的拒绝回调应上报拒绝")
+	}
+	if _, err := s.Wait(context.Background()); err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("拒绝原因应进入会话错误: %v", err)
+	}
+}
+
+// 错误摘要先脱敏再截断：网关半途出错时可能把带 token 的响应体回显，
+// 这些文本会进日志。
+func TestSummarizeBodyRedactsSecrets(t *testing.T) {
+	raw := []byte(`{"error":"boom","accessToken":"sk-live-123","refreshToken":"rt-456","message":"配额不足"}`)
+	got := summarizeBody(raw)
+	if strings.Contains(got, "sk-live-123") || strings.Contains(got, "rt-456") {
+		t.Fatalf("摘要不应包含 token 原文: %s", got)
+	}
+	if !strings.Contains(got, "[redacted]") || !strings.Contains(got, "配额不足") {
+		t.Fatalf("摘要应保留非敏感内容并标注已脱敏: %s", got)
+	}
+	// 带转义引号的值也要整段抹掉，不能留下后半截。
+	if got := summarizeBody([]byte(`{"token":"a\"bcd","ok":1}`)); strings.Contains(got, "bcd") {
+		t.Fatalf("转义值应整段脱敏: %s", got)
+	}
+}

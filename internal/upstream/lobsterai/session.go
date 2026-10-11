@@ -196,7 +196,7 @@ func serveLoop(raw net.Listener, session *LoginSession) {
 	}
 }
 
-// serveConn 解析一次浏览器重定向；不带 code+state 的请求是噪音。
+// serveConn 解析一次浏览器重定向；凡是对不上 state 的请求都是噪音。
 // 页面应答保持中性——交换结果在应用内呈现。
 func serveConn(conn net.Conn, session *LoginSession) {
 	defer conn.Close()
@@ -218,18 +218,21 @@ func serveConn(conn net.Conn, session *LoginSession) {
 	query := parsed.Query()
 	code := strings.TrimSpace(query.Get("code"))
 	state := strings.TrimSpace(query.Get("state"))
+	// state 是 CSRF 防线：16 字节随机，只有真正的控制台重定向才会原样
+	// 带回（OAuth 规范要求错误重定向同样回带）。本机回调端口对浏览器里
+	// 任何页面可达，对不上 state 的回调一律当噪音忽略——之前「不带凭据
+	// 的 error / 缺授权码」不校验 state 就 deliver，等于给恶意页面一个
+	// 一键打断登录的开关；忽略之后会话继续等待真正的回调，直到自然超时。
+	if state == "" || !strings.EqualFold(state, session.State) {
+		writePage(conn)
+		return
+	}
 	reject := ""
 	switch {
 	case strings.TrimSpace(query.Get("error")) != "":
 		reject = "授权被拒绝: " + query.Get("error")
-	case code == "" && state == "":
-		// 预检/探测流量；保持监听。
-		writePage(conn)
-		return
 	case code == "":
 		reject = "登录回调缺少授权码"
-	case !strings.EqualFold(state, session.State):
-		reject = "回调与本机发起的登录不匹配（state 校验失败），已拒绝；请重新发起登录"
 	}
 	session.deliver(code, reject)
 	writePage(conn)
@@ -482,8 +485,10 @@ func jwtExpiry(token string) int64 {
 	return claims.Exp
 }
 
+// summarizeBody 保持错误页可读且不泄漏无关载荷。
+// 先脱敏再截断：截断可能把键值对切成两半，脱敏正则会漏掉残段。
 func summarizeBody(body []byte) string {
-	runes := []rune(strings.TrimSpace(string(body)))
+	runes := []rune(strings.TrimSpace(hx.RedactTokens(string(body))))
 	if len(runes) > 200 {
 		runes = runes[:200]
 	}

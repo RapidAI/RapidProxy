@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -207,5 +208,58 @@ func TestJWTExpiryFallback(t *testing.T) {
 	}
 	if jwtExpiry("not-a-jwt") != 0 {
 		t.Fatal("非 JWT 应返回 0")
+	}
+}
+
+// 回调 CSRF：state 是唯一防线。对不上 state 的回调（伪造 error、伪造 code、
+// 纯探测）一律当噪音忽略——之前不带凭据的 error / 缺授权码不校验 state 就
+// deliver，等于给本机可达的任意网页一个一键打断登录的开关。
+func TestServeConnIgnoresUntrustedState(t *testing.T) {
+	// serve 一次回调并返回 (会话, 应答正文)。
+	serve := func(t *testing.T, target string) (*LoginSession, string) {
+		t.Helper()
+		session := &LoginSession{State: "s1", notify: make(chan struct{})}
+		client, server := net.Pipe()
+		defer client.Close()
+		go serveConn(server, session)
+		if _, err := io.WriteString(client, "GET "+target+" HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"); err != nil {
+			t.Fatalf("写入请求失败: %v", err)
+		}
+		raw, err := io.ReadAll(client) // serveConn 返回时会关闭连接
+		if err != nil && len(raw) == 0 {
+			t.Fatalf("读取应答失败: %v", err)
+		}
+		return session, string(raw)
+	}
+
+	for _, tc := range []struct {
+		name   string
+		target string
+	}{
+		{"伪造拒绝", "/?error=denied"},
+		{"伪造code加错state", "/?code=attacker&state=wrong"},
+		{"只带state没有code", "/?state=wrong"},
+		{"纯探测", "/?foo=bar"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session, _ := serve(t, tc.target)
+			if session.done {
+				t.Fatalf("%s 不应结束会话", tc.name)
+			}
+		})
+	}
+
+	// state 匹配的正常路径不受影响。
+	session, _ := serve(t, "/?code=c1&state=s1")
+	if !session.done || session.code != "c1" {
+		t.Fatalf("state 匹配的回调应正常停靠: done=%v code=%q", session.done, session.code)
+	}
+	session, _ = serve(t, "/?error=denied&state=s1")
+	if _, err := session.Wait(context.Background()); err == nil || !strings.Contains(err.Error(), "denied") {
+		t.Fatalf("state 匹配的拒绝应上报: %v", err)
+	}
+	session, _ = serve(t, "/?state=s1")
+	if _, err := session.Wait(context.Background()); err == nil || !strings.Contains(err.Error(), "授权码") {
+		t.Fatalf("state 匹配但缺授权码应如实上报: %v", err)
 	}
 }

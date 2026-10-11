@@ -290,3 +290,56 @@ func TestPollToleratesTransportBlip(t *testing.T) {
 		t.Fatalf("传输失败应按等待中处理，实际: %v", err)
 	}
 }
+
+// parseCatalog 是登录后拿全量目录的解析器（scene → 条目数组）。
+// 这里固定各容错路径：key/display_name 的别名、enable 的 bool/0/1 双形态、
+// 默认模型的选取与确定性顺序。
+func TestParseCatalogScenes(t *testing.T) {
+	raw := []byte(`{
+		"cli": [
+			{"model_key":"qfmodel","name":"Qwen3.8-Flash","enable":1},
+			{"key":"qmodel_38max","display_name":"Qwen3.8-Max","enable":true,"is_default":true,
+			 "max_input_tokens":1000000,"max_output_tokens":64000,"is_vl":true,"is_reasoning":true}
+		],
+		"assistant": [
+			{"key":"claude-4.6","display_name":"Claude-4.6","enable":false},
+			{"key":"deepseek-v4","name":"DeepSeek-V4"}
+		],
+		"broken": "not-an-array"
+	}`)
+	models, defaultKey, err := parseCatalog(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(models) != 4 {
+		t.Fatalf("应解析出 4 条，实际 %d: %+v", len(models), models)
+	}
+	// scene 优先级：assistant 在 cli 之前，其余按名字排后面。
+	if models[0].Key != "claude-4.6" || models[0].Scene != "assistant" {
+		t.Fatalf("assistant scene 应排在最前: %+v", models[0])
+	}
+	if models[3].Key != "qmodel_38max" || models[3].Scene != "cli" {
+		t.Fatalf("cli scene 应按优先级殿后: %+v", models[3])
+	}
+	// 别名归一：model_key/name 兜底，enable 数字 1 视为真。
+	if models[3].DisplayName != "Qwen3.8-Max" || !models[3].Enabled || !models[3].Vision || !models[3].Reasoning {
+		t.Fatalf("条目字段归一不正确: %+v", models[3])
+	}
+	if models[3].MaxInput != 1000000 || models[3].MaxOutput != 64000 {
+		t.Fatalf("上下文/输出上限应透传: %+v", models[3])
+	}
+	// 未标 is_default 的条目（deepseek-v4，enable 缺省按真处理）不参与默认值，
+	// 但第一个启用的条目是它的兜底候选——显式 is_default 仍应胜出。
+	if defaultKey != "qmodel_38max" {
+		t.Fatalf("默认模型应为显式 is_default 条目: %q", defaultKey)
+	}
+	// 缺 is_default 时退回首个启用条目。
+	models2, defaultKey2, err := parseCatalog([]byte(`{"cli":[{"key":"a","enable":false},{"key":"b"}]}`))
+	if err != nil || defaultKey2 != "b" || len(models2) != 2 {
+		t.Fatalf("无 is_default 时应取首个启用条目: %q err=%v", defaultKey2, err)
+	}
+	// 非数组 scene 被跳过而不是整体失败；全部为空时报错。
+	if _, _, err := parseCatalog([]byte(`{"broken":"x"}`)); err == nil {
+		t.Fatal("空目录应返回错误")
+	}
+}

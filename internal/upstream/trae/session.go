@@ -400,9 +400,14 @@ func repeatDecode(raw string) string {
 func (s *LoginSession) receiveCallback(params map[string]string) bool {
 	details := parseCallbackDetails(params)
 	details.LoginTraceID = firstValue(params, "loginTraceID", "login_trace_id")
-	if details.LoginTraceID != "" && s.TraceID != "" && details.LoginTraceID != s.TraceID {
-		s.finish(nil, errors.New("回调与本机发起的登录不匹配（loginTraceID 校验失败），已拒绝；请重新发起登录"))
-		return true
+	// CSRF 防线：loginTraceID 是发起登录时写进授权 URL 的 8 字节随机数，
+	// 真正的控制台重定向会原样带回。本机回调端口对浏览器里任何页面可达，
+	// 凡是不带或对不上 trace 的回调都不能采信——当作拒绝处理会把会话
+	// 整个打断，等于给恶意页面一个一键打断登录（或投递它自己的
+	// refreshToken 顶替用户账号）的开关；这里选择忽略，会话继续等待
+	// 真正的回调，直到自然超时。
+	if s.TraceID != "" && details.LoginTraceID != s.TraceID {
+		return false
 	}
 	if details.RejectReason() != "" {
 		s.finish(details, fmt.Errorf("授权被拒绝: %s", details.RejectReason()))
@@ -932,9 +937,10 @@ func anyTrim(raw any) string {
 }
 
 // summarizeBody 保持错误页可读且不泄漏无关载荷。
+// 先脱敏再截断：截断可能把键值对切成两半，脱敏正则会漏掉残段。
 func summarizeBody(body []byte) string {
 	const keep = 256
-	runes := []rune(strings.TrimSpace(string(body)))
+	runes := []rune(strings.TrimSpace(hx.RedactTokens(string(body))))
 	if len(runes) > keep {
 		runes = runes[:keep]
 	}

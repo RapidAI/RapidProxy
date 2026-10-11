@@ -38,6 +38,10 @@ export function RestartService():Promise<void>;
 
 export function SaveSettings(arg1:main.SettingsInput):Promise<void>;
 
+export function SetAccountPaused(arg1:string,arg2:string,arg3:boolean):Promise<void>;
+
+export function SetAccountWeight(arg1:string,arg2:string,arg3:number):Promise<void>;
+
 export function ShowWindow():Promise<void>;
 
 export function StartLogin(arg1:string,arg2:string):Promise<main.LoginView>;

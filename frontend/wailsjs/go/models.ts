@@ -33,12 +33,16 @@ export namespace main {
 	    enterpriseId: string;
 	    expiresAt: string;
 	    expiresIn: string;
-	    expired: boolean;
-	    createdAt: string;
-	
-	    static createFrom(source: any = {}) {
-	        return new AccountView(source);
-	    }
+    expired: boolean;
+    createdAt: string;
+    weight: number;
+    paused: boolean;
+    cooldown: number;
+    cooldownReason: string;
+
+    static createFrom(source: any = {}) {
+        return new AccountView(source);
+    }
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
@@ -50,10 +54,14 @@ export namespace main {
 	        this.enterpriseId = source["enterpriseId"];
 	        this.expiresAt = source["expiresAt"];
 	        this.expiresIn = source["expiresIn"];
-	        this.expired = source["expired"];
-	        this.createdAt = source["createdAt"];
-	    }
-	}
+        this.expired = source["expired"];
+        this.createdAt = source["createdAt"];
+        this.weight = source["weight"];
+        this.paused = source["paused"];
+        this.cooldown = source["cooldown"];
+        this.cooldownReason = source["cooldownReason"];
+    }
+}
 	export class LoginView {
 	    active: boolean;
 	    provider: string;
@@ -87,12 +95,14 @@ export namespace main {
 	    name: string;
 	    provider: string;
 	    context: number;
-	    maxOut: number;
-	    images: boolean;
-	
-	    static createFrom(source: any = {}) {
-	        return new ModelView(source);
-	    }
+    maxOut: number;
+    images: boolean;
+    accounts: number;
+    totalAccounts: number;
+
+    static createFrom(source: any = {}) {
+        return new ModelView(source);
+    }
 	
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
@@ -100,8 +110,10 @@ export namespace main {
 	        this.name = source["name"];
 	        this.provider = source["provider"];
 	        this.context = source["context"];
-	        this.maxOut = source["maxOut"];
-	        this.images = source["images"];
+        this.maxOut = source["maxOut"];
+        this.images = source["images"];
+        this.accounts = source["accounts"];
+        this.totalAccounts = source["totalAccounts"];
 	    }
 	}
 	export class ProfileInput {

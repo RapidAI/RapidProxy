@@ -10,6 +10,7 @@ const S = {
   revealKey: false,
   modelFilter: '',
   dirty: false,
+  stats: { period: 'day', provider: '', model: '', loading: false },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -72,6 +73,17 @@ function formatTokens(value) {
   if (value >= 1000000) return (value / 1000000).toFixed(value % 1000000 === 0 ? 0 : 1) + 'M';
   if (value >= 1000) return Math.round(value / 1000) + 'K';
   return String(value);
+}
+
+/* 把秒数写成短文本：45s / 5m / 1h20m。 */
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm';
+  const h = Math.floor(m / 60);
+  const rest = m % 60;
+  return rest ? h + 'h' + rest + 'm' : h + 'h';
 }
 
 function maskKey(key) {
@@ -206,34 +218,127 @@ function renderLoginProviders() {
   });
 }
 
+/* 重建列表会把正在编辑的输入框一起丢掉——20 秒一次的轮询刷新就会触发，
+ * 用户刚敲进去的权重会被清空。这里记下焦点所在的输入框和光标位置，
+ * 重建后再放回去。 */
+function keepFocus(list, build) {
+  const ae = document.activeElement;
+  const key = ae && ae.dataset ? ae.dataset.focusKey : '';
+  const value = key && 'value' in ae ? ae.value : null;
+  const pos = key && 'selectionStart' in ae ? ae.selectionStart : null;
+  build();
+  if (!key) return;
+  const next = list.querySelector('[data-focus-key="' + CSS.escape(key) + '"]');
+  if (!next) return;
+  // 用户已经改过但还没提交的内容不能被后端的值覆盖回去。
+  if (value !== null && next.value !== value) next.value = value;
+  next.focus();
+  if (pos !== null && next.setSelectionRange) {
+    try { next.setSelectionRange(pos, pos); } catch (e) { /* 部分输入类型不支持 */ }
+  }
+}
+
+/* 账号按「版本」（上游）分组：只有同一组内的账号才会互相负载均衡，
+ * 国内版与国际版的同名模型互不干扰。 */
 function renderAccounts() {
   const list = $('account-list');
-  list.innerHTML = '';
   const accounts = S.state.accounts || [];
   $('accounts-count').textContent = accounts.length ? t('acc.countFmt', { n: accounts.length }) : '';
 
-  if (!accounts.length) {
-    list.appendChild(el('div', 'empty', t('acc.empty')));
+  keepFocus(list, () => {
+    list.innerHTML = '';
+
+    if (!accounts.length) {
+      list.appendChild(el('div', 'empty', t('acc.empty')));
+      return;
+    }
+
+    // 分组顺序跟随上游配置，保证国内版 / 国际版的展示顺序稳定。
+    const order = (S.state.providers || []).map((p) => p.id);
+    const groups = new Map();
+    accounts.forEach((a) => {
+      if (!groups.has(a.provider)) groups.set(a.provider, []);
+      groups.get(a.provider).push(a);
+    });
+    const keys = order.filter((id) => groups.has(id));
+    groups.forEach((_, id) => {
+      if (!keys.includes(id)) keys.push(id);
+    });
+
+    keys.forEach((pid) => {
+      const members = groups.get(pid);
+      const group = el('div', 'account-group');
+      const head = el('div', 'group-head');
+      const name = members[0].providerName || members[0].provider || pid;
+      head.appendChild(el('strong', null, name));
+      head.appendChild(el('span', 'hint', t('acc.group.countFmt', { n: members.length })));
+      const allPaused = members.every((a) => a.paused);
+      head.appendChild(el('span', allPaused ? 'badge warn' : 'hint', allPaused ? t('acc.pausedNote') : t('acc.group.hint')));
+      group.appendChild(head);
+
+      members.forEach((a) => group.appendChild(accountRow(a)));
+      list.appendChild(group);
+    });
+  });
+}
+
+/* 单个账号行：权重输入 + 暂停/恢复 + 删除。 */
+function accountRow(a) {
+  const item = el('div', 'account-item' + (a.paused ? ' paused' : ''));
+  const who = el('div', 'who');
+  who.appendChild(el('strong', null, (a.nickname || a.uid || a.id) + (a.paused ? ' · ' + t('acc.paused') : '')));
+  who.appendChild(el('span', null, 'UID ' + (a.uid || t('acc.uidUnknown'))));
+  who.appendChild(el('span', null, t('acc.signedAtFmt', { time: a.createdAt || '-' })));
+  if (a.cooldown > 0) {
+    const reason = a.cooldownReason === 'credit'
+      ? t('acc.cooldownCredit')
+      : (a.cooldownReason === 'server' ? t('acc.cooldownServer') : t('acc.cooldownRate'));
+    who.appendChild(el('span', 'cooldown-note', t('acc.cooldownFmt', { reason: reason, time: formatDuration(a.cooldown) })));
+  }
+  item.appendChild(who);
+
+  const ops = el('div', 'ops');
+
+  const weightBox = el('label', 'weight-box');
+  weightBox.appendChild(el('span', null, t('acc.weight')));
+  const weight = el('input', 'input weight-input');
+  weight.type = 'number';
+  weight.min = '0';
+  weight.max = '1000';
+  weight.step = '1';
+  weight.value = String(a.weight || 1);
+  weight.title = t('acc.weight.hint');
+  weight.dataset.focusKey = 'w:' + a.provider + ':' + a.id;
+  weight.onchange = () => setWeight(a, weight.value);
+  weightBox.appendChild(weight);
+  ops.appendChild(weightBox);
+
+  const toggle = el('button', 'btn btn-mini', a.paused ? t('btn.resume') : t('btn.pause'));
+  toggle.onclick = () => setPaused(a, !a.paused);
+  ops.appendChild(toggle);
+
+  const badge = el('span', 'badge' + (a.expired ? ' warn' : ''), a.expiresIn || t('acc.expiresUnknown'));
+  ops.appendChild(badge);
+
+  const del = el('button', 'btn btn-mini btn-danger', t('btn.delete'));
+  del.onclick = () => removeAccount(a.provider, a.id, a.nickname || a.id);
+  ops.appendChild(del);
+
+  item.appendChild(ops);
+  return item;
+}
+
+function setWeight(a, raw) {
+  const value = parseInt(raw, 10);
+  if (!Number.isFinite(value) || value < 0 || value > 1000) {
+    toast(t('toast.weightBad'));
     return;
   }
+  guard(a, () => call('SetAccountWeight', a.provider, a.id, value), t('toast.weightSaved'));
+}
 
-  accounts.forEach((a) => {
-    const item = el('div', 'account-item');
-    const who = el('div', 'who');
-    who.appendChild(el('strong', null, a.nickname || a.uid || a.id));
-    who.appendChild(el('span', null, (a.providerName || a.provider) + ' · UID ' + (a.uid || t('acc.uidUnknown'))));
-    who.appendChild(el('span', null, t('acc.signedAtFmt', { time: a.createdAt || '-' })));
-    item.appendChild(who);
-
-    const ops = el('div', 'ops');
-    const badge = el('span', 'badge' + (a.expired ? ' warn' : ''), a.expiresIn || t('acc.expiresUnknown'));
-    ops.appendChild(badge);
-    const del = el('button', 'btn btn-mini btn-danger', t('btn.delete'));
-    del.onclick = () => removeAccount(a.provider, a.id, a.nickname || a.id);
-    ops.appendChild(del);
-    item.appendChild(ops);
-    list.appendChild(item);
-  });
+function setPaused(a, paused) {
+  guard(a, () => call('SetAccountPaused', a.provider, a.id, paused), paused ? t('toast.paused') : t('toast.resumed'));
 }
 
 function renderModels() {
@@ -247,7 +352,7 @@ function renderModels() {
   if (!models.length) {
     const row = el('tr');
     const cell = el('td', 'empty', t('models.noMatch'));
-    cell.colSpan = 6;
+    cell.colSpan = 7;
     row.appendChild(cell);
     body.appendChild(row);
     return;
@@ -259,11 +364,74 @@ function renderModels() {
     const pcell = el('td');
     pcell.appendChild(el('span', 'tag on', m.provider || '-'));
     row.appendChild(pcell);
+    row.appendChild(accountCell(m));
     row.appendChild(el('td', 'mono', formatTokens(m.context)));
     row.appendChild(el('td', 'mono', formatTokens(m.maxOut)));
     row.appendChild(el('td', null, m.images ? t('models.imgYes') : '—'));
+    // 右键菜单：直接复制模型 ID，省得手动选中再复制。
+    row.oncontextmenu = (e) => showModelMenu(e, m);
     body.appendChild(row);
   });
+}
+
+/* 可用账号数：这个模型当前有几个账号能承接请求（其余的已暂停或在冷却中）。 */
+function accountCell(m) {
+  const cell = el('td', 'mono');
+  const total = m.totalAccounts || 0;
+  const avail = m.accounts || 0;
+  if (!total) {
+    cell.appendChild(el('span', 'muted', '-'));
+    return cell;
+  }
+  cell.appendChild(el('span', avail ? 'acct-ok' : 'acct-bad', String(avail)));
+  cell.appendChild(el('span', 'muted', ' / ' + total));
+  cell.title = t('models.accountsHint', { n: avail, total: total });
+  return cell;
+}
+
+/* --------------------------- 模型右键菜单 --------------------------- */
+
+function showModelMenu(e, m) {
+  e.preventDefault();
+  const menu = $('ctx-menu');
+  menu.innerHTML = '';
+  const selection = String(window.getSelection() || '').trim();
+
+  const add = (label, value) => {
+    const item = el('button', 'ctx-item', label);
+    item.onclick = () => {
+      hideModelMenu();
+      copyRaw(value);
+    };
+    menu.appendChild(item);
+  };
+  // 用户在单元格里选中了文字时，优先给「复制选中内容」。
+  if (selection) add(t('ctx.copySelection'), selection);
+  add(t('ctx.copyId'), m.id);
+  if (m.name && m.name !== m.id) add(t('ctx.copyName'), m.name);
+
+  menu.classList.add('show');
+  // 按菜单的真实尺寸贴边：写死 200/120 会在窄窗口或多条目时被裁掉一角，
+  // 靠近右下角时改为向左上翻转。
+  const w = menu.offsetWidth || 200;
+  const h = menu.offsetHeight || 100;
+  const x = e.clientX + w + 8 > window.innerWidth ? Math.max(4, e.clientX - w) : e.clientX;
+  const y = e.clientY + h + 8 > window.innerHeight ? Math.max(4, e.clientY - h) : e.clientY;
+  menu.style.left = x + 'px';
+  menu.style.top = y + 'px';
+}
+
+function hideModelMenu() {
+  $('ctx-menu').classList.remove('show');
+}
+
+async function copyRaw(value) {
+  try {
+    await call('CopyText', value);
+    toast(t('toast.copied'));
+  } catch (err) {
+    toast(t('toast.copyFailedFmt', { err: String(err) }));
+  }
 }
 
 function renderSettings() {
@@ -340,6 +508,257 @@ function renderSettings() {
   $('about-platform').textContent = s.settings.platform;
 }
 
+/* --------------------------- 流量统计 --------------------------- */
+
+/* 构建「组 → 模型」的下拉选项：来源既包含已同步的模型（S.state.models），
+ * 也包含历史上产生过流量的 (组, 模型) 组合（scopes），这样即使某模型当前被停用，
+ * 也能回看它的历史流量。 */
+function buildStatsOptions(scopes) {
+  const providers = [];
+  const modelsByProvider = {};
+  const seenP = {};
+  const seenM = {};
+
+  const ensureProvider = (id, label) => {
+    if (!id) return;
+    if (!modelsByProvider[id]) modelsByProvider[id] = [];
+    if (!seenP[id]) { providers.push({ value: id, label: label || id }); seenP[id] = true; }
+  };
+  const ensureModel = (pid, mid) => {
+    if (!pid || !mid) return;
+    ensureProvider(pid, pid);
+    const key = pid + '|' + mid;
+    if (!seenM[key]) { modelsByProvider[pid].push({ value: mid, label: mid }); seenM[key] = true; }
+  };
+
+  (S.state && S.state.providers || []).forEach((p) => ensureProvider(p.id, p.name));
+  (S.state && S.state.models || []).forEach((m) => ensureModel(m.providerId || m.provider, m.id));
+  (scopes || []).forEach((s) => ensureModel(s.provider, s.model));
+
+  providers.sort((a, b) => a.label.localeCompare(b.label));
+  return { providers: providers, modelsByProvider: modelsByProvider };
+}
+
+/* 用 items 重建 select，尽量保留 sel 当前选中的值（若仍存在于新选项里）。 */
+function fillStatsSelect(sel, items, selectedValue, allLabel) {
+  const prev = selectedValue !== undefined ? selectedValue : sel.value;
+  sel.innerHTML = '';
+  if (allLabel) {
+    const o = el('option');
+    o.value = '';
+    o.textContent = allLabel;
+    sel.appendChild(o);
+  }
+  items.forEach((it) => {
+    const o = el('option');
+    o.value = it.value;
+    o.textContent = it.label;
+    sel.appendChild(o);
+  });
+  if (prev !== undefined && Array.prototype.some.call(sel.options, (o) => o.value === prev)) {
+    sel.value = prev;
+  } else if (allLabel) {
+    sel.value = '';
+  }
+}
+
+async function renderStats() {
+  const providerSel = $('stats-provider');
+  const modelSel = $('stats-model');
+  if (!providerSel || !modelSel) return;
+
+  let scopes = [];
+  try { scopes = await call('GetTrafficScopes'); } catch (err) { scopes = []; }
+
+  const opts = buildStatsOptions(scopes);
+  if (!S.stats.provider) S.stats.provider = (opts.providers[0] && opts.providers[0].value) || '';
+  fillStatsSelect(providerSel, opts.providers, S.stats.provider);
+  S.stats.provider = providerSel.value;
+
+  const models = opts.modelsByProvider[S.stats.provider] || [];
+  fillStatsSelect(modelSel, models, S.stats.model, t('stats.allModels'));
+  S.stats.model = modelSel.value;
+
+  let res;
+  try {
+    res = await call('GetTrafficStats', S.stats.provider, S.stats.model, S.stats.period);
+  } catch (err) {
+    res = null;
+  }
+  if (!res) {
+    $('stats-range').textContent = '';
+    $('stats-cards').innerHTML = '';
+    $('stats-chart').innerHTML = '';
+    $('stats-empty').textContent = t('stats.noData');
+    $('stats-empty').classList.remove('hidden');
+    return;
+  }
+
+  const empty = !res.series || res.series.length === 0 ||
+    res.series.every((p) => !p.in && !p.out && !p.total);
+  $('stats-empty').classList.toggle('hidden', !empty);
+  $('stats-chart').classList.toggle('hidden', empty);
+  if (empty) {
+    $('stats-cards').innerHTML = '';
+    $('stats-chart').innerHTML = '';
+    $('stats-range').textContent = '';
+    return;
+  }
+  renderStatCards(res.summary);
+  $('stats-range').textContent = (res.startLabel && res.endLabel)
+    ? (res.startLabel + '  ' + t('stats.to') + '  ' + res.endLabel)
+    : '';
+  renderTrafficChart($('stats-chart'), res);
+}
+
+function renderStatCards(sum) {
+  const wrap = $('stats-cards');
+  wrap.innerHTML = '';
+  const cards = [
+    { key: 'stats.in', value: formatTokens(sum.in), cls: 'in' },
+    { key: 'stats.out', value: formatTokens(sum.out), cls: 'out' },
+    { key: 'stats.total', value: formatTokens(sum.total), cls: 'total' },
+    { key: 'stats.count', value: String(sum.count ?? '-'), cls: 'count' },
+  ];
+  cards.forEach((c) => {
+    const card = el('div', 'stat-card accent-' + c.cls);
+    card.appendChild(el('div', 'label', t(c.key)));
+    card.appendChild(el('div', 'value', c.value));
+    wrap.appendChild(card);
+  });
+}
+
+/* 手绘 SVG 折线图：输入 / 输出 / 总计 三条线 + 面积，自适应明暗主题。
+ * 不使用任何图表库，纯 DOM/SVG，避免引入前端依赖。 */
+function renderTrafficChart(container, res) {
+  container.innerHTML = '';
+  const series = res.series || [];
+  if (!series.length) return;
+  const hasData = series.some((p) => p.in || p.out || p.total);
+  if (!hasData) return;
+
+  const W = 680, H = 260;
+  const PL = 46, PR = 14, PT = 16, PB = 28;
+  const plotW = W - PL - PR;
+  const plotH = H - PT - PB;
+  const n = series.length;
+  const xAt = (i) => (n === 1 ? PL + plotW / 2 : PL + (plotW * i) / (n - 1));
+
+  let maxV = 0;
+  series.forEach((p) => { maxV = Math.max(maxV, p.in, p.out, p.total); });
+  if (maxV <= 0) return;
+  const step = niceStep(maxV / 4);
+  const topVal = Math.ceil(maxV / step) * step;
+  const yAt = (v) => PT + plotH * (1 - v / topVal);
+
+  const NS = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(NS, 'svg');
+  svg.setAttribute('viewBox', '0 0 ' + W + ' ' + H);
+  svg.setAttribute('width', '100%');
+  svg.setAttribute('preserveAspectRatio', 'xMidYMid meet');
+
+  // 横向网格 + Y 轴刻度（自适应主题，用 CSS 变量着色）
+  const lines = 4;
+  for (let g = 0; g <= lines; g++) {
+    const v = (topVal * g) / lines;
+    const y = yAt(v);
+    const ln = document.createElementNS(NS, 'line');
+    ln.setAttribute('x1', PL); ln.setAttribute('x2', W - PR);
+    ln.setAttribute('y1', y); ln.setAttribute('y2', y);
+    ln.style.stroke = 'var(--border)';
+    ln.style.strokeWidth = '1';
+    svg.appendChild(ln);
+    const tx = document.createElementNS(NS, 'text');
+    tx.setAttribute('x', PL - 6); tx.setAttribute('y', y + 3);
+    tx.setAttribute('text-anchor', 'end');
+    tx.style.fill = 'var(--text-faint)';
+    tx.style.fontSize = '10px';
+    tx.textContent = formatTokens(Math.round(v));
+    svg.appendChild(tx);
+  }
+
+  // X 轴标签（最多约 8 个，避免拥挤）
+  const labelStep = Math.max(1, Math.ceil(n / 8));
+  series.forEach((p, i) => {
+    if (i % labelStep !== 0 && i !== n - 1) return;
+    const tx = document.createElementNS(NS, 'text');
+    tx.setAttribute('x', xAt(i)); tx.setAttribute('y', H - 8);
+    tx.setAttribute('text-anchor', 'middle');
+    tx.style.fill = 'var(--text-faint)';
+    tx.style.fontSize = '10px';
+    tx.textContent = p.label ?? '';
+    svg.appendChild(tx);
+  });
+
+  const defs = [
+    { key: 'in', color: 'var(--accent)', fill: 'rgba(59,130,246,0.10)' },
+    { key: 'out', color: 'var(--accent-violet)', fill: 'rgba(139,92,246,0.10)' },
+    { key: 'total', color: '#10b981', fill: 'rgba(16,185,129,0.08)' },
+  ];
+  const showDots = n <= 16;
+
+  defs.forEach((d) => {
+    let area = xAt(0) + ',' + yAt(0);
+    series.forEach((p, i) => { area += ' ' + xAt(i) + ',' + yAt(p[d.key]); });
+    area += ' ' + xAt(n - 1) + ',' + yAt(0);
+    const polyArea = document.createElementNS(NS, 'polygon');
+    polyArea.setAttribute('points', area);
+    polyArea.style.fill = d.fill;
+    svg.appendChild(polyArea);
+
+    let pts = '';
+    series.forEach((p, i) => { pts += xAt(i) + ',' + yAt(p[d.key]) + ' '; });
+    const poly = document.createElementNS(NS, 'polyline');
+    poly.setAttribute('points', pts.trim());
+    poly.style.fill = 'none';
+    poly.style.stroke = d.color;
+    poly.style.strokeWidth = d.key === 'total' ? '2.4' : '1.8';
+    poly.style.strokeLinejoin = 'round';
+    poly.style.strokeLinecap = 'round';
+    svg.appendChild(poly);
+
+    if (showDots) {
+      series.forEach((p, i) => {
+        const c = document.createElementNS(NS, 'circle');
+        c.setAttribute('cx', xAt(i)); c.setAttribute('cy', yAt(p[d.key])); c.setAttribute('r', '2.2');
+        c.style.fill = d.color;
+        svg.appendChild(c);
+      });
+    }
+  });
+
+  // 图例（HTML，便于多语言与配色说明）
+  const legend = el('div', 'chart-legend');
+  [
+    ['var(--accent)', t('stats.in')],
+    ['var(--accent-violet)', t('stats.out')],
+    ['#10b981', t('stats.total')],
+  ].forEach((pair) => {
+    const item = el('span', 'legend-item');
+    const chip = el('span', 'legend-chip');
+    chip.style.background = pair[0];
+    item.appendChild(chip);
+    item.appendChild(el('span', null, pair[1]));
+    legend.appendChild(item);
+  });
+
+  container.appendChild(legend);
+  container.appendChild(svg);
+}
+
+/* 把任意正数映射成「整齐」的坐标轴步长（1/2/5 × 10^n）。 */
+function niceStep(raw) {
+  if (!(raw > 0)) return 1;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const norm = raw / mag;
+  let nice;
+  if (norm <= 1) nice = 1;
+  else if (norm <= 2) nice = 2;
+  else if (norm <= 5) nice = 5;
+  else nice = 10;
+  return nice * mag;
+}
+
 function renderAll() {
   if (!S.state) return;
   syncLanguage();
@@ -352,6 +771,8 @@ function renderAll() {
   renderAccounts();
   renderModels();
   renderSettings();
+  // 流量统计只在对应标签页激活时才拉取，避免 20 秒轮询对它做无谓的后端调用。
+  if ($('tab-stats') && $('tab-stats').classList.contains('active')) renderStats();
   refreshSample();
 }
 
@@ -368,7 +789,10 @@ async function refreshSample() {
   }
 }
 
+let _refreshing = false;
 async function refresh() {
+  if (_refreshing) return; // 防止轮询与手动刷新重叠导致重复渲染 / 竞态覆盖 S.state
+  _refreshing = true;
   try {
     S.state = await call('GetState');
     S.logs = S.state.logs || [];
@@ -376,6 +800,8 @@ async function refresh() {
     renderAll();
   } catch (err) {
     toast(t('toast.stateFailedFmt', { err: String(err) }));
+  } finally {
+    _refreshing = false;
   }
 }
 
@@ -388,6 +814,18 @@ async function startLogin(provider) {
     renderLogin();
   } catch (err) {
     toast(t('toast.loginStartFailedFmt', { err: String(err) }));
+    await refresh();
+  }
+}
+
+/* 账号类操作的统一包装：成功提示并刷新，失败提示原因。 */
+async function guard(_target, run, okMessage) {
+  try {
+    await run();
+    toast(okMessage);
+    await refresh();
+  } catch (err) {
+    toast(t('toast.opFailedFmt', { err: String(err) }));
     await refresh();
   }
 }
@@ -430,7 +868,7 @@ async function saveSettings() {
   const profiles = Array.from(document.querySelectorAll('#provider-config input[type=checkbox]')).map((c) => ({
     id: c.dataset.provider,
     enabled: c.checked,
-    proxy: (document.querySelector('input[data-provider="' + c.dataset.provider + '"][type=text]') || {}).value || '',
+    proxy: (Array.from(document.querySelectorAll('#provider-config input[type=text]')).find((i) => i.dataset.provider === c.dataset.provider) || {}).value || '',
   }));
   const input = {
     listen: $('set-listen').value.trim(),
@@ -485,12 +923,24 @@ function bindUI() {
       document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
       btn.classList.add('active');
       $('tab-' + btn.dataset.tab).classList.add('active');
+      if (btn.dataset.tab === 'stats') renderStats();
     };
   });
 
   document.querySelectorAll('[data-copy]').forEach((btn) => {
     btn.onclick = () => copyFrom($(btn.dataset.copy));
   });
+
+  // 右键菜单：点空白处、滚动、缩放时收起。
+  // 菜单是 fixed 定位的，表格滚动时它会原地不动、脱离原来指向的那一行，
+  // 所以滚动也必须收起。
+  document.addEventListener('click', hideModelMenu);
+  document.addEventListener('contextmenu', (e) => {
+    if (!e.target.closest('#model-body tr')) hideModelMenu();
+  });
+  document.addEventListener('scroll', hideModelMenu, true);
+  window.addEventListener('blur', hideModelMenu);
+  window.addEventListener('resize', hideModelMenu);
 
   $('btn-toggle').onclick = toggleService;
   $('btn-hide').onclick = () => call('HideWindow').catch(() => {});
@@ -562,6 +1012,18 @@ function bindUI() {
       toast(t('toast.genFailedFmt', { err: String(err) }));
     }
   };
+
+  // 流量统计：组 / 模型 / 周期切换
+  $('stats-provider').onchange = () => { S.stats.provider = $('stats-provider').value; S.stats.model = ''; renderStats(); };
+  $('stats-model').onchange = () => { S.stats.model = $('stats-model').value; renderStats(); };
+  document.querySelectorAll('#stats-period .seg-btn').forEach((b) => {
+    b.onclick = () => {
+      document.querySelectorAll('#stats-period .seg-btn').forEach((x) => x.classList.remove('active'));
+      b.classList.add('active');
+      S.stats.period = b.dataset.period;
+      renderStats();
+    };
+  });
 
   // 在线更新
   $('btn-check-update').onclick = checkUpdate;

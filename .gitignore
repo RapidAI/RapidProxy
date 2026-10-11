@@ -17,3 +17,6 @@ accounts/
 .idea/
 .vscode/
 .DS_Store
+
+# 临时截图/二维码
+qrcode-*.png

@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/znsoftm/RapidProxy/internal/config"
 )
@@ -143,5 +144,26 @@ func TestEmbeddedAuthURL(t *testing.T) {
 	empty := &LoginSession{AuthURL: "https://www.workbuddy.ai/login?state=s"}
 	if strings.Contains(empty.EmbeddedAuthURL(""), "parent_origin") {
 		t.Error("空 origin 不应写入 parent_origin")
+	}
+}
+
+// truncate 必须按字符切而不是按字节切。
+//
+// 上游错误正文基本都是中文，按字节切会在中间截断 UTF-8 序列，
+// 传到客户端和日志里就是乱码。
+func TestTruncateKeepsValidUTF8(t *testing.T) {
+	msg := "上游额度已用尽，请充值后再试"
+	got := truncate(msg, 6)
+	if got != "上游额度已用" {
+		t.Fatalf("截断结果不对: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Fatalf("截断产生了非法 UTF-8: %q", got)
+	}
+	if truncate("abc", 10) != "abc" {
+		t.Error("短于上限时不应截断")
+	}
+	if truncate("abc", 0) != "" {
+		t.Error("上限为 0 时应返回空串")
 	}
 }

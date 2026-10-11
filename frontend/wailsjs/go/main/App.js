@@ -38,6 +38,14 @@ export function GetState() {
   return window['go']['main']['App']['GetState']();
 }
 
+export function GetTrafficStats(arg1, arg2, arg3) {
+  return window['go']['main']['App']['GetTrafficStats'](arg1, arg2, arg3);
+}
+
+export function GetTrafficScopes() {
+  return window['go']['main']['App']['GetTrafficScopes']();
+}
+
 export function HideWindow() {
   return window['go']['main']['App']['HideWindow']();
 }
@@ -72,6 +80,14 @@ export function RestartService() {
 
 export function SaveSettings(arg1) {
   return window['go']['main']['App']['SaveSettings'](arg1);
+}
+
+export function SetAccountPaused(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetAccountPaused'](arg1, arg2, arg3);
+}
+
+export function SetAccountWeight(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetAccountWeight'](arg1, arg2, arg3);
 }
 
 export function ShowWindow() {

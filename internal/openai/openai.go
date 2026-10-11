@@ -5,8 +5,10 @@ import (
 	"bufio"
 	"encoding/json"
 	"io"
+	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // ErrorDetail 是 OpenAI 风格的错误体。
@@ -104,6 +106,13 @@ func PrepareRequestBody(payload []byte, opts TransformOptions) ([]byte, map[stri
 	}
 	obj["stream"] = true
 
+	// 要求上游在流的末尾附带 usage（token 用量），否则流式响应里拿不到用量，
+	// 流量统计便无从记录。绝大多数 OpenAI 兼容网关忽略未知字段，个别不支持的
+	// 也只当没这回事，不影响正常应答。
+	if _, ok := obj["stream_options"].(map[string]any); !ok {
+		obj["stream_options"] = map[string]any{"include_usage": true}
+	}
+
 	ensureSystemPrompt(obj)
 	if opts.Sanitize {
 		rewriteMessages(obj)
@@ -177,7 +186,14 @@ func ReadSSEEvents(r io.Reader, fn func(data string) error) error {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
 	for scanner.Scan() {
-		data := stripDataPrefix(scanner.Text())
+		line := strings.TrimRight(scanner.Text(), "\r")
+		// 只处理 data 事件：跳过 SSE 注释（以 ":" 开头，如 OpenAI 的 ": ping"
+		// 心跳）以及 event:/id:/retry: 等其它字段行。否则上游的注释行会被当成
+		// 一条空 data 事件原样转发给客户端，让严格 JSON 解析的 SDK 在流中途报错。
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := stripDataPrefix(line)
 		if data == "" || data == "[DONE]" {
 			continue
 		}
@@ -248,23 +264,66 @@ func isEmptyValue(v any) bool {
 	return false
 }
 
+// StreamError 是上游在 SSE 流里下发的错误事件。
+//
+// 上游会以 200 + text/event-stream 的形式回报失败（状态码完全正常），
+// 调用方需要能把它和「读取流失败」区分开：前者是上游明确报错。
+type StreamError struct {
+	Message string
+}
+
+func (e *StreamError) Error() string { return e.Message }
+
+// choiceState 累积单个 choice（index）的增量内容。
+type choiceState struct {
+	index     int
+	role      string
+	finish    string
+	content   strings.Builder
+	reasoning strings.Builder
+	toolCalls []map[string]any
+	toolIndex map[int]map[string]any
+}
+
 // Aggregate 把上游 SSE 流折叠成一个非流式的 chat.completion 响应体。
+//
+// 几个容易踩的点都在这里处理了：
+//   - 上游可能用 delta（增量）或 message（整段）下发内容，两种都要认，
+//     只认 delta 会把 message 形态的内容整个丢掉，客户端收到空回复；
+//   - 流里可能夹带 {"error":{...}} 事件，必须报出来而不是静默跳过——
+//     否则客户端拿到 200 + 空回复，以为成功却什么都没发生；
+//   - 客户端传 n>1 时每个 chunk 会带多个 choices，必须按 index 分开累积，
+//     否则不同 choice 的内容会拼进同一条消息。
 func Aggregate(r io.Reader, fallbackModel string) ([]byte, error) {
 	var (
-		role, respModel, respID, finish string
-		created                         int64
-		usage                           map[string]any
-		toolCalls                       []map[string]any
-		toolCallIndex                   = map[int]map[string]any{}
-		// 用 Builder 而不是 content += ：流式分块可能有几千片，
-		// 逐个拼接是 O(n²) 的拷贝。
-		content, reasoning strings.Builder
+		respModel, respID, finish string
+		created                   int64
+		usage                     map[string]any
+		choices                   = map[int]*choiceState{}
 	)
+
+	get := func(idx int) *choiceState {
+		st, ok := choices[idx]
+		if !ok {
+			st = &choiceState{index: idx, toolIndex: map[int]map[string]any{}}
+			choices[idx] = st
+		}
+		return st
+	}
 
 	err := ReadSSEEvents(r, func(data string) error {
 		var chunk map[string]any
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			return nil
+		}
+		// 流中错误事件：上游以 200 + SSE 的形式回报失败（状态码上看不出来）。
+		// 必须确认真的带了错误文案才当成错误——某些上游的正常 chunk 可能带
+		// "error": null 或空对象，若不分青红皂白地当成失败，会凭空把一次成功的
+		// 请求打成错误返回。
+		if env, ok := chunk["error"]; ok && env != nil {
+			if msg, ok := extractErrorText(env); ok {
+				return &StreamError{Message: msg}
+			}
 		}
 		if v, ok := chunk["id"].(string); ok && v != "" {
 			respID = v
@@ -275,28 +334,30 @@ func Aggregate(r io.Reader, fallbackModel string) ([]byte, error) {
 		if v, ok := chunk["created"].(float64); ok {
 			created = int64(v)
 		}
-		if v, ok := chunk["usage"].(map[string]any); ok {
+		// usage 通常只在最后一个 chunk 出现，带完整字段；后到的覆盖先到的。
+		if v, ok := chunk["usage"].(map[string]any); ok && v != nil {
 			usage = v
 		}
-		choices, _ := chunk["choices"].([]any)
-		for _, raw := range choices {
+
+		list, _ := chunk["choices"].([]any)
+		for _, raw := range list {
 			choice, _ := raw.(map[string]any)
-			if delta, ok := choice["delta"].(map[string]any); ok {
-				if v, ok := delta["role"].(string); ok && v != "" {
-					role = v
-				}
-				if v, ok := delta["content"].(string); ok {
-					content.WriteString(v)
-				}
-				if v, ok := delta["reasoning_content"].(string); ok {
-					reasoning.WriteString(v)
-				}
-				if tcs, ok := delta["tool_calls"].([]any); ok {
-					toolCalls = mergeToolCalls(tcs, toolCallIndex, toolCalls)
-				}
+			// 没有 index 时按出现顺序当作 0，与 OpenAI 的行为一致。
+			idx := 0
+			if f, ok := choice["index"].(float64); ok {
+				idx = int(f)
 			}
+			st := get(idx)
 			if v, ok := choice["finish_reason"].(string); ok && v != "" {
+				st.finish = v
 				finish = v
+			}
+			// delta 是增量、message 是整段，两种形态都要读。
+			if delta, ok := choice["delta"].(map[string]any); ok {
+				applyDelta(st, delta)
+			}
+			if msg, ok := choice["message"].(map[string]any); ok {
+				applyDelta(st, msg)
 			}
 		}
 		return nil
@@ -305,31 +366,99 @@ func Aggregate(r io.Reader, fallbackModel string) ([]byte, error) {
 		return nil, err
 	}
 
-	message := map[string]any{"role": firstNonEmpty(role, "assistant"), "content": content.String()}
-	if reasoning.Len() > 0 {
-		message["reasoning_content"] = reasoning.String()
-	}
-	if len(toolCalls) > 0 {
-		message["tool_calls"] = toolCalls
-	}
 	if created == 0 {
 		created = time.Now().Unix()
 	}
+	// 按 index 升序输出，保证响应稳定（map 迭代顺序是随机的）。
+	idxs := make([]int, 0, len(choices))
+	for idx := range choices {
+		idxs = append(idxs, idx)
+	}
+	sort.Ints(idxs)
+
+	out := make([]map[string]any, 0, len(idxs))
+	for _, idx := range idxs {
+		st := choices[idx]
+		message := map[string]any{
+			"role":    firstNonEmpty(st.role, "assistant"),
+			"content": st.content.String(),
+		}
+		if st.reasoning.Len() > 0 {
+			message["reasoning_content"] = st.reasoning.String()
+		}
+		if len(st.toolCalls) > 0 {
+			message["tool_calls"] = st.toolCalls
+		}
+		out = append(out, map[string]any{
+			"index":         idx,
+			"message":       message,
+			"finish_reason": firstNonEmpty(st.finish, "stop"),
+		})
+	}
+	// 上游一个 choice 都没下发（空流）时也给一条，客户端解析不至于炸。
+	if len(out) == 0 {
+		out = append(out, map[string]any{
+			"index": 0,
+			"message": map[string]any{
+				"role":    "assistant",
+				"content": "",
+			},
+			"finish_reason": firstNonEmpty(finish, "stop"),
+		})
+	}
+
 	result := map[string]any{
 		"id":      firstNonEmpty(respID, "chatcmpl-workbuddy"),
 		"object":  "chat.completion",
 		"created": created,
 		"model":   firstNonEmpty(respModel, fallbackModel),
-		"choices": []map[string]any{{
-			"index":         0,
-			"message":       message,
-			"finish_reason": firstNonEmpty(finish, "stop"),
-		}},
+		"choices": out,
 	}
 	if usage != nil {
 		result["usage"] = usage
 	}
 	return json.Marshal(result)
+}
+
+// applyDelta 把一个 delta / message 对象累加进对应 choice。
+func applyDelta(st *choiceState, d map[string]any) {
+	if v, ok := d["role"].(string); ok && v != "" {
+		st.role = v
+	}
+	if v, ok := d["content"].(string); ok {
+		st.content.WriteString(v)
+	}
+	if v, ok := d["reasoning_content"].(string); ok {
+		st.reasoning.WriteString(v)
+	}
+	if tcs, ok := d["tool_calls"].([]any); ok {
+		st.toolCalls = mergeToolCalls(tcs, st.toolIndex, st.toolCalls)
+	}
+}
+
+// extractErrorText 把流中 error 字段还原成一句可读文案。
+//
+// 返回 (msg, true) 表示确实是错误事件；返回 ("", false) 表示这个 error 字段
+// 没有携带任何有用的错误文案（例如 null 或空对象），不应被当成失败。
+func extractErrorText(v any) (string, bool) {
+	switch e := v.(type) {
+	case string:
+		if e == "" {
+			return "", false
+		}
+		return e, true
+	case map[string]any:
+		if msg, ok := e["message"].(string); ok && msg != "" {
+			return msg, true
+		}
+		if msg, ok := e["msg"].(string); ok && msg != "" {
+			return msg, true
+		}
+		// 非空对象但两个字段都没有可读文案：不当作错误。
+		return "", false
+	}
+	// null、数字、布尔、数组等都不构成可识别的错误。
+	return "", false
 }
 
 // mergeToolCalls 按 index 合并增量下发的工具调用片段。
@@ -389,4 +518,22 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+// truncateText 按字符截断（上游错误正文多为中文，按字节切会产生非法 UTF-8）。
+func truncateText(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
 }

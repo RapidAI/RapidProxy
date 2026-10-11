@@ -5,6 +5,7 @@ package config
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -389,13 +390,14 @@ func (c *Config) SyncInterval() time.Duration {
 // RequiresAPIKey 返回是否强制校验下游密钥。
 func (c *Config) RequiresAPIKey() bool { return len(c.APIKeys) > 0 }
 
-// CheckAPIKey 校验下游传入的密钥。
+// CheckAPIKey 校验下游传入的密钥。使用恒定时间比较，避免计时侧信道。
 func (c *Config) CheckAPIKey(key string) bool {
 	if !c.RequiresAPIKey() {
 		return true
 	}
+	keyB := []byte(key)
 	for _, k := range c.APIKeys {
-		if k == key {
+		if subtle.ConstantTimeCompare(keyB, []byte(k)) == 1 {
 			return true
 		}
 	}

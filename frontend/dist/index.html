@@ -21,6 +21,7 @@
         <button class="nav-item active" data-tab="overview"><span class="nav-dot"></span><span data-i18n="nav.overview">概览</span></button>
         <button class="nav-item" data-tab="accounts"><span class="nav-dot"></span><span data-i18n="nav.accounts">账号</span></button>
         <button class="nav-item" data-tab="models"><span class="nav-dot"></span><span data-i18n="nav.models">模型</span></button>
+        <button class="nav-item" data-tab="stats"><span class="nav-dot"></span><span data-i18n="nav.stats">流量统计</span></button>
         <button class="nav-item" data-tab="settings"><span class="nav-dot"></span><span data-i18n="nav.settings">设置</span></button>
         <button class="nav-item" data-tab="about"><span class="nav-dot"></span><span data-i18n="nav.about">关于</span></button>
       </nav>
@@ -172,6 +173,7 @@
                     <th data-i18n="th.id">模型 ID</th>
                     <th data-i18n="th.name">名称</th>
                     <th data-i18n="th.provider">上游</th>
+                    <th data-i18n="th.accounts">可用账号</th>
                     <th data-i18n="th.context">上下文</th>
                     <th data-i18n="th.maxOut">最大输出</th>
                     <th data-i18n="th.images">图片</th>
@@ -180,6 +182,42 @@
                 <tbody id="model-body"></tbody>
               </table>
             </div>
+          </div>
+        </section>
+
+        <!-- 流量统计 -->
+        <section class="tab" id="tab-stats">
+          <div class="card">
+            <div class="card-head">
+              <h2 data-i18n="stats.title">流量统计</h2>
+              <span class="hint" data-i18n="stats.hint">按组（上游）与模型查看 token 用量，支持日 / 周 / 月切换</span>
+            </div>
+            <div class="stats-controls">
+              <label class="form-item">
+                <span data-i18n="stats.group">组（上游）</span>
+                <select class="input" id="stats-provider"></select>
+              </label>
+              <label class="form-item">
+                <span data-i18n="stats.model">模型</span>
+                <select class="input" id="stats-model"></select>
+              </label>
+              <div class="seg" id="stats-period">
+                <button class="seg-btn active" data-period="day" data-i18n="stats.period.day">日</button>
+                <button class="seg-btn" data-period="week" data-i18n="stats.period.week">周</button>
+                <button class="seg-btn" data-period="month" data-i18n="stats.period.month">月</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="stat-cards" id="stats-cards"></div>
+
+          <div class="card">
+            <div class="card-head">
+              <h2 data-i18n="stats.trend">流量趋势</h2>
+              <span class="hint" id="stats-range"></span>
+            </div>
+            <div id="stats-chart" class="chart"></div>
+            <div id="stats-empty" class="empty hidden" data-i18n="stats.empty">该范围暂无流量数据，发起一些请求后再来看这里</div>
           </div>
         </section>
 
@@ -299,6 +337,7 @@
     </main>
   </div>
 
+  <div class="ctx-menu" id="ctx-menu"></div>
   <div class="toast" id="toast"></div>
   <script src="i18n.js"></script>
   <script src="app.js"></script>

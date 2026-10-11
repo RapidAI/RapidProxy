@@ -8,12 +8,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	wailsrt "github.com/wailsapp/wails/v2/pkg/runtime"
@@ -23,6 +25,7 @@ import (
 	"github.com/znsoftm/RapidProxy/internal/config"
 	"github.com/znsoftm/RapidProxy/internal/locale"
 	"github.com/znsoftm/RapidProxy/internal/proxysrv"
+	"github.com/znsoftm/RapidProxy/internal/stats"
 	"github.com/znsoftm/RapidProxy/internal/store"
 	"github.com/znsoftm/RapidProxy/internal/tray"
 	"github.com/znsoftm/RapidProxy/internal/update"
@@ -39,7 +42,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.2.4"
+const Version = "1.2.5"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -78,6 +81,13 @@ type AccountView struct {
 	ExpiresIn    string `json:"expiresIn"`
 	Expired      bool   `json:"expired"`
 	CreatedAt    string `json:"createdAt"`
+	// Weight 是组内负载均衡权重，Paused 为 true 时不参与转发。
+	Weight int  `json:"weight"`
+	Paused bool `json:"paused"`
+	// Cooldown 是限流/额度冷却的剩余时间（秒），0 表示正常。
+	Cooldown int `json:"cooldown"`
+	// CooldownReason 说明冷却原因：rate（限流）或 credit（额度耗尽）。
+	CooldownReason string `json:"cooldownReason,omitempty"`
 }
 
 // ProviderView 是上游配置项。
@@ -95,12 +105,17 @@ type ProviderView struct {
 
 // ModelView 是模型列表项。
 type ModelView struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	Context  int64  `json:"context"`
-	MaxOut   int64  `json:"maxOut"`
-	Images   bool   `json:"images"`
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	Provider   string `json:"provider"`   // 上游显示名
+	ProviderID string `json:"providerId"` // 上游 ID（统计与路由使用）
+	Context    int64  `json:"context"`
+	MaxOut     int64  `json:"maxOut"`
+	Images     bool   `json:"images"`
+	// Accounts 是当前能承接该模型请求的账号数，TotalAccounts 是该版本已登录的总数。
+	// 多个账号时同名模型会在它们之间按权重分摊，这个数字就是分摊的宽度。
+	Accounts      int `json:"accounts"`
+	TotalAccounts int `json:"totalAccounts"`
 }
 
 // SettingsView 是设置面板数据。
@@ -288,8 +303,13 @@ func (a *App) startup(ctx context.Context) {
 	}
 
 	// 后台静默检查一次更新（失败不打扰用户，结果通过 update 事件推送）
-	go func() {
-		time.Sleep(4 * time.Second)
+	go func(ctx context.Context) {
+		select {
+		case <-time.After(4 * time.Second):
+		case <-ctx.Done():
+			// 程序已在 4 秒窗口内退出/关闭：放弃检查，不再发起网络请求。
+			return
+		}
 		if a.quitting.Load() {
 			return
 		}
@@ -306,7 +326,7 @@ func (a *App) startup(ctx context.Context) {
 				Message: locale.T("upd.availableSettings", rel.Version),
 			})
 		}
-	}()
+	}(ctx)
 }
 
 func (a *App) context() context.Context {
@@ -562,6 +582,10 @@ func (a *App) QuitApp() {
 }
 
 // runHeadless 在界面不可用时退化为后台服务，仅保留托盘与 OpenAI 接口。
+//
+// 用信号而非裸 select{} 等待：收到 SIGINT/SIGTERM（终端 Ctrl+C、服务管理器停止）
+// 时先优雅停止服务（落盘 traffic.json、关闭统计协程）再退出，避免进程被强杀导致
+// 最近 15 秒的统计计数丢失。
 func (a *App) runHeadless() {
 	a.headless.Store(true)
 	if err := a.StartService(); err != nil {
@@ -569,7 +593,15 @@ func (a *App) runHeadless() {
 		os.Exit(1)
 	}
 	a.log.Infof("已进入后台模式（无界面）：接口地址 %s，可从托盘图标退出", a.settings().OpenAIBaseURL())
-	select {}
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt, syscall.SIGTERM)
+	<-sig
+	a.log.Infof("收到退出信号，正在停止后台服务")
+	if err := a.StopService(); err != nil {
+		a.log.Warnf("停止服务时出错: %v", err)
+	}
+	a.log.Close()
+	os.Exit(0)
 }
 
 // -----------------------------------------------------------------------------
@@ -593,7 +625,10 @@ func (a *App) GetState() StateView {
 		view.Listen = addr
 	}
 	// 凭据目录只读一次，供上游列表与账号列表共用（每次 GetState 都会被调用）。
-	creds, _ := a.store.List("")
+	creds := []*upstream.Credential(nil)
+	if a.store != nil {
+		creds, _ = a.store.List("")
+	}
 	view.Providers = a.providerViews(creds)
 	view.Accounts = a.accountViews(creds)
 	view.Models = a.modelViews()
@@ -609,9 +644,12 @@ func (a *App) GetState() StateView {
 		ConfigPath:     cfg.Path(),
 		DataDir:        a.dataDir,
 		LogPath:        a.log.FilePath(),
-		AccountDir:     a.store.Root(),
+		AccountDir:     "",
 		Version:        Version,
 		Platform:       runtime.GOOS + "/" + runtime.GOARCH,
+	}
+	if a.store != nil {
+		view.Settings.AccountDir = a.store.Root()
 	}
 	return view
 }
@@ -693,6 +731,12 @@ func (a *App) accountViews(creds []*upstream.Credential) []AccountView {
 		if view.ProviderName == "" {
 			view.ProviderName = c.Provider
 		}
+		view.Weight = c.EffectiveWeight()
+		view.Paused = c.Paused
+		if left, reason := a.srv.CooldownInfo(c.ID); left > 0 {
+			view.Cooldown = int(left.Seconds())
+			view.CooldownReason = reason
+		}
 		if !expiresAt.IsZero() {
 			view.ExpiresAt = expiresAt.Format("2006-01-02 15:04")
 			view.ExpiresIn = humanDuration(time.Until(expiresAt))
@@ -718,15 +762,25 @@ func (a *App) modelViews() []ModelView {
 		names[p.ID] = p.Name
 	}
 	models := a.srv.AllModels()
+	// 账号统计按上游缓存：同一个版本的模型共用一组账号。
+	stats := map[string]struct{ avail, total int }{}
 	out := make([]ModelView, 0, len(models))
 	for _, m := range models {
+		st, ok := stats[m.Provider]
+		if !ok {
+			st.avail, st.total = a.srv.AccountStats(m.Provider)
+			stats[m.Provider] = st
+		}
 		out = append(out, ModelView{
-			ID:       m.ID,
-			Name:     m.DisplayName,
-			Provider: names[m.Provider],
-			Context:  m.ContextLength,
-			MaxOut:   m.MaxOutputTokens,
-			Images:   m.SupportsImages,
+			ID:            m.ID,
+			Name:          m.DisplayName,
+			Provider:      names[m.Provider],
+			ProviderID:    m.Provider,
+			Context:       m.ContextLength,
+			MaxOut:        m.MaxOutputTokens,
+			Images:        m.SupportsImages,
+			Accounts:      st.avail,
+			TotalAccounts: st.total,
 		})
 	}
 	return out
@@ -739,6 +793,34 @@ func (a *App) GetLogs() []string { return a.log.Tail(300) }
 func (a *App) ClearLogs() {
 	a.log.Clear()
 	a.pushState()
+}
+
+// -----------------------------------------------------------------------------
+// 流量统计
+// -----------------------------------------------------------------------------
+
+// GetTrafficStats 返回按组（provider）按模型（model）的流量统计。
+//
+// period 取值 day / week / month（其它值按 day 处理）。model 为空表示汇总该组
+// 全部模型。返回本期汇总与趋势序列（日视图为 24 个小时点，周/月为按天）。
+func (a *App) GetTrafficStats(provider, model, period string) (stats.Result, error) {
+	if a.srv == nil || a.srv.Stats() == nil {
+		return stats.Result{}, nil
+	}
+	switch period {
+	case "week", "month":
+	default:
+		period = "day"
+	}
+	return a.srv.Stats().Query(provider, model, period, time.Now()), nil
+}
+
+// GetTrafficScopes 返回「已有流量数据」的 (组, 模型) 组合，供界面默认选中。
+func (a *App) GetTrafficScopes() ([]stats.Scope, error) {
+	if a.srv == nil || a.srv.Stats() == nil {
+		return []stats.Scope{}, nil
+	}
+	return a.srv.Stats().Scopes(), nil
 }
 
 // -----------------------------------------------------------------------------
@@ -933,10 +1015,20 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 			if cred == nil {
 				continue
 			}
-			if err := a.store.Save(cred); err != nil {
+			// 凭据 ID 是 provider+uid，重新登录同一账号会算出同一个 ID。
+			// 用保留本地字段的写法，否则用户在界面上配的权重和「暂停」
+			// 开关会在每次重新登录后被悄悄清成默认值。
+			if a.store == nil {
+				a.finishLogin(run, "failed", locale.T("login.saveFailed", "凭据仓库不可用"), "")
+				return
+			}
+			if err := a.store.SavePreservingLocalFields(cred); err != nil {
 				a.finishLogin(run, "failed", locale.T("login.saveFailed", err.Error()), "")
 				return
 			}
+			// 凭据清单有缓存：不失效的话，紧接着的 RefreshModels 还看不这个新账号，
+			// 会把这一版当成「未登录」而清空模型列表。
+			a.srv.InvalidateAccounts()
 			a.log.Infof("登录成功: %s（%s）", cred.DisplayName(), cred.ID)
 			a.finishLogin(run, "success", locale.T("login.success"), cred.ID)
 			go func() {
@@ -1006,10 +1098,62 @@ func (a *App) loginState() LoginView {
 
 // DeleteAccount 删除一个账号。
 func (a *App) DeleteAccount(provider, id string) error {
+	if a.store == nil {
+		return errors.New("凭据仓库不可用")
+	}
 	if err := a.store.Delete(provider, id); err != nil {
 		return err
 	}
 	a.log.Infof("已删除账号 %s", id)
+	// 删掉的是该版本最后一个账号时，这一版的模型要从列表里消失，
+	// 所以立即失效登录缓存并重建模型列表。
+	a.srv.InvalidateAccounts()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		a.srv.RefreshModels(ctx)
+		a.pushState()
+	}()
+	a.pushState()
+	return nil
+}
+
+// SetAccountWeight 设置账号在同组（同一上游）内的负载均衡权重。
+//
+// 权重 <=0 或未设置时按 1 处理，即组内默认同权。
+func (a *App) SetAccountWeight(provider, id string, weight int) error {
+	if weight < 0 {
+		weight = 0
+	}
+	if weight > 1000 {
+		weight = 1000
+	}
+	effective := weight
+	if err := a.srv.UpdateCredential(provider, id, func(cred *upstream.Credential) error {
+		cred.Weight = weight
+		effective = cred.EffectiveWeight()
+		return nil
+	}); err != nil {
+		return err
+	}
+	a.log.Infof("账号 %s 权重设为 %d", id, effective)
+	a.pushState()
+	return nil
+}
+
+// SetAccountPaused 暂停或恢复一个账号；暂停的账号保留凭据但不参与转发。
+func (a *App) SetAccountPaused(provider, id string, paused bool) error {
+	if err := a.srv.UpdateCredential(provider, id, func(cred *upstream.Credential) error {
+		cred.Paused = paused
+		return nil
+	}); err != nil {
+		return err
+	}
+	if paused {
+		a.log.Infof("账号 %s 已暂停", id)
+	} else {
+		a.log.Infof("账号 %s 已恢复", id)
+	}
 	a.pushState()
 	return nil
 }
@@ -1127,7 +1271,12 @@ func isAnyHost(host string) bool {
 // OpenURL 用系统默认浏览器打开链接。
 func (a *App) OpenURL(url string) {
 	ctx := a.context()
-	if ctx == nil || strings.TrimSpace(url) == "" {
+	url = strings.TrimSpace(url)
+	if ctx == nil || url == "" {
+		return
+	}
+	// 只允许 http/https，避免 javascript: 等危险 scheme 被交给系统打开。
+	if !strings.HasPrefix(url, "http://") && !strings.HasPrefix(url, "https://") {
 		return
 	}
 	wailsrt.BrowserOpenURL(ctx, url)

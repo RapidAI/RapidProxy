@@ -25,6 +25,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/znsoftm/RapidProxy/internal/config"
 )
@@ -65,6 +66,19 @@ type Credential struct {
 	Account   Account   `json:"account"`
 	CreatedAt time.Time `json:"createdAt,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt,omitempty"`
+	// Weight 是同组（同一上游）内负载均衡的权重；
+	// 未设置或 <=0 时按 1 处理，即组内默认同权。
+	Weight int `json:"weight,omitempty"`
+	// Paused 为 true 时该账号暂不参与转发，但不删除、保留凭据。
+	Paused bool `json:"paused,omitempty"`
+}
+
+// EffectiveWeight 返回参与负载均衡的权重，未设置（<=0）时为 1。
+func (c *Credential) EffectiveWeight() int {
+	if c.Weight > 0 {
+		return c.Weight
+	}
+	return 1
 }
 
 // DisplayName 返回给界面展示的账号名。
@@ -623,9 +637,23 @@ func shortHash(value string) string {
 	return hex.EncodeToString(sum[:8])
 }
 
+// truncate 按字符数截断字符串，用于把上游错误正文压成一行。
+//
+// 必须按 rune 而不是字节切：上游返回的多半是中文错误提示，
+// 按字节截会在中间切断 UTF-8 序列，界面上直接显示成乱码。
 func truncate(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n]
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
 }

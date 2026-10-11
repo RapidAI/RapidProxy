@@ -2,8 +2,10 @@ package openai
 
 import (
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestPrepareRequestBodyForcesStreamAndSanitizes(t *testing.T) {
@@ -208,5 +210,167 @@ func TestPrepareRequestBodyKeepsExistingSystemPrompt(t *testing.T) {
 	}
 	if role, _ := msgs[0].(map[string]any)["role"].(string); role != "system" {
 		t.Fatalf("首条应保持 system，实际 %v", msgs[0])
+	}
+}
+
+// 上游可能用 message（整段）而不是 delta（增量）下发内容。
+// 只认 delta 会把 message 形态的内容整个丢掉，客户端收到空回复。
+func TestAggregateAcceptsMessageShape(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"前段\"}}]}\n\n" +
+		"data: {\"choices\":[{\"message\":{\"role\":\"assistant\",\"content\":\"后段\"},\"finish_reason\":\"stop\"}]}\n\n"
+	out, err := Aggregate(strings.NewReader(stream), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if got := resp.Choices[0].Message.Content; got != "前段后段" {
+		t.Fatalf("message 形态的内容应被保留，实际 %q", got)
+	}
+}
+
+// 上游会以 200 + SSE 的形式回报失败（状态码正常，流里夹带 error 事件）。
+// 静默跳过的话客户端拿到 200 + 空回复，以为成功却什么都没发生。
+func TestAggregateReportsStreamError(t *testing.T) {
+	stream := "data: {\"choices\":[{\"delta\":{\"content\":\"开头\"}}]}\n\n" +
+		"data: {\"error\":{\"message\":\"upstream exploded\"}}\n\n"
+	out, err := Aggregate(strings.NewReader(stream), "m")
+	if err == nil {
+		t.Fatalf("流中 error 事件应导致失败，实际返回了 %s", out)
+	}
+	var serr *StreamError
+	if !errors.As(err, &serr) {
+		t.Fatalf("应返回 *StreamError，实际 %T: %v", err, err)
+	}
+	if serr.Error() != "upstream exploded" {
+		t.Errorf("错误文案不对: %q", serr.Error())
+	}
+	if out != nil {
+		t.Errorf("出错时不应同时返回响应体: %s", out)
+	}
+}
+
+// 客户端传 n>1 时每个 chunk 带多个 choices，必须按 index 分开累积，
+// 否则不同 choice 的内容会拼进同一条消息。
+func TestAggregateSeparatesChoicesByIndex(t *testing.T) {
+	stream := "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"A\"}}," +
+		"{\"index\":1,\"delta\":{\"content\":\"B\"}}]}\n\n" +
+		"data: {\"choices\":[{\"index\":1,\"delta\":{\"content\":\"B2\"},\"finish_reason\":\"stop\"}]}\n\n"
+	out, err := Aggregate(strings.NewReader(stream), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp struct {
+		Choices []struct {
+			Index   int `json:"index"`
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if len(resp.Choices) != 2 {
+		t.Fatalf("应返回 2 个 choice，实际 %d", len(resp.Choices))
+	}
+	// 必须按 index 升序，且内容不串。
+	if resp.Choices[0].Index != 0 || resp.Choices[0].Message.Content != "A" {
+		t.Errorf("choice 0 应为 \"A\"，实际 index=%d content=%q",
+			resp.Choices[0].Index, resp.Choices[0].Message.Content)
+	}
+	if resp.Choices[1].Index != 1 || resp.Choices[1].Message.Content != "BB2" {
+		t.Errorf("choice 1 应为 \"BB2\"，实际 index=%d content=%q",
+			resp.Choices[1].Index, resp.Choices[1].Message.Content)
+	}
+}
+
+// 空的 SSE 流也要给出结构完整的响应，客户端解析不至于炸。
+func TestAggregateEmptyStreamStillValid(t *testing.T) {
+	out, err := Aggregate(strings.NewReader("data: [DONE]\n\n"), "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("空流应返回合法 JSON: %v", err)
+	}
+	choices, _ := resp["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("空流也应返回一个 choice，实际 %d", len(choices))
+	}
+}
+
+// error 事件的各种形态：带了可读文案才算错误，null / 空对象 / 只有 code
+// 这类没有文案的不能当成失败（某些上游的正常 chunk 会带这些）。
+func TestExtractErrorText(t *testing.T) {
+	cases := []struct {
+		in    any
+		want  string
+		isErr bool
+	}{
+		{"plain failure", "plain failure", true},
+		{map[string]any{"message": "额度已用尽"}, "额度已用尽", true},
+		{map[string]any{"msg": "登录失效"}, "登录失效", true},
+		{map[string]any{"code": 123}, "", false},
+		{map[string]any{}, "", false},
+		{nil, "", false},
+		{"", "", false},
+	}
+	for _, tc := range cases {
+		msg, ok := extractErrorText(tc.in)
+		if ok != tc.isErr || msg != tc.want {
+			t.Errorf("输入 %v => (%q, %v)，期望 (%q, %v)", tc.in, msg, ok, tc.want, tc.isErr)
+		}
+	}
+}
+
+// 流里夹带 "error": null 或空对象时，Aggregate 不能把它当失败——
+// 否则一次成功的请求会被凭空打成错误返回。
+func TestAggregateIgnoresNullErrorField(t *testing.T) {
+	stream := strings.Join([]string{
+		`data: {"id":"c1","model":"m","choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}]}`,
+		``,
+		`data: {"error":null}`,
+		``,
+		`data: {"error":{}}`,
+		``,
+		`data: [DONE]`,
+		``,
+	}, "\n")
+	out, err := Aggregate(strings.NewReader(stream), "m")
+	if err != nil {
+		t.Fatalf("带 null/空 error 字段的流不应报错，实际: %v", err)
+	}
+	var resp map[string]any
+	if err := json.Unmarshal(out, &resp); err != nil {
+		t.Fatalf("应返回合法 JSON: %v", err)
+	}
+	choices, _ := resp["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("应保留一条正常 choice，实际 %d", len(choices))
+	}
+}
+
+// truncateText 按字符截断，中文不能被切出非法 UTF-8。
+func TestTruncateTextKeepsUTF8(t *testing.T) {
+	got := truncateText("上游额度已用尽，请充值", 6)
+	if got != "上游额度已用" {
+		t.Errorf("截断结果不对: %q", got)
+	}
+	if !utf8.ValidString(got) {
+		t.Errorf("截断产生了非法 UTF-8: %q", got)
+	}
+	if truncateText("abc", 10) != "abc" || truncateText("abc", 0) != "" {
+		t.Error("边界处理不对")
 	}
 }

@@ -7,7 +7,7 @@ import "path/filepath"
 // AtomicWrite 先写临时文件再重命名，保证读取方永远看不到写入一半的内容。
 func AtomicWrite(path string, data []byte, perm os.FileMode) error {
 	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
 	tmp, err := os.CreateTemp(dir, ".tmp-*")
@@ -31,5 +31,13 @@ func AtomicWrite(path string, data []byte, perm os.FileMode) error {
 	if err := os.Chmod(name, perm); err != nil {
 		return err
 	}
-	return os.Rename(name, path)
+	if err := os.Rename(name, path); err != nil {
+		return err
+	}
+	// 让目录项改动落盘，降低进程/系统崩溃后读到旧文件（或读不到新文件）的概率。
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }

@@ -8,6 +8,8 @@ package tray
 
 import (
 	_ "embed"
+	"fmt"
+	"os"
 	"runtime"
 	"sync"
 
@@ -86,30 +88,49 @@ func (t *Tray) onReady() {
 	systray.SetOnDClick(func(systray.IMenu) { t.show() })
 
 	show := func() { t.show() }
-	t.showItem.Click(show)
+	t.showItem.Click(func() { safe(show) })
 
 	t.copyItem.Click(func() {
-		if t.cb.OnCopyURL != nil {
-			t.cb.OnCopyURL()
-		}
+		safe(func() {
+			if t.cb.OnCopyURL != nil {
+				t.cb.OnCopyURL()
+			}
+		})
 	})
 	t.resetItem.Click(func() {
-		if t.cb.OnResetWindow != nil {
-			t.cb.OnResetWindow()
-		}
+		safe(func() {
+			if t.cb.OnResetWindow != nil {
+				t.cb.OnResetWindow()
+			}
+		})
 	})
 	t.toggleItem.Click(func() {
-		if t.cb.OnToggle == nil {
-			return
-		}
-		running := t.cb.OnToggle()
-		t.SetState(running, t.addr)
+		safe(func() {
+			if t.cb.OnToggle == nil {
+				return
+			}
+			running := t.cb.OnToggle()
+			t.SetState(running, t.addr)
+		})
 	})
 	t.quitItem.Click(func() {
-		if t.cb.OnQuit != nil {
-			t.cb.OnQuit()
-		}
+		safe(func() {
+			if t.cb.OnQuit != nil {
+				t.cb.OnQuit()
+			}
+		})
 	})
+}
+
+// safe 包住托盘回调。托盘运行在原生 UI 线程，单个回调 panic 会拖垮整个进程，
+// 这里兜底恢复并打到 stderr，便于事后排查，同时保证其它菜单项仍可点击。
+func safe(fn func()) {
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Fprintf(os.Stderr, "tray callback panic: %v\n", r)
+		}
+	}()
+	fn()
 }
 
 func (t *Tray) show() {
@@ -141,7 +162,7 @@ func (t *Tray) SetState(running bool, addr string) {
 // Retitle 按当前语言刷新全部菜单项标题与提示（语言切换后调用）。
 func (t *Tray) Retitle() {
 	t.mu.Lock()
-	status, _, tip := t.labels()
+	status, toggle, tip := t.labels()
 	t.mu.Unlock()
 
 	retitle := func(item *systray.MenuItem, title, tip string) {
@@ -155,7 +176,9 @@ func (t *Tray) Retitle() {
 	retitle(t.copyItem, locale.T("tray.copyURL"), locale.T("tray.copyURLTip"))
 	retitle(t.resetItem, locale.T("tray.resetWindow"), locale.T("tray.resetTip"))
 	retitle(t.statusItem, status, locale.T("tray.statusTip"))
-	retitle(t.toggleItem, locale.T("tray.start"), locale.T("tray.startTip"))
+	// 必须用 labels() 返回的 toggle（随运行状态在「开始 / 停止」间变化），
+	// 不能直接写死 tray.start：否则切语言时若服务正在运行，标签会卡成「开始」。
+	retitle(t.toggleItem, toggle, locale.T("tray.startTip"))
 	retitle(t.quitItem, locale.T("tray.quit"), locale.T("tray.quitTip"))
 	systray.SetTooltip(tip)
 }

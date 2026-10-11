@@ -102,9 +102,17 @@ func TestSensitiveNamesCannotEscapeDirectory(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 不能出现仓库目录之外的新目录
-	if len(entries) != 1 || entries[0].Name() != "workbuddy" {
-		t.Fatalf("凭据目录结构异常: %+v", entries)
+	// 不能出现仓库目录之外的新目录。
+	// 非 Windows 平台的 DEK 密钥文件（.dek）也在这个目录下，需排除。
+	var dirs []string
+	for _, e := range entries {
+		if e.Name() == dekFile && !e.IsDir() {
+			continue
+		}
+		dirs = append(dirs, e.Name())
+	}
+	if len(dirs) != 1 || dirs[0] != "workbuddy" {
+		t.Fatalf("凭据目录结构异常: %+v", dirs)
 	}
 	files, _ := os.ReadDir(filepath.Join(root, "workbuddy"))
 	if len(files) != 1 {

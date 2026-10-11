@@ -1029,6 +1029,10 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 				a.finishLogin(run, "failed", locale.T("login.saveFailed", err.Error()), "")
 				return
 			}
+			// 登录是用户主动发起的授权动作，成功即代表要使用该上游。模型页与
+			// /v1/models 只看「已启用 ∧ 已登录」的上游，只登录不启用时凭据存了
+			// 却什么都不会发生——升级到多上游后最容易踩的坑，这里自动拉起开关。
+			a.enableProviderIfDisabled(cred.Provider)
 			// 凭据清单有缓存：不失效的话，紧接着的 RefreshModels 还看不这个新账号，
 			// 会把这一版当成「未登录」而清空模型列表。
 			a.srv.InvalidateAccounts()
@@ -1043,6 +1047,32 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 			return
 		}
 	}
+}
+
+// enableProviderIfDisabled 把仍处于关闭状态的上游自动启用并落盘。
+//
+// 升级到多上游后，新预设默认是关的：只登录不启用时，凭据已经存盘，
+// 但模型页、/v1/models 与转发都只认「已启用 ∧ 已登录」的上游，
+// 用户看到的现象就是「登录成功了却什么都没有」。登录成功本身已经
+// 表达了使用意图，这里顺手把开关打开；已启用时是空操作。
+func (a *App) enableProviderIfDisabled(providerID string) {
+	cfg := a.settings().Clone()
+	profile, ok := cfg.ProfileByID(providerID)
+	if !ok || profile.Enabled {
+		return
+	}
+	profile.Enabled = true
+	cfg.SetProfile(profile)
+	cfg.Normalize()
+	if err := cfg.Save(); err != nil {
+		a.log.Errorf("自动启用上游 %s 失败: %v", profile.Name, err)
+		return
+	}
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+	a.srv.SetConfig(cfg)
+	a.log.Infof("上游 %s 已随登录自动启用", profile.Name)
 }
 
 func (a *App) finishLogin(run *loginRun, status, message, accountID string) {

@@ -1,9 +1,13 @@
 package main
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/znsoftm/RapidProxy/internal/applog"
+	"github.com/znsoftm/RapidProxy/internal/config"
+	"github.com/znsoftm/RapidProxy/internal/proxysrv"
 	"github.com/znsoftm/RapidProxy/internal/winfit"
 )
 
@@ -69,4 +73,41 @@ func TestSameListenAddr(t *testing.T) {
 			t.Errorf("sameListenAddr(%q, %q) = %v，期望 %v", tc.a, tc.b, got, tc.want)
 		}
 	}
+}
+
+// 登录成功后要把仍未启用的上游自动拉起：只登录不启用时凭据存了却
+// 什么都不发生（模型页与 /v1/models 只看「已启用 ∧ 已登录」）。
+func TestEnableProviderIfDisabled(t *testing.T) {
+	dir := t.TempDir()
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() }) // Windows 上不关句柄会卡住 TempDir 清理
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, nil, logger)}
+
+	// lobsterai 预设默认未启用：登录后应被拉起，且落盘。
+	a.enableProviderIfDisabled("lobsterai")
+	got, ok := a.settings().ProfileByID("lobsterai")
+	if !ok || !got.Enabled {
+		t.Fatalf("lobsterai 应随登录自动启用: enabled=%v ok=%v", got.Enabled, ok)
+	}
+	persisted, err := config.Load(a.cfg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := persisted.ProfileByID("lobsterai"); !p.Enabled {
+		t.Fatal("自动启用应落盘，重启后仍生效")
+	}
+	// 其它未登录上游不受影响。
+	if p, _ := a.settings().ProfileByID("qoder-cn"); p.Enabled {
+		t.Fatal("未登录的上游不应被连带启用")
+	}
+
+	// 已启用的上游是空操作（不重写配置）。
+	a.enableProviderIfDisabled("lobsterai")
+	if p, _ := a.settings().ProfileByID("lobsterai"); !p.Enabled {
+		t.Fatal("已启用的上游不应被关闭")
+	}
+
+	// 未知 provider 静默返回，不 panic。
+	a.enableProviderIfDisabled("no-such-provider")
 }

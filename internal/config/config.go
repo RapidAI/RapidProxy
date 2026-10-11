@@ -41,7 +41,28 @@ const (
 	envPrefix = "RAPIDPROXY_"
 )
 
-// Profile 描述一个上游服务（workbuddy / codebuddy）。
+// 协议族常量：决定登录流程、令牌刷新与对话转发的实现方式。
+const (
+	// KindWorkBuddy 是 WorkBuddy 协议族（CodeBuddy 同族，共享一套端点约定）。
+	KindWorkBuddy = "workbuddy"
+	// KindLobsterAI 是网易有道 LobsterAI。
+	KindLobsterAI = "lobsterai"
+	// KindTrae 是 Trae（国内/国际双区）。
+	KindTrae = "trae"
+	// KindQoder 是 Qoder（国内/国际双版）。
+	KindQoder = "qoder"
+)
+
+// Edition 区分同一服务商的国内/国际版。
+const (
+	EditionCN     = "cn"
+	EditionGlobal = "global"
+)
+
+// Profile 描述一个上游服务（一个可登录的分组）。
+//
+// 同一服务商分国内/国际版时是两个独立的 Profile（两个分组），各自维护
+// 自己的账号、模型与轮询，例如 trae-cn / trae-global。
 type Profile struct {
 	ID        string `json:"id"`
 	Name      string `json:"name"`
@@ -49,14 +70,28 @@ type Profile struct {
 	BaseURL   string `json:"base_url"`
 	Origin    string `json:"origin"`
 	UserAgent string `json:"user_agent"`
+	// Kind 是协议族，见 Kind* 常量；为空时按 ID 推断（兼容旧配置文件）。
+	Kind string `json:"kind,omitempty"`
+	// Edition 区分国内/国际版（trae、qoder 使用）：cn / global。
+	Edition string `json:"edition,omitempty"`
 	// Proxy 为空时跟随系统环境变量；显式设置则强制走该代理。
 	Proxy string `json:"proxy,omitempty"`
 	// ExtraModels 追加到内置白名单之后的模型名。
 	ExtraModels []string `json:"extra_models,omitempty"`
 	// DisabledModels 从白名单中剔除的模型名。
 	DisabledModels []string `json:"disabled_models,omitempty"`
-	// SyncModels 是否从上游 /v3/config 同步模型元信息，默认 true。
+	// SyncModels 是否从上游同步模型元信息，默认 true。
 	SyncModels *bool `json:"sync_models,omitempty"`
+}
+
+// ProxyRecommended 报告是否建议为该上游配置代理（界面据此展示提示）。
+//
+// 国际版上游从国内直连通常不可达或极慢；国内版无需代理。
+func (p Profile) ProxyRecommended() bool {
+	if p.Edition == EditionGlobal {
+		return true
+	}
+	return strings.Contains(p.BaseURL, "workbuddy.ai")
 }
 
 // Config 是持久化到 <dataDir>/config.json 的全部设置。
@@ -94,6 +129,7 @@ func WorkBuddyPreset() Profile {
 		ID:        "workbuddy",
 		Name:      "WorkBuddy（国际版）",
 		Enabled:   true,
+		Kind:      KindWorkBuddy,
 		BaseURL:   "https://www.workbuddy.ai",
 		Origin:    "https://www.workbuddy.ai",
 		UserAgent: DefaultUserAgent,
@@ -101,14 +137,85 @@ func WorkBuddyPreset() Profile {
 }
 
 // CodeBuddyPreset 返回 codebuddy（copilot.tencent.com，腾讯 CodeBuddy）预设。
+// 与 WorkBuddy 同一协议族的国内部署。
 func CodeBuddyPreset() Profile {
 	return Profile{
 		ID:        "codebuddy",
 		Name:      "CodeBuddy（国内版）",
 		Enabled:   false,
+		Kind:      KindWorkBuddy,
+		Edition:   EditionCN,
 		BaseURL:   "https://copilot.tencent.com",
 		Origin:    "https://www.codebuddy.cn",
 		UserAgent: DefaultUserAgent,
+	}
+}
+
+// LobsterAIPreset 返回 lobsterai（网易有道 龙虾）预设。
+// 无国内/国际之分，单一分组。
+func LobsterAIPreset() Profile {
+	return Profile{
+		ID:      "lobsterai",
+		Name:    "LobsterAI",
+		Enabled: false,
+		Kind:    KindLobsterAI,
+		// 与 upstream/lobsterai.APIBase 一致；对话与账号后端主机。
+		BaseURL: "https://lobsterai-server.youdao.com",
+		Origin:  "https://lobsterai.youdao.com",
+	}
+}
+
+// TraeCNPreset 返回 trae-cn（Trae 国内版）预设。
+func TraeCNPreset() Profile {
+	return Profile{
+		ID:      "trae-cn",
+		Name:    "Trae（国内版）",
+		Enabled: false,
+		Kind:    KindTrae,
+		Edition: EditionCN,
+		// 与 upstream/trae.CNProfile().ChatHost 一致。
+		BaseURL: "https://trae-api-cn.mchost.guru",
+		Origin:  "https://www.trae.cn",
+	}
+}
+
+// TraeGlobalPreset 返回 trae-global（Trae 国际版）预设。
+func TraeGlobalPreset() Profile {
+	return Profile{
+		ID:      "trae-global",
+		Name:    "Trae（国际版）",
+		Enabled: false,
+		Kind:    KindTrae,
+		Edition: EditionGlobal,
+		BaseURL: "https://coresg-normal.trae.ai",
+		Origin:  "https://www.trae.ai",
+	}
+}
+
+// QoderCNPreset 返回 qoder-cn（Qoder 国内版）预设。
+func QoderCNPreset() Profile {
+	return Profile{
+		ID:      "qoder-cn",
+		Name:    "Qoder（国内版）",
+		Enabled: false,
+		Kind:    KindQoder,
+		Edition: EditionCN,
+		// 与 upstream/qoder.CNProfile().ChatOrigin 一致（签名对话网关）。
+		BaseURL: "https://gateway.qoder.com.cn",
+		Origin:  "https://qoder.cn",
+	}
+}
+
+// QoderGlobalPreset 返回 qoder-global（Qoder 国际版）预设。
+func QoderGlobalPreset() Profile {
+	return Profile{
+		ID:      "qoder-global",
+		Name:    "Qoder（国际版）",
+		Enabled: false,
+		Kind:    KindQoder,
+		Edition: EditionGlobal,
+		BaseURL: "https://api3.qoder.sh",
+		Origin:  "https://qoder.com",
 	}
 }
 
@@ -119,7 +226,15 @@ func Default() *Config {
 		Platform:       DefaultPlatform,
 		Product:        DefaultProduct,
 		ModelSyncHours: DefaultSyncHours,
-		Profiles:       []Profile{WorkBuddyPreset(), CodeBuddyPreset()},
+		Profiles: []Profile{
+			WorkBuddyPreset(),
+			CodeBuddyPreset(),
+			LobsterAIPreset(),
+			TraeCNPreset(),
+			TraeGlobalPreset(),
+			QoderCNPreset(),
+			QoderGlobalPreset(),
+		},
 	}
 }
 
@@ -214,7 +329,30 @@ func (c *Config) normalize() {
 		c.Language = "system"
 	}
 	if len(c.Profiles) == 0 {
-		c.Profiles = []Profile{WorkBuddyPreset(), CodeBuddyPreset()}
+		c.Profiles = []Profile{
+			WorkBuddyPreset(), CodeBuddyPreset(), LobsterAIPreset(),
+			TraeCNPreset(), TraeGlobalPreset(), QoderCNPreset(), QoderGlobalPreset(),
+		}
+	} else {
+		// 版本升级带来的新预设要补齐：旧配置文件里只有当时的上游清单，
+		// Unmarshal 会整体替换默认列表，不补的话升级用户看不到新增服务商。
+		// （界面上的「隐藏」语义是停用开关，不是删除预设条目。）
+		missing := []Profile{
+			WorkBuddyPreset(), CodeBuddyPreset(), LobsterAIPreset(),
+			TraeCNPreset(), TraeGlobalPreset(), QoderCNPreset(), QoderGlobalPreset(),
+		}
+		for _, preset := range missing {
+			found := false
+			for _, p := range c.Profiles {
+				if p.ID == preset.ID {
+					found = true
+					break
+				}
+			}
+			if !found {
+				c.Profiles = append(c.Profiles, preset)
+			}
+		}
 	}
 	for i := range c.Profiles {
 		p := &c.Profiles[i]
@@ -222,6 +360,8 @@ func (c *Config) normalize() {
 		switch p.ID {
 		case "workbuddy":
 			preset := WorkBuddyPreset()
+			p.Kind = KindWorkBuddy
+			p.Edition = ""
 			if p.BaseURL == "" {
 				p.BaseURL = preset.BaseURL
 			}
@@ -233,6 +373,73 @@ func (c *Config) normalize() {
 			}
 		case "codebuddy":
 			preset := CodeBuddyPreset()
+			p.Kind = KindWorkBuddy
+			p.Edition = EditionCN
+			if p.BaseURL == "" {
+				p.BaseURL = preset.BaseURL
+			}
+			if p.Origin == "" {
+				p.Origin = preset.Origin
+			}
+			if p.Name == "" {
+				p.Name = preset.Name
+			}
+		case "lobsterai":
+			preset := LobsterAIPreset()
+			p.Kind = KindLobsterAI
+			p.Edition = ""
+			if p.BaseURL == "" {
+				p.BaseURL = preset.BaseURL
+			}
+			if p.Origin == "" {
+				p.Origin = preset.Origin
+			}
+			if p.Name == "" {
+				p.Name = preset.Name
+			}
+		case "trae-cn":
+			preset := TraeCNPreset()
+			p.Kind = KindTrae
+			p.Edition = EditionCN
+			if p.BaseURL == "" {
+				p.BaseURL = preset.BaseURL
+			}
+			if p.Origin == "" {
+				p.Origin = preset.Origin
+			}
+			if p.Name == "" {
+				p.Name = preset.Name
+			}
+		case "trae-global":
+			preset := TraeGlobalPreset()
+			p.Kind = KindTrae
+			p.Edition = EditionGlobal
+			if p.BaseURL == "" {
+				p.BaseURL = preset.BaseURL
+			}
+			if p.Origin == "" {
+				p.Origin = preset.Origin
+			}
+			if p.Name == "" {
+				p.Name = preset.Name
+			}
+		case "qoder-cn":
+			preset := QoderCNPreset()
+			p.Kind = KindQoder
+			p.Edition = EditionCN
+			if p.BaseURL == "" {
+				p.BaseURL = preset.BaseURL
+			}
+			if p.Origin == "" {
+				p.Origin = preset.Origin
+			}
+			if p.Name == "" {
+				p.Name = preset.Name
+			}
+		case "qoder-global":
+			preset := QoderGlobalPreset()
+			p.Kind = KindQoder
+			p.Edition = EditionGlobal
 			if p.BaseURL == "" {
 				p.BaseURL = preset.BaseURL
 			}
@@ -243,7 +450,9 @@ func (c *Config) normalize() {
 				p.Name = preset.Name
 			}
 		}
-		if p.UserAgent == "" {
+		if p.UserAgent == "" && (p.Kind == "" || p.Kind == KindWorkBuddy) {
+			// WorkBuddy 协议族要求伪装官方 CLI；其它协议族的请求头由
+			// 各自的适配包决定，UserAgent 字段不参与。
 			p.UserAgent = DefaultUserAgent
 		}
 		p.BaseURL = strings.TrimRight(strings.TrimSpace(p.BaseURL), "/")

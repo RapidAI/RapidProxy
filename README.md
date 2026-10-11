@@ -2,7 +2,7 @@
 
 **中文** | [English](README_EN.md)
 
-把 **WorkBuddy**（国际版）与 **CodeBuddy**（国内版）账号背后的模型，转换成 **OpenAI 兼容 API** 的桌面代理程序。登录一次，任何支持「自定义 OpenAI 接口」的客户端（Cherry Studio、ChatBox、LobeChat、Open WebUI、Cursor、Cline、各种 SDK 与脚本……）都能直接调用。
+把 **WorkBuddy**（国际版）、**CodeBuddy**（国内版）、**LobsterAI**、**Trae**（国内/国际版）、**Qoder**（国内/国际版）账号背后的模型，转换成 **OpenAI 兼容 API** 的桌面代理程序。登录一次，任何支持「自定义 OpenAI 接口」的客户端（Cherry Studio、ChatBox、LobeChat、Open WebUI、Cursor、Cline、各种 SDK 与脚本……）都能直接调用。
 
 - 语言/框架：Go + Wails v2（原生 WebView，安装包小、内存占用低）
 - 平台：Windows / macOS / Linux
@@ -14,13 +14,29 @@
 
 ---
 
+## 支持的上游
+
+每个可登录的上游就是一个**分组**：同组内多账号加权轮询、互为故障转移；同一服务商分国内/国际版时是两个独立分组（各自登录各自的账号）。
+
+| 分组（上游 ID） | 服务商 | 登录方式 | 说明 |
+|---|---|---|---|
+| `workbuddy` | WorkBuddy（国际版） | 浏览器授权 | 轮询登录，令牌自动刷新 |
+| `codebuddy` | CodeBuddy（国内版） | 浏览器授权 | 与 WorkBuddy 同协议族 |
+| `lobsterai` | LobsterAI（网易有道 龙虾） | 浏览器回调 | 本地回调端口换取令牌，仅流式 |
+| `trae-cn` | Trae（国内版） | 浏览器授权回调 | SOLO 协议，双 token 轮换 |
+| `trae-global` | Trae（国际版） | 浏览器授权回调 | 新加坡部署，与国内版互不通用 |
+| `qoder-cn` | Qoder（国内版） | 设备码（PKCE） | COSY 签名对话，须在浏览器批准 |
+| `qoder-global` | Qoder（国际版） | 设备码（PKCE） | 与国内版互不通用 |
+
+---
+
 ## 功能特性
 
-- **图形化登录**：内置 WorkBuddy（`www.workbuddy.ai`）与 CodeBuddy（`copilot.tencent.com`）两个上游预设，点「登录」打开浏览器完成授权（Google / GitHub / 扫码），令牌自动保存并自动刷新。
-- **OpenAI 兼容服务**：提供 `/v1/models`、`/v1/chat/completions`（及不带 `/v1` 的等价路径）与 `/healthz`，流式与非流式请求都支持（上游仅提供流式接口，程序在服务端自动聚合）。
+- **图形化登录**：内置 WorkBuddy、CodeBuddy、LobsterAI、Trae（国内/国际）、Qoder（国内/国际）七个上游预设，点「登录」打开浏览器完成授权，令牌自动保存并自动刷新。
+- **OpenAI 兼容服务**：提供 `/v1/models`、`/v1/chat/completions`（及不带 `/v1` 的等价路径）与 `/healthz`，流式与非流式请求都支持（上游仅提供流式接口时，程序在服务端自动聚合）。
 - **多账号负载均衡**：同一上游可登录多个账号，请求按序轮询；单个账号令牌失效自动刷新，401/403 自动重试。
 - **多上游路由**：模型名直接写（自动匹配）、或用 `上游ID:模型名` / `上游ID/模型名` 前缀显式指定（国际版可用 `intl:` 简写）；也可用请求头 `X-RapidProxy-Provider`（兼容 `intl`）或 `?provider=` 强制路由，`X-RapidProxy-Account` 指定账号。
-- **国际版/国内版模型区分**：多个上游同时启用时，国际版（workbuddy）的模型统一以 `intl:模型名` 呈现，国内版（codebuddy）保持裸模型名作为默认路由；仅启用单个上游时全部保持原 ID。
+- **多上游模型名消歧**：多个上游同时启用时，国际版（workbuddy）的模型统一以 `intl:模型名` 呈现；其它上游之间的同名模型，裸名归配置顺序里第一个暴露它的上游，其余以 `上游ID:模型名` 呈现；仅启用单个上游时全部保持原 ID。
 - **API Key 鉴权**：可配置多个 Key，支持一键生成；不配置则无需密钥（建议仅本机监听时使用）。
 - **内置 + 自动同步模型清单**：内置白名单保证上游配置接口漏报时仍可调用；定期从上游拉取新模型，也支持手动「额外模型」与「禁用模型」。
 - **深度思考与工具调用**：`hy3` 系列自动按最高思考档请求；`delta.reasoning_content` 原样透传；OpenAI 风格 `tool_calls` 增量按 `index` 正确合并。

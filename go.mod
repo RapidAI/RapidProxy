@@ -4,6 +4,7 @@ go 1.25.0
 
 require (
 	github.com/energye/systray v1.0.3
+	github.com/tetratelabs/wazero v1.12.0
 	github.com/wailsapp/wails/v2 v2.10.2
 	golang.org/x/sys v0.46.0
 )

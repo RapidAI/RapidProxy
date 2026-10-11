@@ -54,10 +54,17 @@ type ModelList struct {
 
 // TransformOptions 控制转发前的请求改写行为。
 type TransformOptions struct {
-	// Sanitize 改写上游内容审核的固定模板句。
+	// Sanitize 改写上游内容审核的固定模板句（WorkBuddy 协议族专用，
+	// 模板句黑名单来自该上游）。
 	Sanitize bool
 	// ForceMaxThinking 对 hy3 系列强制 reasoning_effort=high。
 	ForceMaxThinking bool
+	// EnsureSystemPrompt 保证首条消息是 system（WorkBuddy 上游要求，
+	// 否则报 code=11128）；其它协议族保持客户端原样。
+	EnsureSystemPrompt bool
+	// AddStreamOptions 追加 stream_options.include_usage（WorkBuddy 协议
+	// 约定）；其它协议族的用量由各自适配层在流内翻译。
+	AddStreamOptions bool
 }
 
 // 上游内容审核把 Claude Code 的固定 system 模板句逐字加入黑名单，命中即拒答。
@@ -97,8 +104,8 @@ func ensureSystemPrompt(obj map[string]any) {
 }
 
 // PrepareRequestBody 把客户端请求体整理成上游可接受的形式：
-// 强制 stream（上游拒绝非流式）、补齐首条 system 消息、
-// 按需改写模板句与思考档位。返回处理后的请求体与请求对象。
+// 强制 stream（上游只接受流式应答）、按需补齐首条 system 消息与
+// stream_options、按需改写模板句与思考档位。返回处理后的请求体与请求对象。
 func PrepareRequestBody(payload []byte, opts TransformOptions) ([]byte, map[string]any, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(payload, &obj); err != nil {
@@ -109,11 +116,15 @@ func PrepareRequestBody(payload []byte, opts TransformOptions) ([]byte, map[stri
 	// 要求上游在流的末尾附带 usage（token 用量），否则流式响应里拿不到用量，
 	// 流量统计便无从记录。绝大多数 OpenAI 兼容网关忽略未知字段，个别不支持的
 	// 也只当没这回事，不影响正常应答。
-	if _, ok := obj["stream_options"].(map[string]any); !ok {
-		obj["stream_options"] = map[string]any{"include_usage": true}
+	if opts.AddStreamOptions {
+		if _, ok := obj["stream_options"].(map[string]any); !ok {
+			obj["stream_options"] = map[string]any{"include_usage": true}
+		}
 	}
 
-	ensureSystemPrompt(obj)
+	if opts.EnsureSystemPrompt {
+		ensureSystemPrompt(obj)
+	}
 	if opts.Sanitize {
 		rewriteMessages(obj)
 	}

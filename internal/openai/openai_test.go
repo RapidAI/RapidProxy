@@ -172,7 +172,7 @@ func TestAggregateFallsBackModel(t *testing.T) {
 func TestPrepareRequestBodyEnsuresSystemPrompt(t *testing.T) {
 	base := `{"model":"deepseek-v4.1-flash","messages":[{"role":"user","content":"你好"}]}`
 
-	out, _, err := PrepareRequestBody([]byte(base), TransformOptions{})
+	out, _, err := PrepareRequestBody([]byte(base), TransformOptions{EnsureSystemPrompt: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -196,7 +196,7 @@ func TestPrepareRequestBodyEnsuresSystemPrompt(t *testing.T) {
 // 已有 system 开头时不应重复补齐，也不应打乱顺序。
 func TestPrepareRequestBodyKeepsExistingSystemPrompt(t *testing.T) {
 	base := `{"model":"m","messages":[{"role":"system","content":"You are Claude Code."},{"role":"user","content":"hi"}]}`
-	out, _, err := PrepareRequestBody([]byte(base), TransformOptions{})
+	out, _, err := PrepareRequestBody([]byte(base), TransformOptions{EnsureSystemPrompt: true})
 	if err != nil {
 		t.Fatal(err)
 	}

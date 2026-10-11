@@ -9,8 +9,9 @@ const S = {
   update: null,
   revealKey: false,
   modelFilter: '',
+  modelProvider: '', // 模型页的上游筛选：'' 表示全部上游，否则是 providerId
   dirty: false,
-  stats: { period: 'day', provider: '', model: '', loading: false },
+  stats: { period: 'day', provider: '', model: '' },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -341,14 +342,92 @@ function setPaused(a, paused) {
   guard(a, () => call('SetAccountPaused', a.provider, a.id, paused), paused ? t('toast.paused') : t('toast.resumed'));
 }
 
+/* 模型归属的上游 ID：后端给的是 providerId，缺值时退回显示名，避免有行过滤不到。 */
+const modelProviderID = (m) => m.providerId || m.provider || '';
+
+/* 把模型按上游归堆，保持原顺序（与配置里的上游顺序一致），并带上每个上游的模型数。 */
+function providerBuckets(models) {
+  const buckets = [];
+  const index = new Map();
+  models.forEach((m) => {
+    const id = modelProviderID(m);
+    const hit = index.get(id);
+    if (hit) {
+      hit.count += 1;
+      return;
+    }
+    const bucket = { id: id, name: m.provider || id || '-', count: 1 };
+    index.set(id, bucket);
+    buckets.push(bucket);
+  });
+  return buckets;
+}
+
+/* 上次渲染模型页的签名。
+ *
+ * 界面每 20 秒会被轮询重渲染一次：数据和文案都没变时必须跳过重建，否则
+ * 用户刚在单元格里选中的文字会被抹掉——右键菜单里就有「复制选中内容」，
+ * 选中后还没右键就被刷新清掉等于这个功能半残。
+ *
+ * 这里不能用账号列表那套 keepFocus：它恢复的是输入框的焦点与光标，
+ * 而普通单元格里的文本选区没有等价物，只能不去动它。判定方式与流量图的
+ * _statsSig 一致，顺便也省掉了每 20 秒一次的无谓重排。 */
+let _modelFilterSig = '';
+let _modelTableSig = '';
+
+function renderModelFilters(buckets, total) {
+  const row = $('model-providers');
+  // 列表本身为空时没有可筛的维度，整行藏起来，避免留一排 0 计数。
+  $('model-filter-row').classList.toggle('hidden', !total);
+  const sig = [I18N.lang, total, buckets.map((b) => b.id + ':' + b.name + ':' + b.count).join(',')].join('|');
+  if (sig !== _modelFilterSig) {
+    _modelFilterSig = sig;
+    row.innerHTML = '';
+    const chip = (label, count, providerID) => {
+      const node = el('button', 'chip', label);
+      node.type = 'button';
+      node.dataset.pid = providerID;
+      node.appendChild(el('span', 'count', String(count)));
+      node.onclick = () => {
+        S.modelProvider = providerID;
+        renderModels();
+      };
+      row.appendChild(node);
+    };
+    chip(t('models.allUpstream'), total, '');
+    buckets.forEach((b) => chip(b.name, b.count, b.id));
+  }
+  // 选中态与计数文案跟标签集合无关，无论是否重建都要同步一次。
+  Array.from(row.children).forEach((node) => {
+    node.classList.toggle('active', (node.dataset.pid || '') === S.modelProvider);
+  });
+  const shown = S.modelProvider ? (buckets.find((b) => b.id === S.modelProvider) || {}).count || 0 : total;
+  $('model-count').textContent = S.modelProvider
+    ? t('models.countFiltered', { n: shown, total: total })
+    : t('models.countAll', { n: total });
+}
+
 function renderModels() {
-  const body = $('model-body');
-  body.innerHTML = '';
   const filter = S.modelFilter.trim().toLowerCase();
-  const models = (S.state.models || []).filter((m) => {
+  // 两级过滤：先按自由文本收窄，再按上游收窄。分面计数建立在文本结果之上，
+  // 标签上的数字就是「切过去真能看到几条」，不会出现点了没反应的死标签。
+  const searched = (S.state.models || []).filter((m) => {
     if (!filter) return true;
     return (m.id + ' ' + (m.name || '') + ' ' + (m.provider || '')).toLowerCase().includes(filter);
   });
+  const buckets = providerBuckets(searched);
+  // 选中的上游在当前结果里已不存在（换了搜索词、上游被禁用等）时退回「全部」，
+  // 否则列表会一直空着，用户看不出是被筛选条件挡掉了。
+  if (S.modelProvider && !buckets.some((b) => b.id === S.modelProvider)) S.modelProvider = '';
+  renderModelFilters(buckets, searched.length);
+  const models = S.modelProvider ? searched.filter((m) => modelProviderID(m) === S.modelProvider) : searched;
+  // 见 _modelTableSig 的注释：内容没变就不动表格，保住用户在单元格里的选中与焦点。
+  const sig = models.length ? [I18N.lang, S.modelProvider, filter, JSON.stringify(models)].join('|') : '';
+  if (sig && sig === _modelTableSig) return;
+  _modelTableSig = sig;
+
+  const body = $('model-body');
+  body.innerHTML = '';
   if (!models.length) {
     const row = el('tr');
     const cell = el('td', 'empty', t('models.noMatch'));
@@ -562,7 +641,65 @@ function fillStatsSelect(sel, items, selectedValue, allLabel) {
   }
 }
 
-async function renderStats() {
+/* 只有选项集合真的变了才重建 select：定时刷新时重复重建会把用户展开的下拉打断。 */
+function syncStatsSelect(sel, items, selectedValue, allLabel) {
+  const sig = (allLabel || '') + '|' + items.map((it) => it.value + ':' + it.label).join('|');
+  if (sel._sig !== sig) {
+    fillStatsSelect(sel, items, selectedValue, allLabel);
+    sel._sig = sig;
+  } else if (selectedValue !== undefined && sel.value !== selectedValue) {
+    sel.value = selectedValue;
+  }
+}
+
+/* 流量统计的自动刷新周期。后端 Query 是纯内存聚合（internal/stats.Recorder
+ * 收到请求即累加），3 秒一次的代价可以忽略。 */
+const STATS_REFRESH_MS = 3000;
+let _statsTimer = null;
+let _statsRunning = false;
+let _statsPending = false;
+let _statsSig = '';      // 最近一次实际渲染用的完整签名（含数据），用于跳过无变化重绘
+let _statsFilter = '';   // 最近一次成功取数时的筛选签名，用于判断能否沿用上次画面
+
+/* 统计页是否处于前台：标签页激活且窗口可见（最小化 / 隐藏到托盘都算不可见）。 */
+function statsTabActive() {
+  const tab = $('tab-stats');
+  return !!(tab && tab.classList.contains('active')) && !document.hidden;
+}
+
+function stopStatsAutoRefresh() {
+  if (!_statsTimer) return;
+  clearInterval(_statsTimer);
+  _statsTimer = null;
+}
+
+/* 让自动刷新与当前状态对齐：切标签页、窗口 focus / visibilitychange 时都调它。
+ * 在跑且该跑 → 空操作（重复的 focus / visibilitychange 不会重复拉取）；
+ * 该跑但没在跑 → 先补一次即时刷新再启动，切换过来不必空等一个周期；
+ * 不该跑（离开该页 / 窗口不可见）→ 停掉。 */
+function syncStatsAutoRefresh() {
+  if (!statsTabActive()) return stopStatsAutoRefresh();
+  if (_statsTimer) return;
+  renderStats();
+  _statsTimer = setInterval(() => {
+    if (!statsTabActive()) return stopStatsAutoRefresh();
+    renderStats();
+  }, STATS_REFRESH_MS);
+}
+
+/* 定时轮询、切换筛选、全局状态刷新可能同时要渲染统计：串行成一次，避免互相覆盖。 */
+function renderStats() {
+  if (_statsRunning) { _statsPending = true; return; }
+  _statsRunning = true;
+  renderStatsOnce()
+    .catch(() => { /* 单次失败交给下一轮重试，不弹提示打扰用户 */ })
+    .finally(() => {
+      _statsRunning = false;
+      if (_statsPending) { _statsPending = false; renderStats(); }
+    });
+}
+
+async function renderStatsOnce() {
   const providerSel = $('stats-provider');
   const modelSel = $('stats-model');
   if (!providerSel || !modelSel) return;
@@ -572,19 +709,34 @@ async function renderStats() {
 
   const opts = buildStatsOptions(scopes);
   if (!S.stats.provider) S.stats.provider = (opts.providers[0] && opts.providers[0].value) || '';
-  fillStatsSelect(providerSel, opts.providers, S.stats.provider);
+  syncStatsSelect(providerSel, opts.providers, S.stats.provider);
   S.stats.provider = providerSel.value;
 
   const models = opts.modelsByProvider[S.stats.provider] || [];
-  fillStatsSelect(modelSel, models, S.stats.model, t('stats.allModels'));
+  syncStatsSelect(modelSel, models, S.stats.model, t('stats.allModels'));
   S.stats.model = modelSel.value;
+
+  // 当前筛选条件。取数失败时用它判断能否沿用上次画面：筛选没变才保留，
+  // 否则界面会「显示周、画着日」，比闪烁更误导。
+  const filter = [S.stats.provider, S.stats.model, S.stats.period].join('|');
 
   let res;
   try {
     res = await call('GetTrafficStats', S.stats.provider, S.stats.model, S.stats.period);
   } catch (err) {
+    // 单次查询失败（后端忙、服务重启中）不该清空已经画好的内容：3 秒一轮的
+    // 刷新下，清空重画就是肉眼可见的闪烁。筛选条件没变就保留上次结果，下一轮
+    // 自动重试；筛选变了或首次加载就失败，则退回「暂无数据」提示。
+    if (filter === _statsFilter) return;
     res = null;
   }
+
+  // 筛选、语言、数据都没变就跳过重绘，否则几秒一次的刷新会让图表和卡片反复闪。
+  const sig = [I18N.lang, filter, JSON.stringify(res)].join('|');
+  if (sig === _statsSig) return;
+  _statsSig = sig;
+  if (res) _statsFilter = filter;
+
   if (!res) {
     $('stats-range').textContent = '';
     $('stats-cards').innerHTML = '';
@@ -771,8 +923,8 @@ function renderAll() {
   renderAccounts();
   renderModels();
   renderSettings();
-  // 流量统计只在对应标签页激活时才拉取，避免 20 秒轮询对它做无谓的后端调用。
-  if ($('tab-stats') && $('tab-stats').classList.contains('active')) renderStats();
+  // 流量统计不走这里：它由自己的定时器负责（见 syncStatsAutoRefresh），
+  // 只在统计页激活时每几秒刷新一次。
   refreshSample();
 }
 
@@ -923,7 +1075,8 @@ function bindUI() {
       document.querySelectorAll('.tab').forEach((t) => t.classList.remove('active'));
       btn.classList.add('active');
       $('tab-' + btn.dataset.tab).classList.add('active');
-      if (btn.dataset.tab === 'stats') renderStats();
+      // 启停统一交给 syncStatsAutoRefresh 收敛：切到统计页启动，切走停止
+      syncStatsAutoRefresh();
     };
   });
 
@@ -1132,6 +1285,11 @@ async function main() {
   bindEvents();
   await refresh();
   setInterval(refresh, 20000);
+  // 窗口从最小化 / 托盘恢复、或重新可见时，若正停在统计页就立即续上刷新；
+  // 已在跑时 syncStatsAutoRefresh 是空操作，focus 与 visibilitychange 先后
+  // 触发也不会重复拉取
+  window.addEventListener('focus', syncStatsAutoRefresh);
+  document.addEventListener('visibilitychange', syncStatsAutoRefresh);
 }
 
 window.addEventListener('DOMContentLoaded', main);

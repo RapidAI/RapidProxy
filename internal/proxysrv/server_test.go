@@ -1728,3 +1728,74 @@ func TestAggregateFailoverClosesReplacedResponseBody(t *testing.T) {
 	mu.Unlock()
 	t.Errorf("换号后的响应体没有被关闭，上游仍有 %d 个连接停在 Active（未归还连接池）", n)
 }
+
+// 多上游（含新协议族）同时登录时的同名模型消歧：
+// 裸名归第一个（配置顺序）暴露它的非国际版上游，其余上游用 "上游ID:" 前缀。
+func TestAllModelsDisambiguatesThirdProviderConflict(t *testing.T) {
+	srv, _ := newTestServer(t, func(cfg *config.Config) {
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].Enabled = true
+		}
+	})
+	login(t, srv, "workbuddy", "wb1")
+	login(t, srv, "codebuddy", "cb1")
+	login(t, srv, "lobsterai", "lb1")
+	srv.setModels("workbuddy", []upstream.ModelInfo{
+		{ID: "glm-5.3", Name: "GLM-5.3"},
+	})
+	srv.setModels("codebuddy", []upstream.ModelInfo{
+		{ID: "glm-5.3", Name: "GLM-5.3"},
+		{ID: "hy3", Name: "Hy3"},
+	})
+	srv.setModels("lobsterai", []upstream.ModelInfo{
+		{ID: "glm-5.3", Name: "GLM-5.3"},
+		{ID: "deepseek-flash", Name: "DeepSeek"},
+	})
+
+	got := map[string]string{} // id -> provider
+	for _, m := range srv.AllModels() {
+		got[m.ID] = m.Provider
+	}
+
+	// 国际版约定不变：全部模型 intl: 前缀。
+	if got["intl:glm-5.3"] != "workbuddy" {
+		t.Fatalf("workbuddy 模型应保持 intl: 前缀，实际 %v", got)
+	}
+	// 配置顺序里 codebuddy 先于 lobsterai：裸名归 codebuddy。
+	if got["glm-5.3"] != "codebuddy" || got["hy3"] != "codebuddy" {
+		t.Fatalf("裸名应归第一个暴露它的国内上游，实际 %v", got)
+	}
+	// lobsterai 的同名模型改为上游 ID 前缀；非冲突模型保持裸名。
+	if got["lobsterai:glm-5.3"] != "lobsterai" {
+		t.Fatalf("lobsterai 的冲突模型应加上游 ID 前缀，实际 %v", got)
+	}
+	if got["deepseek-flash"] != "lobsterai" {
+		t.Fatalf("lobsterai 独有模型应保持裸名，实际 %v", got)
+	}
+	// 前缀形式要能被 resolveModel 解析回对应上游。
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	profile, model, err := srv.resolveModel("lobsterai:glm-5.3", req)
+	if err != nil || profile.ID != "lobsterai" || model != "glm-5.3" {
+		t.Fatalf("lobsterai:glm-5.3 应解析到 lobsterai，实际 %s/%s err=%v", profile.ID, model, err)
+	}
+}
+
+// 仅登录新协议族上游时，模型保持裸 ID（不因 intl 前缀机制受影响）。
+func TestAllModelsPlainForSingleNewProvider(t *testing.T) {
+	srv, _ := newTestServer(t, func(cfg *config.Config) {
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].Enabled = false
+		}
+		cfg.SetProfile(config.TraeCNPreset())
+		cfg.Normalize()
+	})
+	login(t, srv, "trae-cn", "tr1")
+	srv.setModels("trae-cn", []upstream.ModelInfo{
+		{ID: "glm-5.2", Name: "GLM-5.2"},
+	})
+	for _, m := range srv.AllModels() {
+		if m.ID != "glm-5.2" {
+			t.Fatalf("单上游（trae-cn）应保持裸 ID，实际 %s", m.ID)
+		}
+	}
+}

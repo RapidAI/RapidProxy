@@ -1,14 +1,22 @@
-// Package upstream 实现对 CodeBuddy / WorkBuddy 上游协议的调用：
-// 登录、令牌刷新、模型同步与 chat completions 转发。
+// Package upstream 实现对各上游服务商协议的调用：登录、令牌刷新、模型
+// 同步与对话转发。本文件承载 WorkBuddy 协议族的实现与统一的凭据/分发层；
+// 其它协议族由子包适配：
 //
-// 上游与官方 CLI 插件共用同一套协议：
+//	workbuddy / codebuddy（本文件，与官方 CLI 插件共用同一套协议）：
+//	  POST {base}/v2/plugin/auth/state?platform=CLI     发起登录，返回 state 与 authUrl
+//	  GET  {base}/v2/plugin/auth/token?state=<state>    轮询登录结果（未完成时返回 code 11217）
+//	  GET  {base}/v2/plugin/login/account?state=<state> 登录完成后取账号信息
+//	  POST {base}/v2/plugin/auth/token/refresh          刷新访问令牌
+//	  GET  {base}/v3/config                             模型与配额配置
+//	  POST {base}/v2/chat/completions                   对话（仅支持流式）
 //
-//	POST {base}/v2/plugin/auth/state?platform=CLI     发起登录，返回 state 与 authUrl
-//	GET  {base}/v2/plugin/auth/token?state=<state>    轮询登录结果（未完成时返回 code 11217）
-//	GET  {base}/v2/plugin/login/account?state=<state> 登录完成后取账号信息
-//	POST {base}/v2/plugin/auth/token/refresh          刷新访问令牌
-//	GET  {base}/v3/config                             模型与配额配置
-//	POST {base}/v2/chat/completions                   对话（仅支持流式）
+//	lobsterai（internal/upstream/lobsterai）：浏览器回调登录 + OpenAI 形状对话。
+//	trae      （internal/upstream/trae）：浏览器授权回调 + SOLO 协议翻译。
+//	qoder     （internal/upstream/qoder）：PKCE 设备登录 + wasm COSY 签名对话。
+//
+// Client 按 Profile.Kind 把六个协议动作（StartLogin/Poll/Refresh/
+// EnsureToken/FetchUpstreamModels/Chat）分发到对应实现；所有对话路径在
+// 适配包边界上统一翻译成 OpenAI SSE，服务层与 Failover 逻辑对上游无感知。
 package upstream
 
 import (
@@ -28,6 +36,9 @@ import (
 	"unicode/utf8"
 
 	"github.com/znsoftm/RapidProxy/internal/config"
+	"github.com/znsoftm/RapidProxy/internal/upstream/lobsterai"
+	"github.com/znsoftm/RapidProxy/internal/upstream/qoder"
+	"github.com/znsoftm/RapidProxy/internal/upstream/trae"
 )
 
 // ErrNoAccessToken 表示凭据里没有可用的访问令牌。
@@ -43,11 +54,22 @@ const refreshLeeway = 5 * time.Minute
 const defaultMaxOutput = 8192
 
 // Tokens 是持久化的令牌信息。
+//
+// 前四个字段是 WorkBuddy 协议族；其余字段服务于新协议族（按 Kind 取用），
+// 均为 omitempty，对既有凭据文件完全向后兼容。
 type Tokens struct {
 	AccessToken  string `json:"accessToken"`
 	RefreshToken string `json:"refreshToken"`
 	ExpiresAt    int64  `json:"expiresAt"`
 	Domain       string `json:"domain"`
+	// UUID / FirstKeyfrom 是 LobsterAI 的续期身份对（随凭据持久化，
+	// 刷新时必须回传）。
+	UUID         string `json:"uuid,omitempty"`
+	FirstKeyfrom string `json:"firstKeyfrom,omitempty"`
+	// MachineID / DeviceID 是 Trae 的登录设备对（refresh token 系于其上，
+	// 永不轮换）；MachineID 同时是 Qoder 的每安装设备 id。
+	MachineID string `json:"machineId,omitempty"`
+	DeviceID  string `json:"deviceId,omitempty"`
 }
 
 // Account 是账号信息。
@@ -148,12 +170,46 @@ func (e *APIError) Error() string {
 }
 
 // Client 是某一个上游服务的客户端。
+//
+// 请求的收发与凭据管理对上游统一；协议差异（登录、刷新、模型目录、对话
+// 线路）按 kind 分发到对应适配包。WorkBuddy 协议族（workbuddy / codebuddy）
+// 的实现保留在本文件内。
 type Client struct {
 	profile  config.Profile
+	kind     string
 	platform string
 	product  string
 	http     *http.Client
+	// traep / qoderp 是按 Edition 选定的区配置；仅对应协议族使用。
+	traep  trae.Profile
+	qoderp qoder.Profile
 }
+
+// ProfileKind 返回上游的协议族；配置未显式指定时按 ID 推断（兼容旧配置）。
+func ProfileKind(p config.Profile) string {
+	if k := strings.TrimSpace(p.Kind); k != "" {
+		return k
+	}
+	switch p.ID {
+	case "lobsterai":
+		return KindLobsterAI
+	case "trae-cn", "trae-global":
+		return KindTrae
+	case "qoder-cn", "qoder-global":
+		return KindQoder
+	default:
+		return KindWorkBuddy
+	}
+}
+
+// 协议族常量与 config 侧保持一致（避免 config ↔ upstream 循环依赖，
+// 两边各自定义，值必须相同）。
+const (
+	KindWorkBuddy = "workbuddy"
+	KindLobsterAI = "lobsterai"
+	KindTrae      = "trae"
+	KindQoder     = "qoder"
+)
 
 // NewClient 按上游配置创建客户端。proxy 为空时跟随系统环境变量。
 func NewClient(p config.Profile, platform, product string) (*Client, error) {
@@ -168,16 +224,36 @@ func NewClient(p config.Profile, platform, product string) (*Client, error) {
 		return nil, err
 	}
 	jar, _ := cookiejar.New(nil)
-	return &Client{
+	kind := ProfileKind(p)
+	c := &Client{
 		profile:  p,
+		kind:     kind,
 		platform: platform,
 		product:  product,
 		http: &http.Client{
 			Transport: transport,
 			Jar:       jar,
 		},
-	}, nil
+	}
+	switch kind {
+	case KindTrae:
+		if p.Edition == config.EditionGlobal {
+			c.traep = trae.GlobalProfile()
+		} else {
+			c.traep = trae.CNProfile()
+		}
+	case KindQoder:
+		if p.Edition == config.EditionGlobal {
+			c.qoderp = qoder.GlobalProfile()
+		} else {
+			c.qoderp = qoder.CNProfile()
+		}
+	}
+	return c, nil
 }
+
+// Kind 返回客户端的协议族。
+func (c *Client) Kind() string { return c.kind }
 
 func newTransport(proxyRaw string) (*http.Transport, error) {
 	t := &http.Transport{
@@ -314,19 +390,41 @@ type accountData struct {
 
 // LoginSession 是一次进行中的登录流程。
 //
-// 登录必须复用同一个 Cookie Jar：上游把浏览器登录会话与 auth/state 下发的
-// state 绑定，换客户端会导致轮询拿不到令牌。
+// WorkBuddy 协议族：登录必须复用同一个 Cookie Jar——上游把浏览器登录会话
+// 与 auth/state 下发的 state 绑定，换客户端会导致轮询拿不到令牌。
+// 新协议族（lobsterai / trae / qoder）通过 pollFn/cancelFn/embedFn 注入各自
+// 的实现：本地回调监听或远端 PKCE 轮询。
 type LoginSession struct {
 	State     string
 	AuthURL   string
 	ExpiresAt time.Time
 
+	// WorkBuddy 协议族专用。
 	client *http.Client
 	owner  *Client
+
+	// 新协议族的注入实现。
+	pollFn   func(ctx context.Context) (*Credential, error)
+	cancelFn func()
+	embedFn  func(parentOrigin string) string
 }
 
 // StartLogin 发起登录，返回需要用户在浏览器打开的授权链接。
 func (c *Client) StartLogin(ctx context.Context) (*LoginSession, error) {
+	switch c.kind {
+	case KindLobsterAI:
+		return c.startLobsterLogin(ctx)
+	case KindTrae:
+		return c.startTraeLogin(ctx)
+	case KindQoder:
+		return c.startQoderLogin(ctx)
+	default:
+		return c.startWorkBuddyLogin(ctx)
+	}
+}
+
+// startWorkBuddyLogin 是 WorkBuddy 协议族的登录实现。
+func (c *Client) startWorkBuddyLogin(ctx context.Context) (*LoginSession, error) {
 	hc := c.isolatedClient(30 * time.Second)
 	loginCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -353,12 +451,152 @@ func (c *Client) StartLogin(ctx context.Context) (*LoginSession, error) {
 	}, nil
 }
 
+// startLobsterLogin 发起 LobsterAI 登录：绑定本地回调监听，浏览器完成授权
+// 后回调带回授权码，再由 /api/auth/exchange 换取 token 对。
+func (c *Client) startLobsterLogin(ctx context.Context) (*LoginSession, error) {
+	session, err := lobsterai.StartLogin(0)
+	if err != nil {
+		return nil, err
+	}
+	return &LoginSession{
+		State:     session.State,
+		AuthURL:   session.LoginURL,
+		ExpiresAt: time.Now().Add(lobsterai.LoginLifetime),
+		cancelFn:  session.Cancel,
+		embedFn:   func(string) string { return session.LoginURL },
+		pollFn: func(pollCtx context.Context) (*Credential, error) {
+			code, err := session.Wait(pollCtx)
+			if err != nil {
+				return nil, err
+			}
+			token, err := session.Resolve(pollCtx, c.http, code)
+			if err != nil {
+				return nil, err
+			}
+			cred := &Credential{
+				Provider: c.profile.ID,
+				Auth: Tokens{
+					AccessToken:  token.AccessToken,
+					RefreshToken: token.RefreshToken,
+					ExpiresAt:    token.ExpiresAt,
+					UUID:         token.UUID,
+					FirstKeyfrom: token.FirstKeyfrom,
+				},
+				Account: Account{
+					UID:      token.UserID,
+					Nickname: token.Nickname,
+				},
+			}
+			if cred.Auth.ExpiresAt <= 0 {
+				// 上游未报告过期时间：按 2 小时保守估计，401 时仍会刷新重试。
+				cred.Auth.ExpiresAt = time.Now().Add(2 * time.Hour).Unix()
+			}
+			c.Finalize(cred)
+			return cred, nil
+		},
+	}, nil
+}
+
+// startTraeLogin 发起 Trae 登录：本地回调监听（含 17388 探测口应答），
+// 授权回调带回 refreshToken，经旧契约换取 JWT；设备对随凭据保存。
+func (c *Client) startTraeLogin(ctx context.Context) (*LoginSession, error) {
+	session, loginURL, err := trae.StartLogin(c.traep, trae.CallbackPort)
+	if err != nil {
+		return nil, err
+	}
+	return &LoginSession{
+		State:     session.TraceID,
+		AuthURL:   loginURL,
+		ExpiresAt: time.Now().Add(trae.LoginLifetime),
+		cancelFn:  session.Cancel,
+		embedFn:   func(string) string { return loginURL },
+		pollFn: func(pollCtx context.Context) (*Credential, error) {
+			details, err := session.Wait(pollCtx)
+			if err != nil {
+				return nil, err
+			}
+			token, err := session.Resolve(pollCtx, c.http, c.traep, details)
+			if err != nil {
+				return nil, err
+			}
+			// 显示名尽量补齐：回调没带账号明细时读一次用户信息（尽力而为）。
+			if strings.TrimSpace(token.DisplayName) == "" {
+				if _, name, _, uiErr := trae.GetUserInfo(pollCtx, c.http, c.traep, token); uiErr == nil && name != "" {
+					token.DisplayName = name
+				}
+			}
+			cred := &Credential{
+				Provider: c.profile.ID,
+				Auth: Tokens{
+					AccessToken:  token.AccessToken,
+					RefreshToken: token.RefreshToken,
+					ExpiresAt:    token.ExpiresAt,
+					MachineID:    token.MachineID,
+					DeviceID:     token.DeviceID,
+				},
+				Account: Account{
+					UID:          token.UserID,
+					EnterpriseID: token.EnterpriseID,
+					Nickname:     token.DisplayName,
+				},
+			}
+			c.Finalize(cred)
+			return cred, nil
+		},
+	}, nil
+}
+
+// startQoderLogin 发起 Qoder 设备登录：浏览器打开 PKCE 授权页，这里按
+// 轮询节奏调用 Poll 直到批准落地（404 = 等待中）。
+func (c *Client) startQoderLogin(ctx context.Context) (*LoginSession, error) {
+	login, err := qoder.StartLogin(qoder.MachineID())
+	if err != nil {
+		return nil, err
+	}
+	loginURL := login.AuthURL(c.qoderp)
+	return &LoginSession{
+		State:     login.Nonce(),
+		AuthURL:   loginURL,
+		ExpiresAt: time.Now().Add(qoder.LoginLifetime()),
+		embedFn:   func(string) string { return loginURL },
+		pollFn: func(pollCtx context.Context) (*Credential, error) {
+			token, err := qoder.Poll(pollCtx, c.http, c.qoderp, login)
+			if err != nil {
+				// 404 = 浏览器端批准尚未落地，继续等待。
+				if errors.Is(err, qoder.ErrPending) {
+					return nil, nil
+				}
+				return nil, err
+			}
+			cred := &Credential{
+				Provider: c.profile.ID,
+				Auth: Tokens{
+					AccessToken:  token.AccessToken,
+					RefreshToken: token.RefreshToken,
+					ExpiresAt:    token.ExpiresAt,
+					MachineID:    qoder.MachineID(),
+				},
+				Account: Account{
+					UID:      token.UserID,
+					Nickname: token.UserName,
+				},
+			}
+			c.Finalize(cred)
+			return cred, nil
+		},
+	}, nil
+}
+
 // EmbeddedAuthURL 返回可嵌入应用内 iframe 的授权链接。
 //
 // 官方登录页原生支持 embed=iframe 模式：登录完成后会向 parent_origin
 // postMessage 通知结果（login_success / login_fail）。token 本身仍由
 // Poll 轮询获取，postMessage 只用于应用内及时感知并关闭授权窗口。
+// 新协议族不支持内嵌授权，返回原始链接。
 func (s *LoginSession) EmbeddedAuthURL(parentOrigin string) string {
+	if s.embedFn != nil {
+		return s.embedFn(parentOrigin)
+	}
 	u, err := url.Parse(s.AuthURL)
 	if err != nil {
 		return s.AuthURL
@@ -372,12 +610,22 @@ func (s *LoginSession) EmbeddedAuthURL(parentOrigin string) string {
 	return u.String()
 }
 
+// Cancel 取消登录流程（停止本地监听等资源）。WorkBuddy 协议族无需清理。
+func (s *LoginSession) Cancel() {
+	if s.cancelFn != nil {
+		s.cancelFn()
+	}
+}
+
 // Poll 轮询一次登录结果。
 //
 // 返回 (nil, nil) 表示用户尚未完成登录，应继续轮询。
 func (s *LoginSession) Poll(ctx context.Context) (*Credential, error) {
 	if time.Now().After(s.ExpiresAt) {
 		return nil, ErrLoginTimeout
+	}
+	if s.pollFn != nil {
+		return s.pollFn(ctx)
 	}
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
@@ -444,7 +692,22 @@ func (c *Client) Finalize(cred *Credential) {
 }
 
 // Refresh 用 refreshToken 换取新的访问令牌，失败时返回错误。
+// 各协议族的刷新端点与身份字段不同，按 kind 分发。
 func (c *Client) Refresh(ctx context.Context, cred *Credential) error {
+	switch c.kind {
+	case KindLobsterAI:
+		return c.refreshLobster(ctx, cred)
+	case KindTrae:
+		return c.refreshTrae(ctx, cred)
+	case KindQoder:
+		return c.refreshQoder(ctx, cred)
+	default:
+		return c.refreshWorkBuddy(ctx, cred)
+	}
+}
+
+// refreshWorkBuddy 是 WorkBuddy 协议族的刷新实现。
+func (c *Client) refreshWorkBuddy(ctx context.Context, cred *Credential) error {
 	if strings.TrimSpace(cred.Auth.RefreshToken) == "" {
 		return errors.New("凭据缺少 refreshToken，请重新登录")
 	}
@@ -482,6 +745,73 @@ func (c *Client) Refresh(ctx context.Context, cred *Credential) error {
 	return nil
 }
 
+// refreshLobster 刷新 LobsterAI 令牌。uuid/firstKeyfrom 身份对随凭据回传；
+// 新值缺失时保留旧值。
+func (c *Client) refreshLobster(ctx context.Context, cred *Credential) error {
+	token, err := lobsterai.Refresh(ctx, c.http, cred.Auth.RefreshToken,
+		cred.Auth.UUID, cred.Auth.FirstKeyfrom, cred.Account.UID)
+	if err != nil {
+		return err
+	}
+	cred.Auth.AccessToken = token.AccessToken
+	if token.RefreshToken != "" {
+		cred.Auth.RefreshToken = token.RefreshToken
+	}
+	if token.ExpiresAt > 0 {
+		cred.Auth.ExpiresAt = token.ExpiresAt
+	}
+	if cred.Auth.UUID == "" {
+		cred.Auth.UUID = token.UUID
+	}
+	if cred.Auth.FirstKeyfrom == "" {
+		cred.Auth.FirstKeyfrom = token.FirstKeyfrom
+	}
+	cred.UpdatedAt = time.Now()
+	return nil
+}
+
+// refreshTrae 刷新 Trae 令牌。双 token 在服务端轮换；登录设备对永不轮换。
+func (c *Client) refreshTrae(ctx context.Context, cred *Credential) error {
+	token, err := trae.Refresh(ctx, c.http, c.traep, cred.Auth.RefreshToken,
+		cred.Auth.MachineID, cred.Auth.DeviceID)
+	if err != nil {
+		return err
+	}
+	cred.Auth.AccessToken = token.AccessToken
+	if token.RefreshToken != "" {
+		cred.Auth.RefreshToken = token.RefreshToken
+	}
+	if token.ExpiresAt > 0 {
+		cred.Auth.ExpiresAt = token.ExpiresAt
+	}
+	// 设备对以凭据里存的那一对为准（token 家族 mint 时所系）。
+	if cred.Auth.MachineID == "" {
+		cred.Auth.MachineID = token.MachineID
+	}
+	if cred.Auth.DeviceID == "" {
+		cred.Auth.DeviceID = token.DeviceID
+	}
+	cred.UpdatedAt = time.Now()
+	return nil
+}
+
+// refreshQoder 刷新 Qoder 设备令牌。machine_id 使用本机稳定 id。
+func (c *Client) refreshQoder(ctx context.Context, cred *Credential) error {
+	token, err := qoder.Refresh(ctx, c.http, c.qoderp, cred.Auth.RefreshToken, qoder.MachineID())
+	if err != nil {
+		return err
+	}
+	cred.Auth.AccessToken = token.AccessToken
+	if token.RefreshToken != "" {
+		cred.Auth.RefreshToken = token.RefreshToken
+	}
+	if token.ExpiresAt > 0 {
+		cred.Auth.ExpiresAt = token.ExpiresAt
+	}
+	cred.UpdatedAt = time.Now()
+	return nil
+}
+
 // EnsureToken 在令牌即将过期时自动刷新。
 func (c *Client) EnsureToken(ctx context.Context, cred *Credential) error {
 	if strings.TrimSpace(cred.Auth.AccessToken) == "" {
@@ -504,8 +834,22 @@ type v3ConfigResponse struct {
 	} `json:"data"`
 }
 
-// FetchUpstreamModels 从 /v3/config 拉取模型列表。
+// FetchUpstreamModels 拉取上游模型列表。各协议族的目录端点不同，按 kind 分发。
 func (c *Client) FetchUpstreamModels(ctx context.Context, cred *Credential) ([]UpstreamModel, error) {
+	switch c.kind {
+	case KindLobsterAI:
+		return c.fetchLobsterModels(ctx, cred)
+	case KindTrae:
+		return c.fetchTraeModels(ctx, cred)
+	case KindQoder:
+		return c.fetchQoderModels(ctx, cred)
+	default:
+		return c.fetchWorkBuddyModels(ctx, cred)
+	}
+}
+
+// fetchWorkBuddyModels 从 /v3/config 拉取模型列表。
+func (c *Client) fetchWorkBuddyModels(ctx context.Context, cred *Credential) ([]UpstreamModel, error) {
 	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
@@ -531,6 +875,52 @@ func (c *Client) FetchUpstreamModels(ctx context.Context, cred *Credential) ([]U
 		return nil, fmt.Errorf("模型配置解析失败: %w", err)
 	}
 	return cfg.Data.Models, nil
+}
+
+// fetchLobsterModels 读取 LobsterAI 目录。
+func (c *Client) fetchLobsterModels(ctx context.Context, cred *Credential) ([]UpstreamModel, error) {
+	entries, err := lobsterai.ListModels(ctx, c.http, cred.Auth.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]UpstreamModel, 0, len(entries))
+	for _, e := range entries {
+		models = append(models, UpstreamModel{ID: e.ID, Name: e.Name})
+	}
+	return models, nil
+}
+
+// fetchTraeModels 读取 SOLO 目录（并发询问全部对话池取并集）。
+func (c *Client) fetchTraeModels(ctx context.Context, cred *Credential) ([]UpstreamModel, error) {
+	entries, err := trae.ListModels(ctx, c.http, c.traep, cred.Auth.AccessToken,
+		cred.Auth.MachineID, cred.Auth.DeviceID, cred.Account.UID)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]UpstreamModel, 0, len(entries))
+	for _, e := range entries {
+		models = append(models, UpstreamModel{ID: e.ID, Name: e.DisplayName})
+	}
+	return models, nil
+}
+
+// fetchQoderModels 读取 Qoder 目录（签名契约）。
+func (c *Client) fetchQoderModels(ctx context.Context, cred *Credential) ([]UpstreamModel, error) {
+	entries, _, err := qoder.ListModels(ctx, c.http, c.qoderp, cred.Account.UID, cred.Auth.AccessToken)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]UpstreamModel, 0, len(entries))
+	for _, e := range entries {
+		models = append(models, UpstreamModel{
+			ID:             e.Key,
+			Name:           e.DisplayName,
+			MaxInputTokens: int64(e.MaxInput),
+			MaxOutputTok:   int64(e.MaxOutput),
+			SupportsImages: e.Vision,
+		})
+	}
+	return models, nil
 }
 
 // BuildModelList 把内置白名单与上游配置合并成最终模型列表。
@@ -615,8 +1005,27 @@ func (c *Client) BuildModelList(extra, disabled []string, upstreamModels []Upstr
 // 对话转发
 // -----------------------------------------------------------------------------
 
-// Chat 把请求转发到上游 /v2/chat/completions。调用方负责关闭响应体。
+// Chat 把请求转发到上游对话端点。调用方负责关闭响应体。
+//
+// 返回的响应（HTTP 200 时）是标准 OpenAI SSE——协议差异（SOLO 翻译、
+// Qoder 签名信封、LobsterAI 流首错误过滤）由各适配包在边界上翻译掉，
+// 服务层与 Failover 逻辑对上游无感知。
 func (c *Client) Chat(ctx context.Context, cred *Credential, body []byte) (*http.Response, error) {
+	switch c.kind {
+	case KindLobsterAI:
+		return lobsterai.Chat(ctx, c.http, cred.Auth.AccessToken, body)
+	case KindTrae:
+		return trae.Chat(ctx, c.http, c.traep, cred.Auth.AccessToken,
+			cred.Auth.MachineID, cred.Auth.DeviceID, cred.Account.UID, body)
+	case KindQoder:
+		return qoder.Chat(ctx, c.http, c.qoderp, cred.Account.UID, cred.Auth.AccessToken, body)
+	default:
+		return c.chatWorkBuddy(ctx, cred, body)
+	}
+}
+
+// chatWorkBuddy 把请求转发到上游 /v2/chat/completions。
+func (c *Client) chatWorkBuddy(ctx context.Context, cred *Credential, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/v2/chat/completions"), bytes.NewReader(body))
 	if err != nil {
 		return nil, err

@@ -514,25 +514,51 @@ func (s *Server) modelEntries() []modelEntry {
 // buildModelEntries 实际汇总模型；返回的切片之后不再修改，可以被多个请求共享。
 //
 // 调用方必须持有 entryMu。
+//
+// 命名消歧规则（多上游同时登录时）：
+//   - 国际版 workbuddy 的模型统一加 "intl:" 前缀（既有约定，裸名默认路由
+//     到国内版）；
+//   - 其它上游：每个裸模型名归属于第一个（配置顺序）暴露它的上游，其余
+//     上游的同名模型改用 "上游ID:模型名" 前缀暴露，保证都能被显式寻址
+//     （resolveModel 支持 "上游ID:模型名" 语法）；
+//   - 只登录单个上游时全部保持原样，客户端直接填裸模型名。
 func (s *Server) buildModelEntries() []modelEntry {
 	active := s.loggedInProfiles()
 
-	// 多版本场景下国际版需要前缀区分。
-	tag := map[string]bool{}
+	// 每个上游的模型列表只取一次：hasCredential → loadCreds 虽有 2 秒缓存，
+	// 汇总在每次路由与 /v1/models 都会跑，仍要避免成倍的重复扫描。
+	modelSets := make([][]upstream.ModelInfo, len(active))
+	for i, p := range active {
+		modelSets[i] = s.modelsFor(p.ID)
+	}
+
+	// 裸模型名的归属表：跳过多上游场景下整体加前缀的 workbuddy，
+	// 让国内/国内系上游优先持有裸名。
+	firstOwner := map[string]string{}
 	if len(active) > 1 {
-		for _, p := range active {
+		for i, p := range active {
 			if p.ID == intlProviderID {
-				tag[p.ID] = true
+				continue
+			}
+			for _, m := range modelSets[i] {
+				if _, ok := firstOwner[m.ID]; !ok {
+					firstOwner[m.ID] = p.ID
+				}
 			}
 		}
 	}
 
 	out := make([]modelEntry, 0, 32)
-	for _, p := range active {
-		for _, m := range s.modelsFor(p.ID) {
+	for i, p := range active {
+		for _, m := range modelSets[i] {
 			id := m.ID
-			if tag[p.ID] {
-				id = intlModelPrefix + ":" + m.ID
+			if len(active) > 1 {
+				switch {
+				case p.ID == intlProviderID:
+					id = intlModelPrefix + ":" + m.ID
+				case firstOwner[m.ID] != p.ID:
+					id = p.ID + ":" + m.ID
+				}
 			}
 			out = append(out, modelEntry{
 				Model: openai.Model{
@@ -888,9 +914,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	payload["model"] = upstreamModel
+	// WorkBuddy 协议族要求首条 system 消息、stream_options 与模板句改写；
+	// 其它协议族（lobsterai / trae / qoder）的请求体由各自适配层处理，
+	// 这里保持客户端原样（仅强制流式）。强制思考档只对 hy3 系列有意义，
+	// 同样限定在 WorkBuddy 协议族——qoder 的签名体多一个未知字段都可能
+	// 被上游拒绝。
+	workBuddyFamily := upstream.ProfileKind(profile) == upstream.KindWorkBuddy
 	body, _, err := openai.PrepareRequestBody(mustJSON(payload), openai.TransformOptions{
-		Sanitize:         s.Config().SanitizeEnabled(),
-		ForceMaxThinking: s.Config().MaxThinkingEnabled(),
+		Sanitize:           workBuddyFamily && s.Config().SanitizeEnabled(),
+		ForceMaxThinking:   workBuddyFamily && s.Config().MaxThinkingEnabled(),
+		EnsureSystemPrompt: workBuddyFamily,
+		AddStreamOptions:   workBuddyFamily,
 	})
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "构造上游请求失败: "+err.Error(), "invalid_request_error", "invalid_body")
@@ -1393,6 +1427,7 @@ var creditKeywords = []string{
 	"insufficient_quota", "insufficient quota", "quota_exceeded", "quota exceeded",
 	"out of credits", "no credits", "insufficient credits", "credit balance",
 	"insufficient_balance", "insufficient balance", "credits exhausted",
+	"exceed_quota", "超出配额",
 	"额度", "余额不足", "配额", "用量已用尽", "计费",
 }
 

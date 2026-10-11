@@ -2,7 +2,7 @@
 
 [中文说明](README.md) | **English**
 
-Turn **WorkBuddy** (international) and **CodeBuddy** (China) accounts into a local **OpenAI-compatible API**. Sign in once, and any client that supports a custom OpenAI endpoint (Cherry Studio, ChatBox, LobeChat, Open WebUI, Cursor, Cline, various SDKs and scripts, …) can call the models directly.
+Turn **WorkBuddy** (international), **CodeBuddy** (China), **LobsterAI**, **Trae** (China / International) and **Qoder** (China / International) accounts into a local **OpenAI-compatible API**. Sign in once, and any client that supports a custom OpenAI endpoint (Cherry Studio, ChatBox, LobeChat, Open WebUI, Cursor, Cline, various SDKs and scripts, …) can call the models directly.
 
 - Language / framework: Go + Wails v2 (native WebView, small installer, low memory footprint)
 - Platforms: Windows / macOS / Linux
@@ -15,13 +15,29 @@ Turn **WorkBuddy** (international) and **CodeBuddy** (China) accounts into a loc
 
 ---
 
+## Supported providers
+
+Each signable provider is one **group**: accounts inside a group are served with weighted round-robin and act as each other's failover. When a vendor ships China / International editions, they are two independent groups (accounts are signed in separately).
+
+| Group (provider ID) | Vendor | Sign-in | Notes |
+|---|---|---|---|
+| `workbuddy` | WorkBuddy (International) | Browser authorization | Polling sign-in, tokens auto-refreshed |
+| `codebuddy` | CodeBuddy (China) | Browser authorization | Same protocol family as WorkBuddy |
+| `lobsterai` | LobsterAI (NetEase Youdao) | Browser callback | Local callback port exchanges the token, streaming only |
+| `trae-cn` | Trae (China) | Browser authorization callback | SOLO protocol, dual-token rotation |
+| `trae-global` | Trae (International) | Browser authorization callback | Singapore deployment, separate from the China edition |
+| `qoder-cn` | Qoder (China) | Device code (PKCE) | COSY-signed chat, approve in the browser |
+| `qoder-global` | Qoder (International) | Device code (PKCE) | Separate from the China edition |
+
+---
+
 ## Features
 
-- **Graphical sign-in**: built-in presets for WorkBuddy (`www.workbuddy.ai`) and CodeBuddy (`copilot.tencent.com`). Click "Sign in" and the official authorization page (Google / GitHub / QR code) opens in your system browser; tokens are saved and refreshed automatically. Sign-in status is shown on the Overview tab.
-- **OpenAI-compatible service**: exposes `/v1/models`, `/v1/chat/completions` (plus equivalent paths without `/v1`) and `/healthz`. Both streaming and non-streaming requests are supported (the upstream only offers streaming; the proxy aggregates SSE server-side).
+- **Graphical sign-in**: built-in presets for WorkBuddy, CodeBuddy, LobsterAI, Trae (China / International) and Qoder (China / International). Click "Sign in" and the authorization page opens in your system browser; tokens are saved and refreshed automatically. Sign-in status is shown on the Overview tab.
+- **OpenAI-compatible service**: exposes `/v1/models`, `/v1/chat/completions` (plus equivalent paths without `/v1`) and `/healthz`. Both streaming and non-streaming requests are supported (streaming-only upstreams are aggregated server-side).
 - **Multi-account load balancing**: sign in with several accounts per provider; requests are served round-robin. Expired tokens are refreshed automatically and 401/403 responses are retried once.
 - **Multi-provider routing**: use the bare model name (auto-matched), or prefix it with `provider:model` / `provider/model` (the International edition accepts the `intl:` shorthand); you can also force routing with the `X-RapidProxy-Provider` header (`intl` accepted) or `?provider=`, and pin an account with `X-RapidProxy-Account`.
-- **International vs China edition naming**: when several providers are enabled, International (workbuddy) models are listed as `intl:model` while China edition (codebuddy) models keep their bare names and serve as the default route; with a single provider enabled, all IDs stay plain.
+- **Multi-provider model disambiguation**: when several providers are enabled, International (workbuddy) models are listed as `intl:model`; for the remaining providers, a bare model name belongs to the first provider (config order) that exposes it, and every other provider's copy is listed as `provider:model`; with a single provider enabled, all IDs stay plain.
 - **API key auth**: multiple keys supported with one-click generation; with no key configured, requests are unauthenticated (recommended only for loopback listening).
 - **Built-in + auto-synced model list**: a built-in whitelist keeps models callable even when the upstream config endpoint under-reports; new upstream models are pulled periodically. Manual "extra models" and "disabled models" are also supported.
 - **Deep thinking & tool calls**: `hy3` models automatically request the highest reasoning effort; `delta.reasoning_content` is passed through; OpenAI-style `tool_calls` deltas are merged correctly by `index`.

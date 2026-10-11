@@ -42,7 +42,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.2.5"
+const Version = "1.3.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -704,7 +704,7 @@ func (a *App) providerViews(creds []*upstream.Credential) []ProviderView {
 			Proxy:        p.Proxy,
 			AccountCount: counts[p.ID],
 			ModelCount:   len(a.srv.ModelsFor(p.ID)),
-			NeedsProxy:   strings.Contains(p.BaseURL, "workbuddy.ai"),
+			NeedsProxy:   p.ProxyRecommended(),
 		})
 	}
 	return out
@@ -959,7 +959,10 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 
 	a.cancelLogin()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+	// 10 分钟覆盖各协议族的授权窗口（WorkBuddy 5 分钟、LobsterAI/Trae
+	// 10 分钟、Qoder 5 分钟）；WorkBuddy 的会话到期由 Poll 返回
+	// ErrLoginTimeout 提前结束，不会被这里拖住。
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	session, err := client.StartLogin(ctx)
 	if err != nil {
 		cancel()
@@ -1063,7 +1066,14 @@ func (a *App) cancelLogin() {
 	run := a.login
 	a.login = nil
 	a.loginMu.Unlock()
-	if run != nil && run.cancel != nil {
+	if run == nil {
+		return
+	}
+	// 先停掉协议族侧的资源（本地回调监听、探测口等），再取消轮询上下文。
+	if run.session != nil {
+		run.session.Cancel()
+	}
+	if run.cancel != nil {
 		run.cancel()
 	}
 }

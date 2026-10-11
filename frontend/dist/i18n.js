@@ -108,12 +108,14 @@
 
       /* 模型 */
       'models.title': '可用模型',
-      'th.accounts': '可用账号',
       'models.accountsHint': '{n}/{total} 个账号可用；同名模型在这些账号间按权重分摊，右键可复制模型 ID',
       'ctx.copyId': '复制模型 ID',
       'ctx.copyName': '复制模型名称',
       'ctx.copySelection': '复制选中内容',
       'models.search': '搜索模型…',
+      'models.allUpstream': '全部上游',
+      'models.countAll': '共 {n} 个模型',
+      'models.countFiltered': '{n} / {total} 个模型',
       'btn.sync': '立即同步',
       'th.id': '模型 ID',
       'th.name': '名称',
@@ -326,12 +328,14 @@
 
       /* Models */
       'models.title': 'Available Models',
-      'th.accounts': 'Accounts',
       'models.accountsHint': '{n}/{total} accounts available; same-name models are balanced across them by weight. Right-click to copy the model ID',
       'ctx.copyId': 'Copy model ID',
       'ctx.copyName': 'Copy model name',
       'ctx.copySelection': 'Copy selection',
       'models.search': 'Search models…',
+      'models.allUpstream': 'All upstreams',
+      'models.countAll': '{n} models',
+      'models.countFiltered': '{n} of {total} models',
       'btn.sync': 'Sync Now',
       'th.id': 'Model ID',
       'th.name': 'Name',

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"testing"
 )
@@ -10,8 +11,17 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Listen != DefaultListen {
 		t.Errorf("默认监听地址 = %q", cfg.Listen)
 	}
-	if len(cfg.Profiles) != 2 {
-		t.Fatalf("默认应有 2 个上游，实际 %d", len(cfg.Profiles))
+	if len(cfg.Profiles) != 7 {
+		t.Fatalf("默认应有 7 个上游，实际 %d", len(cfg.Profiles))
+	}
+	kinds := map[string]string{}
+	for _, p := range cfg.Profiles {
+		kinds[p.ID] = p.Kind
+	}
+	if kinds["lobsterai"] != KindLobsterAI || kinds["trae-cn"] != KindTrae ||
+		kinds["trae-global"] != KindTrae || kinds["qoder-cn"] != KindQoder ||
+		kinds["qoder-global"] != KindQoder || kinds["workbuddy"] != KindWorkBuddy {
+		t.Errorf("上游协议族标注不符合预期: %v", kinds)
 	}
 	enabled := cfg.EnabledProfiles()
 	if len(enabled) != 1 || enabled[0].ID != "workbuddy" {
@@ -74,7 +84,7 @@ func TestNormalizeFillsMissingFields(t *testing.T) {
 	if c.Platform != DefaultPlatform || c.Product != DefaultProduct {
 		t.Error("platform / product 未补默认值")
 	}
-	if len(c.Profiles) != 2 {
+	if len(c.Profiles) != 7 {
 		t.Errorf("上游未补默认值: %d", len(c.Profiles))
 	}
 }
@@ -193,5 +203,38 @@ func TestCloneIsolatesMutations(t *testing.T) {
 	}
 	if len(cfg.APIKeys) != 0 {
 		t.Error("Clone 未隔离 APIKeys")
+	}
+}
+
+// 旧版本配置文件里只有当时的上游清单：加载后必须补齐新增预设，
+// 否则升级用户在界面上永远看不到新增的服务商。
+func TestOldConfigGainsNewPresets(t *testing.T) {
+	raw := []byte(`{"listen":"127.0.0.1:8787","profiles":[` +
+		`{"id":"workbuddy","name":"WorkBuddy（国际版）","enabled":true,"base_url":"https://www.workbuddy.ai"},` +
+		`{"id":"codebuddy","name":"CodeBuddy（国内版）","enabled":false,"base_url":"https://copilot.tencent.com"}]}`)
+	cfg := DefaultAt(filepath.Join(t.TempDir(), "config.json"))
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Normalize()
+	if len(cfg.Profiles) != 7 {
+		t.Fatalf("升级后应有 7 个上游，实际 %d", len(cfg.Profiles))
+	}
+	byID := map[string]Profile{}
+	for _, p := range cfg.Profiles {
+		byID[p.ID] = p
+	}
+	for _, id := range []string{"lobsterai", "trae-cn", "trae-global", "qoder-cn", "qoder-global"} {
+		p, ok := byID[id]
+		if !ok {
+			t.Fatalf("升级后缺少预设 %s", id)
+		}
+		if p.Kind == "" {
+			t.Fatalf("补齐的预设 %s 未标注协议族", id)
+		}
+	}
+	// 用户原有配置不被覆盖：开关与自定义字段保持原样。
+	if !byID["workbuddy"].Enabled || byID["codebuddy"].Enabled {
+		t.Fatal("升级不应改动既有上游的启用状态")
 	}
 }

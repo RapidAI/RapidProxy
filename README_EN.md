@@ -28,6 +28,7 @@ Each signable provider is one **group**: accounts inside a group are served with
 | `trae-global` | Trae (International) | Browser authorization callback | Singapore deployment, separate from the China edition |
 | `qoder-cn` | Qoder (China) | Device code (PKCE) | COSY-signed chat, approve in the browser |
 | `qoder-global` | Qoder (International) | Device code (PKCE) | Separate from the China edition |
+| `opencode` | OpenCode Zen (opencode.ai) | API key | Paste a key, or auto-import the one saved by the local OpenCode CLI; a proxy is recommended |
 
 ---
 

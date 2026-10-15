@@ -50,4 +50,6 @@ export function StartService():Promise<void>;
 
 export function StopService():Promise<void>;
 
+export function SubmitLoginKey(arg1:string,arg2:string):Promise<void>;
+
 export function ToggleService():Promise<boolean>;

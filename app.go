@@ -42,7 +42,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.3.1"
+const Version = "1.4.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -164,6 +164,8 @@ type LoginView struct {
 	Message   string `json:"message"`
 	ExpiresAt string `json:"expiresAt"`
 	AccountID string `json:"accountId"`
+	// NeedKey 表示这次登录等待用户在界面上粘贴密钥（OpenCode 的 API Key 制登录）。
+	NeedKey bool `json:"needKey"`
 }
 
 // UpdateView 是在线更新的检查结果与安装进度。
@@ -975,8 +977,20 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 		session:      session,
 		cancel:       cancel,
 		status:       "pending",
-		message:      locale.T("login.browserOpened"),
 		parentOrigin: strings.TrimSpace(parentOrigin),
+	}
+	switch {
+	case session.SkipBrowser:
+		// 本机已找到凭据（如 OpenCode CLI 的 auth.json），直接确认导入，
+		// 不必打开浏览器；粘贴框仍可见（NeedKey 亦为真），想换一把钥匙
+		// 的用户可以直接粘贴覆盖，不必先去删本机文件。
+		run.message = locale.T("login.importing")
+	case session.NeedKey:
+		// OpenCode 是 API Key 制登录：本机没有现成密钥时，打开官方密钥页，
+		// 等用户在界面上粘贴（SubmitLoginKey 收口）。
+		run.message = locale.T("login.pasteKey")
+	default:
+		run.message = locale.T("login.browserOpened")
 	}
 	a.loginMu.Lock()
 	a.login = run
@@ -985,11 +999,13 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 	// 内嵌 iframe 授权页会被上游安全策略（X-Frame-Options / CSP frame-ancestors）
 	// 拦截，无法在应用内显示；统一改用系统浏览器完成登录。
 	// 登录结果仍由后端轮询自动感知，不依赖浏览器回调。
-	if ctx := a.context(); ctx != nil {
-		wailsrt.BrowserOpenURL(ctx, session.AuthURL)
-		a.log.Infof("[%s] 已在系统浏览器打开登录页", profile.Name)
-	} else {
-		a.log.Warnf("[%s] 无法自动打开浏览器，请复制登录链接手动访问", profile.Name)
+	if !session.SkipBrowser {
+		if ctx := a.context(); ctx != nil {
+			wailsrt.BrowserOpenURL(ctx, session.AuthURL)
+			a.log.Infof("[%s] 已在系统浏览器打开登录页", profile.Name)
+		} else {
+			a.log.Warnf("[%s] 无法自动打开浏览器，请复制登录链接手动访问", profile.Name)
+		}
 	}
 	a.pushLogin()
 
@@ -1008,15 +1024,35 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 		case <-ticker.C:
 			cred, err := run.session.Poll(ctx)
 			if err != nil {
+				// 本机导入的 OpenCode 密钥被网关明确拒绝：不结束流程，转成
+				// 粘贴模式让用户就地换一把。否则坏密钥静默落库，而本机
+				// auth.json 不删掉的话，用户连粘贴框都等不到。
+				if errors.Is(err, upstream.ErrOpenCodeKeyRejected) && run.session.State == "local" && a.fallbackLoginToKeyPaste(run) {
+					continue
+				}
 				if errors.Is(err, upstream.ErrLoginTimeout) {
 					a.finishLogin(run, "failed", locale.T("login.expired"), "")
 					return
 				}
-				a.finishLogin(run, "failed", err.Error(), "")
+				message := err.Error()
+				if errors.Is(err, upstream.ErrOpenCodeKeyRejected) {
+					message = locale.T("login.keyRejected")
+				}
+				a.finishLogin(run, "failed", message, "")
 				return
 			}
 			if cred == nil {
 				continue
+			}
+			// 凭据到手时流程可能已经不在 pending：用户改用了粘贴密钥
+			// （SubmitLoginKey 已置终态并取消轮询），或取消了登录、或发起
+			// 了新流程。这时迟到的凭据不该落库——否则同一次登录会存出两个
+			// 账号（本机密钥 + 用户粘贴的密钥），流量被悄悄分走。
+			a.loginMu.Lock()
+			stillPending := a.login == run && run.status == "pending"
+			a.loginMu.Unlock()
+			if !stillPending {
+				return
 			}
 			// 凭据 ID 是 provider+uid，重新登录同一账号会算出同一个 ID。
 			// 用保留本地字段的写法，否则用户在界面上配的权重和「暂停」
@@ -1075,20 +1111,132 @@ func (a *App) enableProviderIfDisabled(providerID string) {
 	a.log.Infof("上游 %s 已随登录自动启用", profile.Name)
 }
 
+// finishLogin 结束登录流程。终态（success / failed）具有粘滞性：先到达的
+// 终态不会被后到的覆盖。密钥制登录（OpenCode）由 SubmitLoginKey 直接置
+// success 并取消轮询上下文，轮询 goroutine 随后会在 <-ctx.Done() 分支醒来，
+// 没有这道守卫就会把「登录成功」改写成「登录超时或已取消」。
 func (a *App) finishLogin(run *loginRun, status, message, accountID string) {
 	a.loginMu.Lock()
-	if a.login == run {
-		run.status = status
-		run.message = message
-		run.accountID = accountID
-		if status != "pending" {
-			run.cancel()
-		}
-	}
+	applied := a.finishLoginLocked(run, status, message, accountID)
 	a.loginMu.Unlock()
+	if !applied {
+		// 终态粘滞：后来的 success/failed 不再改状态，也不必记一笔流程结束。
+		return
+	}
 	a.log.Infof("登录流程结束: %s", message)
 	a.pushLogin()
 	a.pushState()
+}
+
+// finishLoginLocked 是 finishLogin 的持锁版本，供已拿到 loginMu 的调用方
+// 使用。返回 false 表示这次终态被粘滞守卫挡下（状态未变）。
+func (a *App) finishLoginLocked(run *loginRun, status, message, accountID string) bool {
+	if a.login != run || run.status != "pending" {
+		return false
+	}
+	run.status = status
+	run.message = message
+	run.accountID = accountID
+	if status != "pending" {
+		run.cancel()
+	}
+	return true
+}
+
+// fallbackLoginToKeyPaste 把「本机导入的密钥被上游拒绝」的登录流程转成粘贴
+// 模式：沿用同一个 pending 流程，界面上出现密钥输入框，同时打开官方密钥页
+// 让用户去领一把新钥匙。返回 false 表示流程已不在 pending（被取消或已结束），
+// 调用方应按普通错误收尾。
+//
+// 轮询 goroutine 随后会在 session.NeedKey 上看到 true，pollFn 转为占位等待
+// （见 upstream.openCodeLocalSession），不会重复校验同一把坏密钥。
+func (a *App) fallbackLoginToKeyPaste(run *loginRun) bool {
+	a.loginMu.Lock()
+	if a.login != run || run.status != "pending" {
+		a.loginMu.Unlock()
+		return false
+	}
+	run.session.NeedKey = true
+	run.session.State = "paste"
+	run.message = locale.T("login.keyRejected")
+	a.loginMu.Unlock()
+	a.log.Warnf("本机导入的 %s 密钥被上游拒绝，转为手动粘贴", run.provider)
+	if ctx := a.context(); ctx != nil {
+		wailsrt.BrowserOpenURL(ctx, run.session.AuthURL)
+	}
+	a.pushLogin()
+	return true
+}
+
+// SubmitLoginKey 提交用户粘贴的上游密钥（目前用于 OpenCode：Zen 是 API Key
+// 制，没有浏览器授权回调）。provider 是上游 ID，key 是用户粘贴的原文，
+//
+//	tolerates 常见的粘贴噪声（引号、JSON、Bearer 前缀）。
+func (a *App) SubmitLoginKey(provider, key string) error {
+	cfg := a.settings()
+	profile, ok := cfg.ProfileByID(provider)
+	if !ok {
+		return fmt.Errorf("%s", locale.T("login.unknownProvider", provider))
+	}
+	client, err := a.srv.ClientFor(provider)
+	if err != nil {
+		return err
+	}
+	normalized, err := client.NormalizeOpenCodeKey(key)
+	if err != nil {
+		if errors.Is(err, upstream.ErrOpenCodeKeyInvalid) {
+			return errors.New(locale.T("login.keyInvalid"))
+		}
+		return err
+	}
+
+	// 粘贴的密钥先过一次上游校验：错键立刻提示，不会存进凭据库后等到首次
+	// 对话才以一句费解的「认证失败」暴露。联机类错误放行——密钥本身可能
+	// 没问题，真实故障让运行时去暴露。
+	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelVerify()
+	if err := client.VerifyOpenCodeKey(verifyCtx, normalized); err != nil {
+		if errors.Is(err, upstream.ErrOpenCodeKeyRejected) {
+			return errors.New(locale.T("login.keyRejected"))
+		}
+		a.log.Warnf("未能联机校验 %s 密钥（仍按提交保存）: %v", profile.Name, err)
+	}
+
+	cred := client.OpenCodeCredential(normalized)
+	if a.store == nil {
+		return fmt.Errorf("%s", locale.T("login.saveFailed", "凭据仓库不可用"))
+	}
+	// 与轮询路径同一套写法：保留本地字段（权重、暂停开关），否则重复
+	// 导入同一密钥会把用户配置清掉。
+	if err := a.store.SavePreservingLocalFields(cred); err != nil {
+		return fmt.Errorf("%s", locale.T("login.saveFailed", err.Error()))
+	}
+	a.enableProviderIfDisabled(cred.Provider)
+	a.srv.InvalidateAccounts()
+	a.log.Infof("登录成功: %s（%s）", cred.DisplayName(), cred.ID)
+
+	// 只有当前确实有一个等待密钥的 pending 流程时才接管它；用户可能在
+	// 流程已结束（超时/取消）之后才提交，那时只落盘凭据、不动登录态。
+	a.loginMu.Lock()
+	run := a.login
+	takeover := run != nil && run.provider == provider && run.status == "pending" && run.session != nil && run.session.NeedKey
+	if takeover {
+		a.finishLoginLocked(run, "success", locale.T("login.success"), cred.ID)
+	}
+	a.loginMu.Unlock()
+	if !takeover {
+		a.log.Warnf("收到密钥提交，但没有等待中的 %s 登录流程，仅保存凭据", profile.Name)
+	}
+	a.pushLogin()
+	a.pushState()
+
+	go func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		a.srv.RefreshModels(refreshCtx)
+		a.pushState()
+	}()
+	return nil
 }
 
 func (a *App) cancelLogin() {
@@ -1132,6 +1280,7 @@ func (a *App) loginState() LoginView {
 		Message:   run.message,
 		ExpiresAt: run.session.ExpiresAt.Format("15:04:05"),
 		AccountID: run.accountID,
+		NeedKey:   run.session.NeedKey,
 	}
 	return view
 }

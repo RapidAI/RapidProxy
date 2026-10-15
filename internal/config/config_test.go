@@ -11,8 +11,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Listen != DefaultListen {
 		t.Errorf("默认监听地址 = %q", cfg.Listen)
 	}
-	if len(cfg.Profiles) != 7 {
-		t.Fatalf("默认应有 7 个上游，实际 %d", len(cfg.Profiles))
+	if len(cfg.Profiles) != 8 {
+		t.Fatalf("默认应有 8 个上游，实际 %d", len(cfg.Profiles))
 	}
 	kinds := map[string]string{}
 	for _, p := range cfg.Profiles {
@@ -20,7 +20,8 @@ func TestDefaultConfig(t *testing.T) {
 	}
 	if kinds["lobsterai"] != KindLobsterAI || kinds["trae-cn"] != KindTrae ||
 		kinds["trae-global"] != KindTrae || kinds["qoder-cn"] != KindQoder ||
-		kinds["qoder-global"] != KindQoder || kinds["workbuddy"] != KindWorkBuddy {
+		kinds["qoder-global"] != KindQoder || kinds["workbuddy"] != KindWorkBuddy ||
+		kinds["opencode"] != KindOpenCode {
 		t.Errorf("上游协议族标注不符合预期: %v", kinds)
 	}
 	enabled := cfg.EnabledProfiles()
@@ -84,8 +85,54 @@ func TestNormalizeFillsMissingFields(t *testing.T) {
 	if c.Platform != DefaultPlatform || c.Product != DefaultProduct {
 		t.Error("platform / product 未补默认值")
 	}
-	if len(c.Profiles) != 7 {
+	if len(c.Profiles) != 8 {
 		t.Errorf("上游未补默认值: %d", len(c.Profiles))
+	}
+}
+
+// OpenCode 预设：设置里保存的 User-Agent 恒为裸 "opencode"——连线时改写成
+// opencode/<semver> 只发生在上游侧，不能落进配置文件，否则按精确匹配识别
+// opencode 客户端的 GLM 会读到被改写过的值。
+func TestOpenCodePresetKeepsBareUserAgent(t *testing.T) {
+	preset := OpenCodePreset()
+	if preset.ID != "opencode" || preset.Kind != KindOpenCode {
+		t.Fatalf("预设基本信息异常: %+v", preset)
+	}
+	if preset.UserAgent != "opencode" {
+		t.Errorf("设置里保存的 User-Agent 应为裸 opencode，实际 %q", preset.UserAgent)
+	}
+	if preset.BaseURL != "https://opencode.ai/zen/v1" {
+		t.Errorf("BaseURL = %q", preset.BaseURL)
+	}
+	if preset.Enabled {
+		t.Error("OpenCode 预设默认应为关闭状态")
+	}
+
+	// 旧配置里只有 ID 的 opencode 条目：归一化补全字段，但不动用户显式
+	// 填写的 User-Agent。
+	c := &Config{Listen: "127.0.0.1:8787", Profiles: []Profile{{ID: "opencode"}}}
+	c.Normalize()
+	byID := map[string]Profile{}
+	for _, p := range c.Profiles {
+		byID[p.ID] = p
+	}
+	p, ok := byID["opencode"]
+	if !ok {
+		t.Fatal("归一化后缺少 opencode 预设")
+	}
+	if p.Kind != KindOpenCode || p.BaseURL != "https://opencode.ai/zen/v1" {
+		t.Errorf("归一化未补全 opencode 字段: %+v", p)
+	}
+	if p.UserAgent != "opencode" {
+		t.Errorf("归一化后 User-Agent = %q，应为裸 opencode", p.UserAgent)
+	}
+
+	c2 := &Config{Listen: "127.0.0.1:8787", Profiles: []Profile{{ID: "opencode", UserAgent: "custom-agent/9.9"}}}
+	c2.Normalize()
+	for _, got := range c2.Profiles {
+		if got.ID == "opencode" && got.UserAgent != "custom-agent/9.9" {
+			t.Errorf("用户自定义 User-Agent 被覆盖: %q", got.UserAgent)
+		}
 	}
 }
 
@@ -217,14 +264,14 @@ func TestOldConfigGainsNewPresets(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.Normalize()
-	if len(cfg.Profiles) != 7 {
-		t.Fatalf("升级后应有 7 个上游，实际 %d", len(cfg.Profiles))
+	if len(cfg.Profiles) != 8 {
+		t.Fatalf("升级后应有 8 个上游，实际 %d", len(cfg.Profiles))
 	}
 	byID := map[string]Profile{}
 	for _, p := range cfg.Profiles {
 		byID[p.ID] = p
 	}
-	for _, id := range []string{"lobsterai", "trae-cn", "trae-global", "qoder-cn", "qoder-global"} {
+	for _, id := range []string{"lobsterai", "trae-cn", "trae-global", "qoder-cn", "qoder-global", "opencode"} {
 		p, ok := byID[id]
 		if !ok {
 			t.Fatalf("升级后缺少预设 %s", id)

@@ -14,6 +14,9 @@ const S = {
   stats: { period: 'day', provider: '', model: '' },
 };
 
+// OpenCode 密钥提交进行中：后端会联机校验，期间要挡住轮询刷新重复放开按钮。
+let submittingKey = false;
+
 const $ = (id) => document.getElementById(id);
 const el = (tag, cls, text) => {
   const node = document.createElement(tag);
@@ -192,11 +195,20 @@ function renderLogin() {
   const spinner = $('login-spinner');
   spinner.className = 'spinner' + (login.status === 'success' ? ' done' : login.status === 'failed' ? ' fail' : '');
 
+  // API Key 制登录（OpenCode）走「粘贴密钥」分支：显示输入行、隐藏浏览器提示。
+  const needKey = !!login.needKey && login.status === 'pending';
   $('login-title').textContent =
-    login.status === 'pending' ? t('login.pending') :
-    login.status === 'success' ? t('login.success') : t('login.failed');
+    login.status === 'success' ? t('login.success') :
+    login.status === 'failed' ? t('login.failed') :
+    needKey ? t('login.pasteTitle') : t('login.pending');
   $('login-message').textContent = login.message || '';
   $('login-expires').textContent = login.status === 'pending' ? t('login.expiresFmt', { time: login.expiresAt }) : '';
+  $('login-browser-tip').classList.toggle('hidden', needKey);
+  $('login-key-tip').classList.toggle('hidden', !needKey);
+  $('login-key-row').classList.toggle('hidden', !needKey);
+  // 提交过程中后端要联机校验密钥，轮询刷新不能把按钮又放开导致重复提交。
+  $('btn-submit-key').disabled = !needKey || submittingKey;
+  if (!needKey && !submittingKey) $('login-key').value = '';
 
   const urlNode = $('login-url');
   urlNode.textContent = login.url || '-';
@@ -1132,6 +1144,28 @@ function bindUI() {
   $('btn-open-login').onclick = () => {
     if (S.login.url) call('OpenURL', S.login.url).catch(() => {});
   };
+  // OpenCode 密钥提交：Enter 与按钮等价。失败时保留输入框内容便于重试，
+  // 刷新后仍处于 pending 会重新放开按钮。提交期间后端会联机校验密钥，
+  // 用 submittingKey 挡住轮询刷新与重复点击。
+  $('btn-submit-key').onclick = async () => {
+    if (submittingKey) return;
+    const value = $('login-key').value.trim();
+    if (!value) return toast(t('toast.keyEmpty'));
+    const provider = S.login.provider;
+    submittingKey = true;
+    $('btn-submit-key').disabled = true;
+    try {
+      await call('SubmitLoginKey', provider, value);
+      $('login-key').value = '';
+    } catch (err) {
+      toast(t('toast.opFailedFmt', { err: String(err) }));
+    }
+    submittingKey = false;
+    await refresh();
+  };
+  $('login-key').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') $('btn-submit-key').click();
+  });
   $('model-search').oninput = (e) => { S.modelFilter = e.target.value; renderModels(); };
 
   // 语言切换即时生效；其余设置项保持「编辑后点保存」的节奏

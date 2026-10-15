@@ -13,7 +13,7 @@
   "info": {
     "companyName": "RapidProxy",
     "productName": "WorkBuddy Proxy",
-    "productVersion": "1.3.1",
+    "productVersion": "1.4.0",
     "copyright": "MIT License",
     "comments": "把 WorkBuddy / CodeBuddy / LobsterAI / Trae / Qoder 封装成 OpenAI 兼容服务"
   }

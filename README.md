@@ -27,6 +27,7 @@
 | `trae-global` | Trae（国际版） | 浏览器授权回调 | 新加坡部署，与国内版互不通用 |
 | `qoder-cn` | Qoder（国内版） | 设备码（PKCE） | COSY 签名对话，须在浏览器批准 |
 | `qoder-global` | Qoder（国际版） | 设备码（PKCE） | 与国内版互不通用 |
+| `opencode` | OpenCode Zen（opencode.ai） | API Key | 粘贴密钥，或自动导入本机 OpenCode CLI 的密钥；建议配置代理 |
 
 ---
 

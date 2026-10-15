@@ -51,6 +51,8 @@ const (
 	KindTrae = "trae"
 	// KindQoder 是 Qoder（国内/国际双版）。
 	KindQoder = "qoder"
+	// KindOpenCode 是 OpenCode Zen（opencode.ai），API Key 制。
+	KindOpenCode = "opencode"
 )
 
 // Edition 区分同一服务商的国内/国际版。
@@ -88,7 +90,7 @@ type Profile struct {
 //
 // 国际版上游从国内直连通常不可达或极慢；国内版无需代理。
 func (p Profile) ProxyRecommended() bool {
-	if p.Edition == EditionGlobal {
+	if p.Edition == EditionGlobal || p.Kind == KindOpenCode {
 		return true
 	}
 	return strings.Contains(p.BaseURL, "workbuddy.ai")
@@ -219,6 +221,23 @@ func QoderGlobalPreset() Profile {
 	}
 }
 
+// OpenCodePreset 返回 opencode（OpenCode Zen，opencode.ai）预设。
+//
+// UserAgent 保存的是裸 "opencode"：这是设置里的身份，原样落到其它上游
+// （GLM 等按精确匹配识别 opencode 客户端的场景不受影响）；连线 OpenCode
+// 时由 upstream/opencode 改写成官方客户端的 opencode/1.18.31。
+func OpenCodePreset() Profile {
+	return Profile{
+		ID:        "opencode",
+		Name:      "OpenCode",
+		Enabled:   false,
+		Kind:      KindOpenCode,
+		BaseURL:   "https://opencode.ai/zen/v1",
+		Origin:    "https://opencode.ai",
+		UserAgent: "opencode",
+	}
+}
+
 // Default 返回内置默认配置。
 func Default() *Config {
 	return &Config{
@@ -234,6 +253,7 @@ func Default() *Config {
 			TraeGlobalPreset(),
 			QoderCNPreset(),
 			QoderGlobalPreset(),
+			OpenCodePreset(),
 		},
 	}
 }
@@ -332,6 +352,7 @@ func (c *Config) normalize() {
 		c.Profiles = []Profile{
 			WorkBuddyPreset(), CodeBuddyPreset(), LobsterAIPreset(),
 			TraeCNPreset(), TraeGlobalPreset(), QoderCNPreset(), QoderGlobalPreset(),
+			OpenCodePreset(),
 		}
 	} else {
 		// 版本升级带来的新预设要补齐：旧配置文件里只有当时的上游清单，
@@ -340,6 +361,7 @@ func (c *Config) normalize() {
 		missing := []Profile{
 			WorkBuddyPreset(), CodeBuddyPreset(), LobsterAIPreset(),
 			TraeCNPreset(), TraeGlobalPreset(), QoderCNPreset(), QoderGlobalPreset(),
+			OpenCodePreset(),
 		}
 		for _, preset := range missing {
 			found := false
@@ -448,6 +470,24 @@ func (c *Config) normalize() {
 			}
 			if p.Name == "" {
 				p.Name = preset.Name
+			}
+		case "opencode":
+			preset := OpenCodePreset()
+			p.Kind = KindOpenCode
+			p.Edition = ""
+			if p.BaseURL == "" {
+				p.BaseURL = preset.BaseURL
+			}
+			if p.Origin == "" {
+				p.Origin = preset.Origin
+			}
+			if p.Name == "" {
+				p.Name = preset.Name
+			}
+			// 设置里保存的身份恒为裸 "opencode"：连线时的改写只发生在
+			// 上游侧（见 upstream/opencode），不落进配置文件。
+			if p.UserAgent == "" {
+				p.UserAgent = preset.UserAgent
 			}
 		}
 		if p.UserAgent == "" && (p.Kind == "" || p.Kind == KindWorkBuddy) {

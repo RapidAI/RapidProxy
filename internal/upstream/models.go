@@ -104,6 +104,12 @@ var QoderCNSpecs = []ModelSpec{
 // QoderGlobalSpecs 与国内版共用同一套模型 key。
 var QoderGlobalSpecs = QoderCNSpecs
 
+// OpenCodeSpecs 是 OpenCode Zen 的内置兜底目录，只保留官方默认模型。
+// Zen 目录以远端 /models 为准，同步失败时也不至于列表为空。
+var OpenCodeSpecs = []ModelSpec{
+	{"big-pickle", "Big Pickle", 128000, 0},
+}
+
 // Allowlist 返回指定上游的内置白名单。
 func Allowlist(profileID string) []ModelSpec {
 	switch profileID {
@@ -121,6 +127,8 @@ func Allowlist(profileID string) []ModelSpec {
 		return QoderCNSpecs
 	case "qoder-global":
 		return QoderGlobalSpecs
+	case "opencode":
+		return OpenCodeSpecs
 	default:
 		return nil
 	}

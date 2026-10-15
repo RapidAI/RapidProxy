@@ -13,6 +13,8 @@
 //	lobsterai（internal/upstream/lobsterai）：浏览器回调登录 + OpenAI 形状对话。
 //	trae      （internal/upstream/trae）：浏览器授权回调 + SOLO 协议翻译。
 //	qoder     （internal/upstream/qoder）：PKCE 设备登录 + wasm COSY 签名对话。
+//	opencode  （internal/upstream/opencode）：API Key 登录 + OpenAI 形状对话，
+//	          连线时改写 User-Agent 与 x-opencode-session（官方网关校验）。
 //
 // Client 按 Profile.Kind 把六个协议动作（StartLogin/Poll/Refresh/
 // EnsureToken/FetchUpstreamModels/Chat）分发到对应实现；所有对话路径在
@@ -37,6 +39,7 @@ import (
 
 	"github.com/znsoftm/RapidProxy/internal/config"
 	"github.com/znsoftm/RapidProxy/internal/upstream/lobsterai"
+	"github.com/znsoftm/RapidProxy/internal/upstream/opencode"
 	"github.com/znsoftm/RapidProxy/internal/upstream/qoder"
 	"github.com/znsoftm/RapidProxy/internal/upstream/trae"
 )
@@ -197,6 +200,8 @@ func ProfileKind(p config.Profile) string {
 		return KindTrae
 	case "qoder-cn", "qoder-global":
 		return KindQoder
+	case "opencode":
+		return KindOpenCode
 	default:
 		return KindWorkBuddy
 	}
@@ -209,6 +214,7 @@ const (
 	KindLobsterAI = "lobsterai"
 	KindTrae      = "trae"
 	KindQoder     = "qoder"
+	KindOpenCode  = "opencode"
 )
 
 // NewClient 按上游配置创建客户端。proxy 为空时跟随系统环境变量。
@@ -407,6 +413,13 @@ type LoginSession struct {
 	pollFn   func(ctx context.Context) (*Credential, error)
 	cancelFn func()
 	embedFn  func(parentOrigin string) string
+
+	// NeedKey 表示这次登录等待用户在界面上粘贴密钥（OpenCode 的 API Key
+	// 制登录），而非浏览器授权回调。
+	NeedKey bool
+	// SkipBrowser 表示不必在系统浏览器打开 AuthURL——本机已能找到凭据
+	// （如导入 OpenCode CLI 保存的密钥），打开网页只会让人困惑。
+	SkipBrowser bool
 }
 
 // StartLogin 发起登录，返回需要用户在浏览器打开的授权链接。
@@ -418,6 +431,8 @@ func (c *Client) StartLogin(ctx context.Context) (*LoginSession, error) {
 		return c.startTraeLogin(ctx)
 	case KindQoder:
 		return c.startQoderLogin(ctx)
+	case KindOpenCode:
+		return c.startOpenCodeLogin(ctx)
 	default:
 		return c.startWorkBuddyLogin(ctx)
 	}
@@ -593,6 +608,126 @@ func (c *Client) startQoderLogin(ctx context.Context) (*LoginSession, error) {
 	}, nil
 }
 
+// startOpenCodeLogin 发起 OpenCode 登录。Zen 是 API Key 制，没有浏览器授权
+// 回调：优先导入本机 OpenCode CLI 已保存的密钥（auth.json / OPENCODE_API_KEY）；
+// 找不到、或本机密钥形态不对，就打开官方密钥页，等用户在界面上粘贴（由
+// App.SubmitLoginKey 收口，这里只占位等待，超时由 ExpiresAt 收口）。
+func (c *Client) startOpenCodeLogin(ctx context.Context) (*LoginSession, error) {
+	if raw := opencode.LocalKey(); raw != "" {
+		// 本机密钥同样要过清洗：环境变量或 auth.json 里存的可能是带 Bearer
+		// 前缀、引号甚至整段 JSON 的值，原样存进去就是一个坏账号。
+		if key, err := opencode.NormalizeKey(raw); err == nil {
+			return c.openCodeLocalSession(key), nil
+		}
+		// 形态不对（粘贴噪声、无法识别的格式）：按粘贴流程走，让用户手动换一把。
+	}
+	return &LoginSession{
+		State:     "paste",
+		AuthURL:   opencode.AuthURL,
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+		NeedKey:   true,
+		pollFn: func(pollCtx context.Context) (*Credential, error) {
+			return nil, nil
+		},
+	}, nil
+}
+
+// openCodeLocalSession 用本机导入的密钥构造「直接确认」的登录会话。
+//
+// 密钥在第一次轮询时过一次上游校验（跑在轮询 goroutine 上，不阻塞发起登录
+// 的调用方）：被 401/403 明确拒绝时 Poll 返回 ErrKeyRejected，由
+// App.pollLogin 把流程转成粘贴模式——否则一把坏密钥会静默落库，而用户不删掉
+// 本机 auth.json 就连粘贴框都等不到（本地导入永远优先）。联机类错误
+// （超时、DNS、5xx）放行保存，让运行时暴露真实问题。
+//
+// NeedKey 同时置位：导入本机密钥不等于用户就想用它，粘贴框常驻可供覆盖
+// （SkipBrowser 仍然为真——不替用户打开浏览器）。pollFn 的占位守卫认的是
+// State=="paste"（被拒后由 App 翻转），本地导入本身不受 NeedKey 影响。
+func (c *Client) openCodeLocalSession(key string) *LoginSession {
+	cred := c.openCodeCredential(key)
+	session := &LoginSession{
+		State:       "local",
+		AuthURL:     opencode.AuthURL,
+		ExpiresAt:   time.Now().Add(10 * time.Minute),
+		NeedKey:     true,
+		SkipBrowser: true,
+	}
+	session.pollFn = func(pollCtx context.Context) (*Credential, error) {
+		if session.NeedKey && session.State == "paste" {
+			// 已因密钥被拒转成粘贴模式：占位等 SubmitLoginKey，不再重复校验。
+			return nil, nil
+		}
+		if err := c.VerifyOpenCodeKey(pollCtx, key); err != nil {
+			if errors.Is(err, opencode.ErrKeyRejected) {
+				return nil, err
+			}
+			// 联机类错误不判定密钥无效。
+		}
+		return cred, nil
+	}
+	return session
+}
+
+// openCodeCredential 用 Zen API Key 构造凭据。密钥制、不过期（ExpiresAt 为
+// 零值，NeedsRefresh 不会触发刷新）；ID 取密钥短哈希，同一密钥重复导入会
+// 更新同一份凭据文件，而不是堆积多份。
+func (c *Client) openCodeCredential(key string) *Credential {
+	key = strings.TrimSpace(key)
+	cred := &Credential{
+		Provider: c.profile.ID,
+		Auth:     Tokens{AccessToken: key},
+		Account:  Account{UID: shortHash(key), Nickname: opencode.KeyLabel(key)},
+	}
+	c.Finalize(cred)
+	return cred
+}
+
+// OpenCodeCredential 用 Zen API Key 构造一份可保存的 OpenCode 凭据
+// （供界面粘贴密钥时使用）。
+func (c *Client) OpenCodeCredential(key string) *Credential {
+	return c.openCodeCredential(key)
+}
+
+// ErrOpenCodeKeyInvalid 是 OpenCode 密钥格式错误的应用层哨兵：由
+// opencode.ErrKeyInvalid 透传，供界面映射成本地化文案。
+var ErrOpenCodeKeyInvalid = opencode.ErrKeyInvalid
+
+// ErrOpenCodeKeyRejected 是 OpenCode 密钥被上游拒绝（401/403）的应用层
+// 哨兵：格式没问题但网关不认，供界面给出针对性提示。
+var ErrOpenCodeKeyRejected = opencode.ErrKeyRejected
+
+// NormalizeOpenCodeKey 清洗用户粘贴的 OpenCode 密钥：去掉引号、JSON 包装和
+// Bearer 前缀，并做最基本的合法性校验。非 OpenCode 上游调用会返回错误，
+// 避免把别家的密钥格式套到这里。
+func (c *Client) NormalizeOpenCodeKey(key string) (string, error) {
+	if ProfileKind(c.profile) != KindOpenCode {
+		return "", fmt.Errorf("上游 %s 不使用 API Key 登录", c.profile.Name)
+	}
+	return opencode.NormalizeKey(key)
+}
+
+// VerifyOpenCodeKey 用一次模型目录请求校验密钥是否被上游接受。
+//
+// 只在登录粘贴时调用：错键立刻报错，好过存进凭据库、等到首次对话才以
+// 「认证失败」的形式暴露。联机类错误（超时、DNS、5xx）原样返回但不视为
+// 密钥无效——调用方应放行保存，让运行时再暴露真实问题。
+func (c *Client) VerifyOpenCodeKey(ctx context.Context, key string) error {
+	if ProfileKind(c.profile) != KindOpenCode {
+		return fmt.Errorf("上游 %s 不使用 API Key 登录", c.profile.Name)
+	}
+	normalized, err := opencode.NormalizeKey(key)
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	_, err = opencode.ListModels(ctx, c.http, c.profile.BaseURL, normalized, c.profile.UserAgent)
+	return err
+}
+
 // EmbeddedAuthURL 返回可嵌入应用内 iframe 的授权链接。
 //
 // 官方登录页原生支持 embed=iframe 模式：登录完成后会向 parent_origin
@@ -707,6 +842,10 @@ func (c *Client) Refresh(ctx context.Context, cred *Credential) error {
 		return c.refreshTrae(ctx, cred)
 	case KindQoder:
 		return c.refreshQoder(ctx, cred)
+	case KindOpenCode:
+		// Zen 是 API Key 制、不过期：没有刷新端点。EnsureToken 也因
+		// ExpiresAt 为零值而不会走到这里，保留分支只为语义完整。
+		return nil
 	default:
 		return c.refreshWorkBuddy(ctx, cred)
 	}
@@ -849,6 +988,8 @@ func (c *Client) FetchUpstreamModels(ctx context.Context, cred *Credential) ([]U
 		return c.fetchTraeModels(ctx, cred)
 	case KindQoder:
 		return c.fetchQoderModels(ctx, cred)
+	case KindOpenCode:
+		return c.fetchOpenCodeModels(ctx, cred)
 	default:
 		return c.fetchWorkBuddyModels(ctx, cred)
 	}
@@ -925,6 +1066,19 @@ func (c *Client) fetchQoderModels(ctx context.Context, cred *Credential) ([]Upst
 			MaxOutputTok:   int64(e.MaxOutput),
 			SupportsImages: e.Vision,
 		})
+	}
+	return models, nil
+}
+
+// fetchOpenCodeModels 读取 OpenCode Zen 目录（OpenAI 兼容形状）。
+func (c *Client) fetchOpenCodeModels(ctx context.Context, cred *Credential) ([]UpstreamModel, error) {
+	entries, err := opencode.ListModels(ctx, c.http, c.profile.BaseURL, cred.Auth.AccessToken, c.profile.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	models := make([]UpstreamModel, 0, len(entries))
+	for _, e := range entries {
+		models = append(models, UpstreamModel{ID: e.ID, Name: e.Name})
 	}
 	return models, nil
 }
@@ -1025,6 +1179,10 @@ func (c *Client) Chat(ctx context.Context, cred *Credential, body []byte) (*http
 			cred.Auth.MachineID, cred.Auth.DeviceID, cred.Account.UID, body)
 	case KindQoder:
 		return qoder.Chat(ctx, c.http, c.qoderp, cred.Account.UID, cred.Auth.AccessToken, body)
+	case KindOpenCode:
+		// 设置里保存的 User-Agent 是裸 "opencode"；适配层只在连往
+		// OpenCode 主机时改写成 opencode/1.18.31 并带上 x-opencode-session。
+		return opencode.Chat(ctx, c.http, c.profile.BaseURL, cred.Auth.AccessToken, c.profile.UserAgent, body)
 	default:
 		return c.chatWorkBuddy(ctx, cred, body)
 	}

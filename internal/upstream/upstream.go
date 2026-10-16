@@ -1200,19 +1200,22 @@ func (c *Client) chatWorkBuddy(ctx context.Context, cred *Credential, body []byt
 		return nil, err
 	}
 	c.backendHeaders(req, cred)
-	if isWorkBuddyGlobalProfile(c.profile) {
+	if workbuddyWantsConversationHeaders(c.profile) {
 		applyConversationHeaders(req.Header)
 	}
 	return c.http.Do(req)
 }
 
-// isWorkBuddyGlobalProfile 报告该上游是否面向 WorkBuddy 国际版网关。
-// 会话头是国际版网关的专属要求，同协议族的国内部署
-// （copilot.tencent.com，Edition=cn）不发。判定与 config.ProxyRecommended
-// 同款：Edition 显式为 global，或（兼容未填 Edition 的旧配置）BaseURL
-// 指向 workbuddy.ai。
-func isWorkBuddyGlobalProfile(p config.Profile) bool {
-	return p.Edition == config.EditionGlobal || strings.Contains(strings.ToLower(p.BaseURL), "workbuddy.ai")
+// workbuddyWantsConversationHeaders 报告该上游的对话是否应补会话标识头。
+// 会话头是 workbuddy.ai 网关的要求，同协议族的国内部署
+// （copilot.tencent.com，Edition=cn）不发。判定按「非国内版」：
+// kind=workbuddy 的 Edition 只可能是 ""（workbuddy，国际版——规范化时强制
+// 清空，ID 即版本身份）或 "cn"（codebuddy），因此除 cn 外一律补。这样即使用
+// 户给国际版上游换自定义反代域名（BaseURL 不含 workbuddy.ai）也能正确补头；
+// 请求若自带完整标识仍会原样保留，多余的标识头对网关无害（官方客户端对全部
+// 对话都带）。
+func workbuddyWantsConversationHeaders(p config.Profile) bool {
+	return p.Edition != config.EditionCN
 }
 
 // -----------------------------------------------------------------------------

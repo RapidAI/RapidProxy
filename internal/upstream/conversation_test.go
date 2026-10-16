@@ -116,6 +116,29 @@ func TestChatCodeBuddyHostSkipsConversationHeaders(t *testing.T) {
 	}
 }
 
+// 国际版上游被用户换成自定义反代域名（BaseURL 不含 workbuddy.ai）时也必须
+// 补会话头：config 规范化会把 workbuddy 配置的 Edition 强制清空，门禁不能
+// 押在域名上。国内版（Edition=cn）不受影响。
+func TestChatWorkBuddyCustomDomainAddsConversationHeaders(t *testing.T) {
+	headers, srv := chatStub(t)
+	profile := config.WorkBuddyPreset()
+	profile.BaseURL = srv.URL // 不含 workbuddy.ai，Edition 保持空
+	c, err := NewClient(profile, config.DefaultPlatform, config.DefaultProduct)
+	if err != nil {
+		t.Fatalf("NewClient: %v", err)
+	}
+	resp, err := c.Chat(context.Background(), &Credential{}, chatBody("deepseek-v4.1-flash"))
+	if err != nil {
+		t.Fatalf("Chat: %v", err)
+	}
+	resp.Body.Close()
+	for _, name := range conversationHeaderNames {
+		if strings.TrimSpace(headers().Get(name)) == "" {
+			t.Errorf("自定义域名的国际版请求缺少 %s", name)
+		}
+	}
+}
+
 func TestApplyConversationHeadersKeepsCallerValues(t *testing.T) {
 	h := http.Header{}
 	h.Set("X-Conversation-ID", "caller-conv")

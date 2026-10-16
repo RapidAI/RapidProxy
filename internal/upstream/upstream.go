@@ -1190,16 +1190,17 @@ func (c *Client) Chat(ctx context.Context, cred *Credential, body []byte) (*http
 
 // chatWorkBuddy 把请求转发到上游 /v2/chat/completions。
 //
-// 国际版（www.workbuddy.ai）对 hy3 与 deepseek 系模型强制要求会话标识头，
-// 缺失时上游以 code=11128 "conversation id missing" 拒绝；国内部署
-// （copilot.tencent.com）没有该要求，不补。请求体里的模型名决定是否触发。
+// 国际版（www.workbuddy.ai）网关要求对话携带会话标识头（hy3/deepseek 缺失时
+// 以 code=11128 "conversation id missing" 拒绝；官方客户端对全部模型的每次
+// 调用都带，因此对所有模型补头都是安全的）。国内部署（copilot.tencent.com）
+// 没有该要求，不补。
 func (c *Client) chatWorkBuddy(ctx context.Context, cred *Credential, body []byte) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint("/v2/chat/completions"), bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	c.backendHeaders(req, cred)
-	if isWorkBuddyGlobalProfile(c.profile) && modelNeedsConversationID(bodyModel(body)) {
+	if isWorkBuddyGlobalProfile(c.profile) {
 		applyConversationHeaders(req.Header)
 	}
 	return c.http.Do(req)
@@ -1212,18 +1213,6 @@ func (c *Client) chatWorkBuddy(ctx context.Context, cred *Credential, body []byt
 // 指向 workbuddy.ai。
 func isWorkBuddyGlobalProfile(p config.Profile) bool {
 	return p.Edition == config.EditionGlobal || strings.Contains(strings.ToLower(p.BaseURL), "workbuddy.ai")
-}
-
-// bodyModel 从对话请求体里取 model 字段；解析失败返回空（此时按不需要
-// 会话头处理，保持与旧行为一致）。
-func bodyModel(body []byte) string {
-	var obj struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &obj); err != nil {
-		return ""
-	}
-	return obj.Model
 }
 
 // -----------------------------------------------------------------------------

@@ -1,8 +1,9 @@
 package upstream
 
-// 会话头补全的回归测试：国际版 workbuddy.ai 上 hy3/deepseek 对话必须携带
-// 四个会话标识（缺 X-Conversation-ID 时上游以 code=11128 拒绝），其它模型
-// 与国内部署不受影响，调用方自带的标识原样保留。
+// 会话头补全的回归测试：国际版 workbuddy.ai 的对话必须携带四个会话标识
+//（缺 X-Conversation-ID 时上游以 code=11128 拒绝；官方客户端对全部模型
+// 都发，因此对所有模型补头都安全），国内部署不受影响，调用方自带的
+// 标识原样保留。
 
 import (
 	"context"
@@ -72,23 +73,10 @@ func TestChatWorkBuddyAddsConversationHeadersForDeepSeek(t *testing.T) {
 	}
 }
 
-func TestChatWorkBuddyAddsConversationHeadersForHy3(t *testing.T) {
-	headers, srv := chatStub(t)
-	c := globalClient(t, srv.URL)
-	resp, err := c.Chat(context.Background(), &Credential{}, chatBody("hy3"))
-	if err != nil {
-		t.Fatalf("Chat: %v", err)
-	}
-	resp.Body.Close()
-	for _, name := range conversationHeaderNames {
-		if strings.TrimSpace(headers().Get(name)) == "" {
-			t.Errorf("hy3 请求缺少 %s", name)
-		}
-	}
-}
-
-func TestChatWorkBuddySkipsConversationHeadersForOtherModels(t *testing.T) {
-	for _, model := range []string{"gpt-5.4", "kimi-k3", "glm-5.3", "hy4-preview"} {
+func TestChatWorkBuddyAddsConversationHeadersForAllModels(t *testing.T) {
+	// 官方客户端对全部模型的每次调用都带会话头（含 hy4 系），因此
+	// 国际版上不做模型区分。
+	for _, model := range []string{"deepseek-v4.1-flash", "hy3", "hy4-preview", "gpt-5.4", "kimi-k3", "glm-5.3"} {
 		headers, srv := chatStub(t)
 		c := globalClient(t, srv.URL)
 		resp, err := c.Chat(context.Background(), &Credential{}, chatBody(model))
@@ -96,10 +84,14 @@ func TestChatWorkBuddySkipsConversationHeadersForOtherModels(t *testing.T) {
 			t.Fatalf("Chat(%s): %v", model, err)
 		}
 		resp.Body.Close()
+		got := headers()
 		for _, name := range conversationHeaderNames {
-			if headers().Get(name) != "" {
-				t.Errorf("模型 %s 不应携带 %s", model, name)
+			if strings.TrimSpace(got.Get(name)) == "" {
+				t.Errorf("模型 %s 请求缺少 %s", model, name)
 			}
+		}
+		if id := got.Get("X-Conversation-ID"); len(strings.Split(id, "-")) != 5 {
+			t.Errorf("模型 %s 的 X-Conversation-ID 不是 UUID 形态: %q", model, id)
 		}
 	}
 }
@@ -140,22 +132,6 @@ func TestApplyConversationHeadersKeepsCallerValues(t *testing.T) {
 	for name, value := range want {
 		if h.Get(name) != value {
 			t.Errorf("%s = %q, want %q（调用方自带值必须保留）", name, h.Get(name), value)
-		}
-	}
-}
-
-func TestModelNeedsConversationID(t *testing.T) {
-	yes := []string{"deepseek-v4.1-flash", "DeepSeek-V4.1-Flash", "hy3"}
-	// hy4 系不在已验证的门禁内（aicoder 实证范围是 hy3* 与 deepseek*）。
-	no := []string{"gpt-5.4", "kimi-k3", "glm-5.3", "gemini-3.1-pro", "hy4-preview", ""}
-	for _, m := range yes {
-		if !modelNeedsConversationID(m) {
-			t.Errorf("%q 应触发会话头", m)
-		}
-	}
-	for _, m := range no {
-		if modelNeedsConversationID(m) {
-			t.Errorf("%q 不应触发会话头", m)
 		}
 	}
 }

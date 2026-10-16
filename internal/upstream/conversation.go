@@ -1,9 +1,10 @@
 package upstream
 
-// 会话头补全：www.workbuddy.ai 对 hy3 与 deepseek 系模型要求每次对话携带
-// 会话标识（缺 X-Conversation-ID 时上游以 code=11128 "conversation id
-// missing" 拒绝）。官方客户端每次调用都带，这里按同样形态补齐。
-// 逻辑与 MaClaw（CodeClaw）仓库 corelib/workbuddy 中已验证的实现保持一致。
+// 会话头补全：www.workbuddy.ai 的对话网关要求每次对话携带会话标识
+//（hy3/deepseek 缺失时上游以 code=11128 "conversation id missing" 拒绝，
+// 官方客户端对全部模型的每次调用都带）。这里按官方客户端形态对国际版
+// 全部对话补齐。逻辑与 MaClaw（CodeClaw）仓库 corelib/workbuddy 中
+// 已验证的实现保持一致。
 
 import (
 	"crypto/rand"
@@ -45,13 +46,6 @@ func conversationHeadersComplete(h http.Header) bool {
 		}
 	}
 	return true
-}
-
-// modelNeedsConversationID 报告国际版上哪些模型强制要求会话头。同主机其它
-// 模型沿用既有请求形态即可，不必多发。
-func modelNeedsConversationID(model string) bool {
-	model = strings.ToLower(strings.TrimSpace(model))
-	return strings.HasPrefix(model, "hy3") || strings.HasPrefix(model, "deepseek")
 }
 
 func setHeaderIfEmpty(h http.Header, name, value string) {

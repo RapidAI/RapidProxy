@@ -116,61 +116,10 @@ func TestFinishLoginLockedKeepsFirstTerminalState(t *testing.T) {
 	}
 }
 
-// 本机导入的密钥被上游拒绝时，同一个 pending 流程应翻转成粘贴模式：
-// 界面出现密钥输入框、说明换成密钥被拒，用户就地换一把，而不是流程结束、
-// 用户不删 auth.json 就出不来。
-func TestFallbackLoginToKeyPaste(t *testing.T) {
-	a := &App{log: applog.New("", 50)}
-	a.loginMu.Lock()
-	a.login = &loginRun{
-		provider: "opencode",
-		session: &upstream.LoginSession{
-			State:       "local",
-			AuthURL:     "https://opencode.ai/auth",
-			SkipBrowser: true,
-			ExpiresAt:   time.Now().Add(10 * time.Minute),
-		},
-		cancel:  func() {},
-		status:  "pending",
-		message: "正在导入本机密钥",
-	}
-	a.loginMu.Unlock()
-
-	if !a.fallbackLoginToKeyPaste(a.login) {
-		t.Fatal("pending 的本地导入流程应能转为粘贴模式")
-	}
-	view := a.loginState()
-	if !view.NeedKey {
-		t.Error("翻转后应等待粘贴密钥")
-	}
-	if view.State != "paste" {
-		t.Errorf("State = %q, want paste", view.State)
-	}
-	if view.Message == "" {
-		t.Error("应给出密钥被拒的说明")
-	}
-
-	// 已结束的流程不再翻转：返回 false，状态原样。
-	done := &loginRun{
-		provider: "opencode",
-		session:  &upstream.LoginSession{State: "local"},
-		cancel:   func() {},
-		status:   "success",
-	}
-	a.loginMu.Lock()
-	a.login = done
-	a.loginMu.Unlock()
-	if a.fallbackLoginToKeyPaste(done) {
-		t.Error("非 pending 流程不应被翻转")
-	}
-	if done.session.NeedKey {
-		t.Error("非 pending 流程不应被改成等待粘贴")
-	}
-}
-
-// 用户在本机导入进行中粘贴了另一把密钥：SubmitLoginKey 已置终态，轮询
-// goroutine 随后才拿到本机密钥——这时不能再落库，否则一次登录存出两个
-// 账号（本机密钥 + 粘贴密钥），流量被悄悄分走。
+// 等待确认期间轮询 goroutine 只占位：不落库、不碰终态。用户在此期间
+// 粘贴新密钥并提交后流程已终态，迟到的轮询唤醒也不会把它改回失败
+// （终态粘滞）——本机导入的密钥改由 SubmitLoginKey 的空提交收口，
+// 见 TestSubmitLoginKeyEmptyConfirmsImportedKey。
 func TestPollLoginSkipsCredentialAfterTakeover(t *testing.T) {
 	dir := t.TempDir()
 	logger := applog.New(filepath.Join(dir, "logs"), 3)
@@ -209,36 +158,96 @@ func TestPollLoginSkipsCredentialAfterTakeover(t *testing.T) {
 		t.Fatal("粘贴接管应生效")
 	}
 
-	// 轮询 goroutine 这时才校验完本机密钥：不能落库。
-	a.pollLogin(context.Background(), run)
+	// 轮询 goroutine 随后醒来（上下文已取消）：不落库、不覆盖终态。
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	a.pollLogin(ctx, run)
 	creds, err := credStore.List("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(creds) != 0 {
-		t.Errorf("被接管后迟到的本机密钥不应落库，实际 %d 个: %+v", len(creds), creds)
+		t.Errorf("等待确认期间不应有凭据落库，实际 %d 个: %+v", len(creds), creds)
 	}
+	if view := a.loginState(); view.Status != "success" {
+		t.Errorf("迟到的轮询不应覆盖终态，实际 status=%q", view.Status)
+	}
+}
 
-	// 对照组：流程仍是 pending 时，本机密钥正常落库。
-	session2, err := client.StartLogin(context.Background())
+// 空提交 = 确认使用本机导入的密钥：凭据落库、上游自动启用、流程收口。
+// 没有等待中的本地导入会话时，空提交按空密钥报错（防误触）。
+func TestSubmitLoginKeyEmptyConfirmsImportedKey(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	run2 := &loginRun{provider: "opencode", session: session2, cancel: func() {}, status: "pending"}
-	a.loginMu.Lock()
-	a.login = run2
-	a.loginMu.Unlock()
-	a.pollLogin(context.Background(), run2)
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/models" {
+			t.Errorf("确认前应联机校验 /models，实际 %q", r.URL.Path)
+		}
+		io.WriteString(w, `{"data":[{"id":"big-pickle","name":"Big Pickle"}]}`)
+	}))
+	defer stub.Close()
 
-	creds, err = credStore.List("opencode")
+	// 配置里的 opencode 指向桩服务器：确认时的联机校验不能打真实上游。
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	profile, _ := cfg.ProfileByID("opencode")
+	profile.BaseURL = stub.URL
+	cfg.SetProfile(profile)
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, nil, logger), store: credStore}
+
+	client, err := a.srv.ClientFor("opencode")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 环境变量优先于 auth.json：本机导入路径稳定拿到这把钥匙。
+	t.Setenv("OPENCODE_API_KEY", "sk-local-0123456789")
+
+	session, err := client.StartLogin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	run := &loginRun{provider: "opencode", session: session, cancel: func() {}, status: "pending"}
+	a.loginMu.Lock()
+	a.login = run
+	a.loginMu.Unlock()
+
+	// 空提交：确认使用本机导入的密钥。
+	if err := a.SubmitLoginKey("opencode", ""); err != nil {
+		t.Fatalf("空提交应确认本机密钥，实际 %v", err)
+	}
+	creds, err := credStore.List("opencode")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(creds) != 1 {
-		t.Fatalf("pending 流程的本机密钥应正常落库，实际 %d 个", len(creds))
+		t.Fatalf("应落库一份凭据，实际 %d 个", len(creds))
 	}
 	if creds[0].Auth.AccessToken != "sk-local-0123456789" {
 		t.Errorf("落库的密钥不对: %q", creds[0].Auth.AccessToken)
+	}
+	// 流程收口为成功。
+	if view := a.loginState(); view.Status != "success" {
+		t.Errorf("确认后流程应为 success，实际 %q", view.Status)
+	}
+	// 登录即表达使用意图：预设默认关闭的上游被自动启用并落盘。
+	if p, _ := a.settings().ProfileByID("opencode"); !p.Enabled {
+		t.Error("opencode 应随登录自动启用")
+	}
+	persisted, err := config.Load(a.cfg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := persisted.ProfileByID("opencode"); !p.Enabled {
+		t.Error("自动启用应落盘，重启后仍生效")
+	}
+
+	// 没有等待中的本地导入会话时，空提交按空密钥报错。
+	if err := a.SubmitLoginKey("opencode", ""); err == nil {
+		t.Error("无待确认导入密钥时，空提交应报错")
 	}
 }
 

@@ -42,7 +42,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.4.1"
+const Version = "1.5.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -981,10 +981,10 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 	}
 	switch {
 	case session.SkipBrowser:
-		// 本机已找到凭据（如 OpenCode CLI 的 auth.json），直接确认导入，
-		// 不必打开浏览器；粘贴框仍可见（NeedKey 亦为真），想换一把钥匙
-		// 的用户可以直接粘贴覆盖，不必先去删本机文件。
-		run.message = locale.T("login.importing")
+		// 本机已找到凭据（如 OpenCode CLI 的 auth.json）：不打开浏览器，
+		// 流程停在等待确认的状态——用户提交空密钥即用它登录，或直接在
+		// 下方粘贴新密钥覆盖（NeedKey 亦为真），想换钥匙不必先删本机文件。
+		run.message = locale.T("login.importing", session.LocalKeyLabel)
 	case session.NeedKey:
 		// OpenCode 是 API Key 制登录：本机没有现成密钥时，打开官方密钥页，
 		// 等用户在界面上粘贴（SubmitLoginKey 收口）。
@@ -1024,21 +1024,11 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 		case <-ticker.C:
 			cred, err := run.session.Poll(ctx)
 			if err != nil {
-				// 本机导入的 OpenCode 密钥被网关明确拒绝：不结束流程，转成
-				// 粘贴模式让用户就地换一把。否则坏密钥静默落库，而本机
-				// auth.json 不删掉的话，用户连粘贴框都等不到。
-				if errors.Is(err, upstream.ErrOpenCodeKeyRejected) && run.session.State == "local" && a.fallbackLoginToKeyPaste(run) {
-					continue
-				}
 				if errors.Is(err, upstream.ErrLoginTimeout) {
 					a.finishLogin(run, "failed", locale.T("login.expired"), "")
 					return
 				}
-				message := err.Error()
-				if errors.Is(err, upstream.ErrOpenCodeKeyRejected) {
-					message = locale.T("login.keyRejected")
-				}
-				a.finishLogin(run, "failed", message, "")
+				a.finishLogin(run, "failed", err.Error(), "")
 				return
 			}
 			if cred == nil {
@@ -1143,35 +1133,29 @@ func (a *App) finishLoginLocked(run *loginRun, status, message, accountID string
 	return true
 }
 
-// fallbackLoginToKeyPaste 把「本机导入的密钥被上游拒绝」的登录流程转成粘贴
-// 模式：沿用同一个 pending 流程，界面上出现密钥输入框，同时打开官方密钥页
-// 让用户去领一把新钥匙。返回 false 表示流程已不在 pending（被取消或已结束），
-// 调用方应按普通错误收尾。
+// pendingImportedKey 返回当前等待确认的本地导入密钥（没有则返回空串）。
 //
-// 轮询 goroutine 随后会在 session.NeedKey 上看到 true，pollFn 转为占位等待
-// （见 upstream.openCodeLocalSession），不会重复校验同一把坏密钥。
-func (a *App) fallbackLoginToKeyPaste(run *loginRun) bool {
+// 只有「同一上游、仍在 pending、且带着待确认导入密钥」的会话才算数：
+// 用户可能在流程结束后才提交，那时没有可确认的本机密钥。
+func (a *App) pendingImportedKey(provider string) string {
 	a.loginMu.Lock()
-	if a.login != run || run.status != "pending" {
-		a.loginMu.Unlock()
-		return false
+	defer a.loginMu.Unlock()
+	run := a.login
+	if run == nil || run.provider != provider || run.status != "pending" || run.session == nil {
+		return ""
 	}
-	run.session.NeedKey = true
-	run.session.State = "paste"
-	run.message = locale.T("login.keyRejected")
-	a.loginMu.Unlock()
-	a.log.Warnf("本机导入的 %s 密钥被上游拒绝，转为手动粘贴", run.provider)
-	if ctx := a.context(); ctx != nil {
-		wailsrt.BrowserOpenURL(ctx, run.session.AuthURL)
-	}
-	a.pushLogin()
-	return true
+	return strings.TrimSpace(run.session.LocalKey)
 }
 
 // SubmitLoginKey 提交用户粘贴的上游密钥（目前用于 OpenCode：Zen 是 API Key
 // 制，没有浏览器授权回调）。provider 是上游 ID，key 是用户粘贴的原文，
 //
 //	tolerates 常见的粘贴噪声（引号、JSON、Bearer 前缀）。
+//
+// key 为空表示「确认使用本机导入的密钥」：本机导入不再自动落库，用户点
+// 登录后流程停在等待确认的状态，此时提交空密钥就是用本机钥匙完成登录
+// 的确认动作。只有当前确有等待中的本地导入会话时才合法——没有待确认的
+// 导入密钥时按空密钥报错，避免误触。
 func (a *App) SubmitLoginKey(provider, key string) error {
 	cfg := a.settings()
 	profile, ok := cfg.ProfileByID(provider)
@@ -1181,6 +1165,13 @@ func (a *App) SubmitLoginKey(provider, key string) error {
 	client, err := a.srv.ClientFor(provider)
 	if err != nil {
 		return err
+	}
+	if strings.TrimSpace(key) == "" {
+		imported := a.pendingImportedKey(provider)
+		if imported == "" {
+			return errors.New(locale.T("login.keyEmpty"))
+		}
+		key = imported
 	}
 	normalized, err := client.NormalizeOpenCodeKey(key)
 	if err != nil {

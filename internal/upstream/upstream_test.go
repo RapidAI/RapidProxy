@@ -262,12 +262,12 @@ func TestOpenCodeCredential(t *testing.T) {
 	}
 }
 
+// 本机导入不再自动落库：会话停在「等待确认」的状态。Poll 只占位——不
+// 返回凭据、也不打上游校验（校验改在用户确认时由 SubmitLoginKey 同步做），
+// 想换钥匙的用户有机会先粘贴新密钥，不必先去删本机的 auth.json。
 func TestStartOpenCodeLoginImportsLocalKey(t *testing.T) {
-	var sawPath, sawAuth string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		sawPath = r.URL.Path
-		sawAuth = r.Header.Get("Authorization")
-		io.WriteString(w, `{"data":[{"id":"big-pickle","name":"Big Pickle"}]}`)
+		t.Error("等待确认期间不应向上游发请求")
 	}))
 	defer srv.Close()
 
@@ -287,75 +287,18 @@ func TestStartOpenCodeLoginImportsLocalKey(t *testing.T) {
 	if session.State != "local" {
 		t.Errorf("State = %q, want local", session.State)
 	}
-	cred, err := session.Poll(context.Background())
-	if err != nil {
-		t.Fatal(err)
+	if session.LocalKey != "sk-local-0123456789" {
+		t.Errorf("LocalKey = %q，应带上待确认的导入密钥", session.LocalKey)
 	}
-	if cred == nil || cred.Auth.AccessToken != "sk-local-0123456789" {
-		t.Errorf("轮询应直接返回本地密钥凭据: %+v", cred)
+	if session.LocalKeyLabel != "OpenCode · 6789" {
+		t.Errorf("LocalKeyLabel = %q，应为脱敏展示名", session.LocalKeyLabel)
 	}
-	// 导入前过一次上游校验：钥匙确实是打给 /models 的。
-	if sawPath != "/models" {
-		t.Errorf("导入前应校验 /models，实际 %q", sawPath)
-	}
-	if sawAuth != "Bearer sk-local-0123456789" {
-		t.Errorf("Authorization = %q", sawAuth)
-	}
-}
-
-// 本机密钥被上游明确拒绝（401/403）：Poll 返回 ErrKeyRejected，由
-// App.pollLogin 转成粘贴模式；翻转后 Poll 只占位，不再重复校验。
-func TestStartOpenCodeLoginLocalKeyRejected(t *testing.T) {
-	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls++
-		w.WriteHeader(http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-
-	t.Setenv("OPENCODE_API_KEY", "sk-local-0123456789")
-	c := newOpenCodeClientAt(t, srv.URL)
-	session, err := c.StartLogin(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := session.Poll(context.Background()); !errors.Is(err, ErrOpenCodeKeyRejected) {
-		t.Fatalf("被拒密钥应返回 ErrOpenCodeKeyRejected，实际 %v", err)
-	}
-
-	// 流程已转成粘贴模式（App.fallbackLoginToKeyPaste 的写入：NeedKey 置真、
-	// State 改 paste）：占位等待。注意本地导入期间 NeedKey 本就为真，占位守卫
-	// 认的是 State=="paste"，不会把正常的本地导入也挡掉。
-	session.NeedKey = true
-	session.State = "paste"
-	cred, err := session.Poll(context.Background())
-	if err != nil || cred != nil {
-		t.Errorf("粘贴模式应占位等待，实际 cred=%+v err=%v", cred, err)
-	}
-	if calls != 1 {
-		t.Errorf("翻转后不应再打上游校验，实际调用 %d 次", calls)
-	}
-}
-
-// 联机类错误（这里用 500 代表）不判定密钥无效：照常放行导入。
-func TestStartOpenCodeLoginLocalKeyUnverifiable(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-
-	t.Setenv("OPENCODE_API_KEY", "sk-local-0123456789")
-	c := newOpenCodeClientAt(t, srv.URL)
-	session, err := c.StartLogin(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	cred, err := session.Poll(context.Background())
-	if err != nil {
-		t.Fatalf("联机类错误应放行导入，实际 %v", err)
-	}
-	if cred == nil || cred.Auth.AccessToken != "sk-local-0123456789" {
-		t.Errorf("应放行本机密钥: %+v", cred)
+	// 反复轮询都只占位：不自动落库，也不会每 2 秒打一次上游。
+	for i := 0; i < 3; i++ {
+		cred, err := session.Poll(context.Background())
+		if err != nil || cred != nil {
+			t.Fatalf("等待确认期间 Poll 应占位，实际 cred=%+v err=%v", cred, err)
+		}
 	}
 }
 

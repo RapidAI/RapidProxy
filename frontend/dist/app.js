@@ -196,16 +196,23 @@ function renderLogin() {
   spinner.className = 'spinner' + (login.status === 'success' ? ' done' : login.status === 'failed' ? ' fail' : '');
 
   // API Key 制登录（OpenCode）走「粘贴密钥」分支：显示输入行、隐藏浏览器提示。
+  // 本机导入（state === 'local'）是同一分支的变体：不自动登录，等用户确认
+  // （空提交 = 使用本机密钥）或粘贴新密钥覆盖。
   const needKey = !!login.needKey && login.status === 'pending';
+  const localImport = needKey && login.state === 'local';
   $('login-title').textContent =
     login.status === 'success' ? t('login.success') :
     login.status === 'failed' ? t('login.failed') :
+    localImport ? t('login.localTitle') :
     needKey ? t('login.pasteTitle') : t('login.pending');
   $('login-message').textContent = login.message || '';
   $('login-expires').textContent = login.status === 'pending' ? t('login.expiresFmt', { time: login.expiresAt }) : '';
   $('login-browser-tip').classList.toggle('hidden', needKey);
   $('login-key-tip').classList.toggle('hidden', !needKey);
+  $('login-key-tip-text').textContent = localImport ? t('login.localTip') : t('login.keyTip');
   $('login-key-row').classList.toggle('hidden', !needKey);
+  $('login-key').placeholder = localImport ? t('login.localPlaceholder') : t('login.keyPlaceholder');
+  $('btn-submit-key').textContent = localImport ? t('btn.confirmLogin') : t('btn.submitKey');
   // 提交过程中后端要联机校验密钥，轮询刷新不能把按钮又放开导致重复提交。
   $('btn-submit-key').disabled = !needKey || submittingKey;
   if (!needKey && !submittingKey) $('login-key').value = '';
@@ -1147,11 +1154,15 @@ function bindUI() {
   // OpenCode 密钥提交：Enter 与按钮等价。失败时保留输入框内容便于重试，
   // 刷新后仍处于 pending 会重新放开按钮。提交期间后端会联机校验密钥，
   // 用 submittingKey 挡住轮询刷新与重复点击。
+  //
+  // 本机导入会话（state === 'local'）允许空提交：空提交 = 确认使用本机
+  // 已保存的密钥——导入不再自动登录，用户有机会先粘贴新密钥。
   $('btn-submit-key').onclick = async () => {
     if (submittingKey) return;
-    const value = $('login-key').value.trim();
-    if (!value) return toast(t('toast.keyEmpty'));
     const provider = S.login.provider;
+    const localImport = S.login.state === 'local';
+    const value = $('login-key').value.trim();
+    if (!value && !localImport) return toast(t('toast.keyEmpty'));
     submittingKey = true;
     $('btn-submit-key').disabled = true;
     try {

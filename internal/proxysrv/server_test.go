@@ -1729,6 +1729,272 @@ func TestAggregateFailoverClosesReplacedResponseBody(t *testing.T) {
 	t.Errorf("换号后的响应体没有被关闭，上游仍有 %d 个连接停在 Active（未归还连接池）", n)
 }
 
+// 组内账号回「不可退避错误」（模型没在这个账号开通、参数不对等）时，
+// 不把错误透传给下游：跳过该账号换同组下一个，请求照旧成功。
+func TestUnclassifiedAccountErrorFallsOverToNextAccount(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/config" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			return
+		}
+		if strings.Contains(r.Header.Get("Authorization"), "token-a") {
+			// 账号 a 没开通这个模型：普通客户端错误，不含任何冷却关键词。
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = w.Write([]byte(`{"error":{"message":"该模型未在当前账号开通"}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"来自账号b\"},\"index\":0}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(up.Close)
+
+	srv, base := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	for _, uid := range []string{"a", "b"} {
+		cred := &upstream.Credential{
+			Provider: "workbuddy", ID: "workbuddy-" + uid,
+			Auth:    upstream.Tokens{AccessToken: "token-" + uid, ExpiresAt: time.Now().Add(time.Hour).Unix()},
+			Account: upstream.Account{UID: uid},
+		}
+		if err := srv.store.Save(cred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.InvalidateAccounts()
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	status, raw := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"x","messages":[{"role":"user","content":"hi"}]}`, nil)
+
+	if status != http.StatusOK {
+		t.Fatalf("组内还有可用账号时应换号成功，实际 %d，响应 %s", status, raw)
+	}
+	if !strings.Contains(string(raw), "来自账号b") {
+		t.Errorf("应返回健康账号的内容，实际 %s", raw)
+	}
+	// 客户端错误不是账号的错：不冷却，否则下一个请求还会白白跳过它。
+	if left := srv.cooldownLeft("workbuddy-a"); left != 0 {
+		t.Errorf("客户端错误不应冷却账号，实际剩余 %s", left)
+	}
+}
+
+// 整组账号都回客户端错误时，最后的错误按原状态码带回——状态码与文案对
+// 调用方排查最有意义，也不该被压成 502 让人以为是可重试的临时故障。
+func TestAllAccountsClientErrorSurfacesLastStatus(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/config" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"上下文超过上限"}}`))
+	}))
+	t.Cleanup(up.Close)
+
+	srv, base := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	for _, uid := range []string{"a", "b"} {
+		login(t, srv, "workbuddy", uid)
+	}
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	status, raw := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"x","messages":[{"role":"user","content":"hi"}]}`, nil)
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("客户端错误应按原状态码带回，实际 %d，响应 %s", status, raw)
+	}
+	if !strings.Contains(string(raw), "上下文超过上限") {
+		t.Errorf("响应应包含上游的错误文案，实际 %s", raw)
+	}
+}
+
+// 流式请求同样享受组内跳过：上游以 200 + SSE 在流的第一个事件就回报
+// 额度耗尽（状态码完全正常），在写给下游任何字节之前冷却该账号、换
+// 同组下一个账号——客户端全程无感，拿到的是健康账号的完整流。
+func TestStreamFirstEventErrorFallsOverToNextAccount(t *testing.T) {
+	var aCalls, bCalls int32
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/config" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if strings.Contains(r.Header.Get("Authorization"), "token-a") {
+			atomic.AddInt32(&aCalls, 1)
+			_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"额度已用尽\"}}\n\n"))
+			return
+		}
+		atomic.AddInt32(&bCalls, 1)
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"流式ok\"},\"index\":0}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(up.Close)
+
+	srv, base := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	for _, uid := range []string{"a", "b"} {
+		login(t, srv, "workbuddy", uid)
+	}
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	status, raw := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"x","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+
+	if status != http.StatusOK {
+		t.Fatalf("组内还有可用账号时应换号成功，实际 %d，响应 %s", status, raw)
+	}
+	if !strings.Contains(string(raw), "流式ok") {
+		t.Errorf("客户端应收到健康账号的流式内容，实际 %s", raw)
+	}
+	if !strings.Contains(string(raw), "[DONE]") {
+		t.Errorf("流应以 [DONE] 收尾，实际 %s", raw)
+	}
+	if strings.Contains(string(raw), "额度已用尽") {
+		t.Errorf("错误帧不应透传给客户端，实际 %s", raw)
+	}
+	if atomic.LoadInt32(&aCalls) == 0 || atomic.LoadInt32(&bCalls) == 0 {
+		t.Errorf("两个账号都应被实际用到（a=%d b=%d）", atomic.LoadInt32(&aCalls), atomic.LoadInt32(&bCalls))
+	}
+	// 流首报额度耗尽的账号要进冷却，否则下一个请求还会先打到它。
+	if left := srv.cooldownLeft("workbuddy-a"); left <= 0 {
+		t.Error("流首报额度耗尽的账号应进入冷却")
+	}
+}
+
+// 流式请求组内没有能换的账号时，错误按 HTTP 错误返回（与非流式一致），
+// 而不是 200 + 错误帧——客户端能拿到状态码与可读文案。
+func TestStreamFirstEventErrorExhaustedReturnsHTTPError(t *testing.T) {
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/config" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"额度已用尽\"}}\n\n"))
+	}))
+	t.Cleanup(up.Close)
+
+	srv, base := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	login(t, srv, "workbuddy", "only")
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	status, raw := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"x","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+
+	if status == http.StatusOK {
+		t.Fatalf("流首错误的流式请求不能返回 200，响应 %s", raw)
+	}
+	if !strings.Contains(string(raw), "额度已用尽") {
+		t.Errorf("响应应包含上游的错误文案，实际 %s", raw)
+	}
+	if strings.Contains(string(raw), "data:") {
+		t.Errorf("不应把 SSE 帧原样透传给客户端，实际 %s", raw)
+	}
+}
+
+// 流式换号后，被替换掉的响应体必须被关闭，否则连接永远不归还连接池。
+//
+// 调用方的 defer 只捕获了最初那个 resp；换号拿到的响应如果没人关，
+// 每次「额度耗尽 -> 换号 -> 成功」都会漏一个连接。判据同非流式版本：
+// body 被读完并 Close 之后，上游连接从 StateActive 转成 StateIdle。
+func TestStreamFailoverClosesReplacedResponseBody(t *testing.T) {
+	var mu sync.Mutex
+	busy := 0
+	up := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/config" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if strings.Contains(r.Header.Get("Authorization"), "token-a") {
+			_, _ = w.Write([]byte("data: {\"error\":{\"message\":\"额度已用尽\"}}\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"},\"index\":0}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	up.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		mu.Lock()
+		defer mu.Unlock()
+		switch state {
+		case http.StateActive:
+			busy++
+		case http.StateIdle, http.StateClosed:
+			if busy > 0 {
+				busy--
+			}
+		}
+	}
+	up.Start()
+	t.Cleanup(up.Close)
+
+	srv, base := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	for _, uid := range []string{"a", "b"} {
+		login(t, srv, "workbuddy", uid)
+	}
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	status, raw := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"x","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("换号后应成功，实际 %d，响应 %s", status, raw)
+	}
+
+	// 状态更新是异步的，给它一点时间落定。
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := busy
+		mu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	mu.Lock()
+	n := busy
+	mu.Unlock()
+	t.Errorf("换号后的响应体没有被关闭，上游仍有 %d 个连接停在 Active（未归还连接池）", n)
+}
+
 // 多上游（含新协议族）同时登录时的同名模型消歧：
 // 裸名归第一个（配置顺序）暴露它的非国际版上游，其余上游用 "上游ID:" 前缀。
 func TestAllModelsDisambiguatesThirdProviderConflict(t *testing.T) {
@@ -1797,5 +2063,91 @@ func TestAllModelsPlainForSingleNewProvider(t *testing.T) {
 		if m.ID != "glm-5.2" {
 			t.Fatalf("单上游（trae-cn）应保持裸 ID，实际 %s", m.ID)
 		}
+	}
+}
+
+// 防御分支：>= 400 的响应绝不能透传成流。handleChat 会先拦下这类响应，
+// 这里直接驱动 pipeSSEWithFailover 验证换号路径上的守卫——错误响应体里
+// 没有 data 事件，PeekFirstEvent 会把它当健康流，客户端随即收到
+// 200 + 原始错误体（以为成功，拿到的却是错误）。
+func TestStreamFailoverRejectsHTTPErrorResponse(t *testing.T) {
+	srv, _ := newTestServer(t, nil)
+	cred := login(t, srv, "workbuddy", "b")
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{"Content-Type": []string{"application/json"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"模型未开通"}}`)),
+	}
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+
+	_, _, err := srv.pipeSSEWithFailover(context.Background(), rec, "workbuddy", resp, cred, []byte("{}"), req, "x")
+
+	var uhe *upstreamHTTPError
+	if !errors.As(err, &uhe) {
+		t.Fatalf(">= 400 的响应应按 upstreamHTTPError 带回，实际 %v", err)
+	}
+	if uhe.Status != http.StatusBadRequest {
+		t.Errorf("应保留上游原始状态码 400，实际 %d", uhe.Status)
+	}
+	if !strings.Contains(uhe.Message, "模型未开通") {
+		t.Errorf("错误文案应提取上游信息，实际 %q", uhe.Message)
+	}
+	if rec.Body.Len() != 0 {
+		t.Errorf("报错前不能写给下游任何字节，实际写了 %q", rec.Body.String())
+	}
+	// 健康流路径会写 200 并 flush；两者都没发生才算没透传。
+	// （ResponseRecorder.Code 默认就是 200，不能单独作为判据。）
+	if rec.Flushed {
+		t.Error("不能把错误响应当健康流 flush 给客户端")
+	}
+}
+
+// 上游错误体可达 8MB：提取给下游的文案必须有上限，否则一个行为不端的上游
+// 能把几 MB 的 HTML/JSON 塞进 error.message。
+func TestUpstreamErrorMessageIsBounded(t *testing.T) {
+	huge := strings.Repeat("<html>gateway error</html>", 200<<10) // 约 4.6MB
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/config" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			return
+		}
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(huge))
+	}))
+	t.Cleanup(up.Close)
+
+	srv, base := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	login(t, srv, "workbuddy", "only")
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	status, raw := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"x","stream":false,"messages":[{"role":"user","content":"hi"}]}`, nil)
+
+	if status != http.StatusBadRequest {
+		t.Fatalf("不可退避的客户端错误应按原状态码 400 带回，实际 %d", status)
+	}
+	var errResp struct {
+		Error struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(raw, &errResp); err != nil {
+		t.Fatalf("错误响应应是合法 JSON: %v（长度 %d）", err, len(raw))
+	}
+	if n := utf8.RuneCountInString(errResp.Error.Message); n > maxUpstreamMessageRunes {
+		t.Errorf("错误文案应有上限 %d runes，实际 %d", maxUpstreamMessageRunes, n)
+	}
+	if len(raw) > 1<<20 {
+		t.Errorf("错误响应体不应有几 MB 大小，实际 %d 字节", len(raw))
 	}
 }

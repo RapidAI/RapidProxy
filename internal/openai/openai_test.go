@@ -1,8 +1,10 @@
 package openai
 
 import (
+	"bufio"
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -372,5 +374,66 @@ func TestTruncateTextKeepsUTF8(t *testing.T) {
 	}
 	if truncateText("abc", 10) != "abc" || truncateText("abc", 0) != "" {
 		t.Error("边界处理不对")
+	}
+}
+
+// PeekFirstEvent：跳过注释与心跳取首个 data 事件，读取器不关闭，
+// 剩余事件仍能从同一个读取器继续读——流式故障转移靠它实现
+// 「先窥探、确认健康再透传」。
+func TestPeekFirstEvent(t *testing.T) {
+	stream := ": ping\n\n" +
+		"event: message\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"第一块\"}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"第二块\"}}]}\n\n" +
+		"data: [DONE]\n\n"
+	br := bufio.NewReader(strings.NewReader(stream))
+	first, err := PeekFirstEvent(br)
+	if err != nil {
+		t.Fatalf("窥探首事件失败: %v", err)
+	}
+	if !strings.Contains(first, "第一块") {
+		t.Errorf("首事件不对: %q", first)
+	}
+	// 剩余流仍可继续读：首事件之后的第二块与 [DONE] 都在。
+	rest, err := io.ReadAll(br)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(rest), "第二块") || !strings.Contains(string(rest), "[DONE]") {
+		t.Errorf("窥探后剩余流不完整: %q", rest)
+	}
+	if strings.Contains(string(rest), "第一块") {
+		t.Errorf("首事件不应残留在剩余流里: %q", rest)
+	}
+}
+
+// 首事件就是错误帧时返回 *StreamError，与「读取流失败」可区分。
+func TestPeekFirstEventErrorFrame(t *testing.T) {
+	br := bufio.NewReader(strings.NewReader("data: {\"error\":{\"message\":\"额度已用尽\"}}\n\n"))
+	first, err := PeekFirstEvent(br)
+	var serr *StreamError
+	if !errors.As(err, &serr) {
+		t.Fatalf("错误帧应返回 *StreamError，实际 first=%q err=%v", first, err)
+	}
+	if serr.Message != "额度已用尽" {
+		t.Errorf("错误文案不对: %q", serr.Message)
+	}
+	// error: null / 空对象不是错误帧。
+	br = bufio.NewReader(strings.NewReader("data: {\"error\":null}\n\n"))
+	if _, err := PeekFirstEvent(br); errors.As(err, &serr) {
+		t.Errorf("error:null 不应判定为错误帧，实际 %v", err)
+	}
+}
+
+// 流在首个事件前就中断（EOF / 读不出事件）时返回读取错误，调用方按空流收尾。
+func TestPeekFirstEventEmptyStream(t *testing.T) {
+	br := bufio.NewReader(strings.NewReader(": ping\n\n"))
+	first, err := PeekFirstEvent(br)
+	if first != "" || err == nil {
+		t.Errorf("只有心跳的空流应返回读取错误，实际 first=%q err=%v", first, err)
+	}
+	var serr *StreamError
+	if errors.As(err, &serr) {
+		t.Error("空流不应判定为上游错误帧")
 	}
 }

@@ -17,7 +17,7 @@ Turn **WorkBuddy** (international), **CodeBuddy** (China), **LobsterAI**, **Trae
 
 ## Supported providers
 
-Each signable provider is one **group**: accounts inside a group are served with weighted round-robin and act as each other's failover. When a vendor ships China / International editions, they are two independent groups (accounts are signed in separately).
+Each signable provider is one **group**: accounts inside a group are served with weighted round-robin and act as each other's failover. When a vendor ships China / International editions, they are two independent groups (accounts are signed in separately). If any account in a group runs into trouble (rate-limited, out of credits, upstream unavailable, model not enabled on it, auth failure…), the proxy skips it on the forwarding side and moves to the next account in the group — the error is not passed through to the client. Only when no account in the whole group can serve the request does the client see an error.
 
 | Group (provider ID) | Vendor | Sign-in | Notes |
 |---|---|---|---|
@@ -28,7 +28,7 @@ Each signable provider is one **group**: accounts inside a group are served with
 | `trae-global` | Trae (International) | Browser authorization callback | Singapore deployment, separate from the China edition |
 | `qoder-cn` | Qoder (China) | Device code (PKCE) | COSY-signed chat, approve in the browser |
 | `qoder-global` | Qoder (International) | Device code (PKCE) | Separate from the China edition |
-| `opencode` | OpenCode Zen (opencode.ai) | API key | Paste a key, or auto-import the one saved by the local OpenCode CLI; a proxy is recommended |
+| `opencode` | OpenCode Zen (opencode.ai) | API key | Imports the key saved by the local OpenCode CLI and waits for confirmation (paste a new key to override), or paste a key directly; a proxy is recommended |
 
 ---
 
@@ -36,7 +36,8 @@ Each signable provider is one **group**: accounts inside a group are served with
 
 - **Graphical sign-in**: built-in presets for WorkBuddy, CodeBuddy, LobsterAI, Trae (China / International) and Qoder (China / International). Click "Sign in" and the authorization page opens in your system browser; tokens are saved and refreshed automatically. Sign-in status is shown on the Overview tab.
 - **OpenAI-compatible service**: exposes `/v1/models`, `/v1/chat/completions` (plus equivalent paths without `/v1`) and `/healthz`. Both streaming and non-streaming requests are supported (streaming-only upstreams are aggregated server-side).
-- **Multi-account load balancing**: sign in with several accounts per provider; requests are served round-robin. Expired tokens are refreshed automatically and 401/403 responses are retried once.
+- **Multi-account load balancing**: sign in with several accounts per provider; requests are served by weighted round-robin. Expired tokens are refreshed automatically and 401/403 responses are retried once.
+- **In-group failure auto-skip**: whenever an account runs into trouble, the proxy moves to the next account in the group instead of passing the error to the client — rate limits / exhausted credits / upstream outages cool the account down and switch; "this account can't serve this request" errors (model not enabled, bad parameters…) switch without cooling; for streaming requests, an upstream that reports failure at the very first SSE event (HTTP 200 + error frame) also triggers a switch before a single byte is written downstream. Only after every account in the group has been tried does the last error come back with its original status code (retryable failures are summarized as 429 + Retry-After).
 - **Multi-provider routing**: use the bare model name (auto-matched), or prefix it with `provider:model` / `provider/model` (the International edition accepts the `intl:` shorthand); you can also force routing with the `X-RapidProxy-Provider` header (`intl` accepted) or `?provider=`, and pin an account with `X-RapidProxy-Account`.
 - **Multi-provider model disambiguation**: when several providers are enabled, International (workbuddy) models are listed as `intl:model`; for the remaining providers, a bare model name belongs to the first provider (config order) that exposes it, and every other provider's copy is listed as `provider:model`; with a single provider enabled, all IDs stay plain.
 - **API key auth**: multiple keys supported with one-click generation; with no key configured, requests are unauthenticated (recommended only for loopback listening).
@@ -246,7 +247,8 @@ Installers are stored under `<data dir>/update/`, using a `.part` temp file + at
 
 - Client requests are rewritten to `stream: true` before forwarding (the upstream only supports streaming); when the client asked for non-streaming, SSE events are aggregated into a single `chat.completion` response.
 - Tokens are refreshed 5 minutes before expiry; on 401/403 the proxy refreshes once and retries.
-- Accounts are served round-robin (cursor); requests for the same account are serialized to avoid concurrent refresh races.
+- Accounts are served by weighted round-robin (smooth WRR); requests for the same account are serialized to avoid concurrent refresh races.
+- In-group failures are auto-skipped: any account error switches to the next account in the group rather than surfacing to the client; only a fully exhausted group returns the last error with its original status code (retryable ones as 429 + Retry-After).
 - The upstream blocks certain fixed system-template sentences; request sanitization performs minimal word-level rewrites before forwarding.
 
 ---
@@ -260,6 +262,9 @@ The server is also tolerant of this misconfiguration: any path ending with `/cha
 
 **Sign-in seems stuck / keeps spinning?**
 Make sure you actually completed the sign-in in the browser. If your browser blocks the redirect, use "Copy sign-in link" and finish on your phone or another browser — the app polls for the result automatically.
+
+**I clicked Sign in for OpenCode but it didn't sign in right away?**
+When a key saved by the local OpenCode CLI is detected, it is no longer saved automatically: submit with the box empty to sign in with that key, or paste a new key to sign in with it instead — no need to delete the local `auth.json` first. The key is verified online before saving, and a bad key is reported immediately.
 
 **Service fails to start (port in use)?**
 Pick another listen address (e.g. `127.0.0.1:8788`); a running service restarts on the new address automatically.

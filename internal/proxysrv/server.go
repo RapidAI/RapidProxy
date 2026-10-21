@@ -9,7 +9,7 @@
 package proxysrv
 
 import (
-	"bytes"
+	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
@@ -956,7 +956,17 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	if wantStream {
 		// 流式：边透传边抽取 usage，请求正常结束后计入统计。
-		usage := s.pipeSSE(w, resp)
+		//
+		// 上游会以 200 + SSE 的形式回报额度耗尽 / 限流（状态码完全正常，
+		// 错误在流的第一个事件里）。pipeSSEWithFailover 在写给下游任何字节
+		// 之前先窥探首事件：是错误帧就冷却该账号、换同组下一个账号重来，
+		// 组里还有能用的账号时客户端全程无感。
+		usage, cred, err := s.pipeSSEWithFailover(r.Context(), w, profile.ID, resp, cred, body, r, requestedModel)
+		if err != nil {
+			// 只有在还没写给下游任何字节时才会走到这里，可以安全回错误码。
+			s.writeChatError(w, err, profile.ID, requestedModel)
+			return
+		}
 		s.recordUsage(profile.ID, requestedModel, usage)
 		s.log.Infof("[%s] %s 流式转发完成，耗时 %s（账号 %s）", profile.ID, requestedModel, time.Since(started).Round(time.Millisecond), cred.DisplayName())
 		return
@@ -982,7 +992,8 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	s.log.Infof("[%s] %s 非流式转发完成，耗时 %s（账号 %s）", profile.ID, requestedModel, time.Since(started).Round(time.Millisecond), cred.DisplayName())
 }
 
-// aggregateRetries 是非流式请求因流内错误而换号重试的上限。
+// aggregateRetries 是「上游以流的形式报错」时换号重试的上限，非流式
+// （aggregateWithFailover）与流式（pipeSSEWithFailover）共用。
 //
 // 不做成无限：账号数量有限，每轮 doChatExcluding 至少会排除一个账号，
 // 所以轮数只是防止逻辑意外时无限循环的兜底。
@@ -1048,15 +1059,11 @@ func (s *Server) aggregateWithFailover(
 			// 其它错误（如整组冷却、组内账号都不健康）比原始文案更贴近实际。
 			return nil, cred, err
 		}
-		// 换号成功不代表请求成功：新账号可能回的是 400 / 404 / 422 这类
-		// 客户端错误（模型在别的账号上没开、内容超长等），doChatExcluding
-		// 对这类错误不做退避，直接把响应交回来。
-		//
-		// 必须把上游的真实错误原样带回去——这里绝不能 `return nil, cred, err`，
-		// 因为 err 在 doChatExcluding 成功时已被置成 nil，调用方只判 err != nil，
-		// 会写出「200 + 空 body」：客户端以为请求成功，拿到空响应后只能报一句
-		// 无头无尾的解析错误。用 upstreamHTTPError 把状态码和文案一起带回去，
-		// writeChatError 会按原状态码（保留 4xx）回给下游。
+		// 防御性分支：doChatExcluding 只会在状态码 < 400 时返回响应
+		//（>= 400 的都在组内跳过换号了），正常情况下走不到这里。
+		// 真出现时照样把上游的真实错误原样带回去——绝不能 return nil 且 err 为 nil，
+		// 否则调用方会写出「200 + 空 body」：客户端以为请求成功，拿到空响应后
+		// 只能报一句无头无尾的解析错误。
 		if next.StatusCode >= 400 {
 			kind, detail, retryAfter := inspectUpstreamFailure(next)
 			_ = next.Body.Close()
@@ -1065,11 +1072,7 @@ func (s *Server) aggregateWithFailover(
 				s.log.Warnf("账号 %s %s，冷却至 %s（%s）", nextCred.DisplayName(), failReason(kind),
 					until.Format("15:04:05"), truncate(detail, 120))
 			}
-			msg := strings.TrimSpace(detail)
-			if msg == "" {
-				msg = fmt.Sprintf("上游 HTTP %d", next.StatusCode)
-			}
-			return nil, cred, &upstreamHTTPError{Status: next.StatusCode, Message: msg}
+			return nil, cred, &upstreamHTTPError{Status: next.StatusCode, Message: detail}
 		}
 		resp, cred = next, nextCred
 	}
@@ -1104,6 +1107,48 @@ func (s *Server) writeChatError(w http.ResponseWriter, err error, providerID, re
 	writeError(w, status, err.Error(), "upstream_error", "upstream_error")
 }
 
+// maxUpstreamMessageRunes 限制带回给下游的上游错误文案长度。
+//
+// 上游错误体上限 8MB（见 inspectUpstreamFailure）：不截断的话，一个行为不端的
+// 上游能把整段 HTML / JSON 塞进 error.message，客户端收到几 MB 的「错误」。
+// 真正的错误文案都在几百字符以内，2000 足够保留可读信息。
+const maxUpstreamMessageRunes = 2000
+
+// extractUpstreamErrorMessage 从上游的错误响应体里提取一句可读文案。
+//
+// 上游的错误形态五花八门：OpenAI 的 {"error":{"message":...}}、信封式的
+// {"code":N,"msg":...}、甚至带着 text/event-stream Content-Type 的 SSE 帧。
+// 不提取的话客户端看到的是一整段原始 JSON 或带 "data:" 前缀的半截文本。
+// raw 是已经读到的响应体（上限 8MB，见 inspectUpstreamFailure）；返回值
+// 按 maxUpstreamMessageRunes 截断，分类用的关键词匹配在调用方基于原文进行，
+// 不受截断影响。
+func extractUpstreamErrorMessage(resp *http.Response, raw []byte) string {
+	message := strings.TrimSpace(string(raw))
+	if isSSE(resp) {
+		return truncate(firstSSEErrorMessage(message), maxUpstreamMessageRunes)
+	}
+	// 上游的 JSON 错误通常是 {"error":{"message":"..."}} 形态，顶层没有 code/msg。
+	var jerr struct {
+		Error *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	}
+	if json.Unmarshal(raw, &jerr) == nil && jerr.Error != nil && jerr.Error.Message != "" {
+		message = jerr.Error.Message
+	}
+	var env struct {
+		Code int    `json:"code"`
+		Msg  string `json:"msg"`
+	}
+	if json.Unmarshal(raw, &env) == nil && env.Code != 0 {
+		return truncate(fmt.Sprintf("上游返回 code=%d msg=%s", env.Code, env.Msg), maxUpstreamMessageRunes)
+	}
+	if message == "" {
+		return fmt.Sprintf("上游 HTTP %d", resp.StatusCode)
+	}
+	return truncate(message, maxUpstreamMessageRunes)
+}
+
 // writeNonStreamUpstream 处理上游返回非 SSE 响应的情况：正常响应透传，错误响应转成 OpenAI 错误。
 //
 // 上游偶尔给错误响应也带上 text/event-stream 的 Content-Type，
@@ -1132,31 +1177,7 @@ func (s *Server) writeNonStreamUpstream(w http.ResponseWriter, resp *http.Respon
 		return
 	}
 
-	message := strings.TrimSpace(string(raw))
-	if isSSE(resp) {
-		message = firstSSEErrorMessage(message)
-	}
-	// 上游的 JSON 错误通常是 {"error":{"message":"..."}} 形态，顶层没有 code/msg。
-	// 不提取的话客户端会看到一整段原始 JSON，可读性很差。
-	if !isSSE(resp) {
-		var jerr struct {
-			Error *struct {
-				Message string `json:"message"`
-			} `json:"error"`
-		}
-		if json.Unmarshal(raw, &jerr) == nil && jerr.Error != nil && jerr.Error.Message != "" {
-			message = jerr.Error.Message
-		}
-	}
-	var env struct {
-		Code int    `json:"code"`
-		Msg  string `json:"msg"`
-	}
-	if json.Unmarshal(raw, &env) == nil && env.Code != 0 {
-		message = fmt.Sprintf("上游返回 code=%d msg=%s", env.Code, env.Msg)
-	} else if message == "" {
-		message = fmt.Sprintf("上游 HTTP %d", resp.StatusCode)
-	}
+	message := extractUpstreamErrorMessage(resp, raw)
 	s.log.Errorf("[%s] %s 上游异常: %s", provider, model, truncate(message, 200))
 	// 上游明确报的是客户端错误（400 / 404 / 422 …）时按原状态码回给下游：
 	// 一律报 502 会让调用方以为这是可以重试的临时故障，从而反复重发同一个坏请求。
@@ -1208,11 +1229,13 @@ func firstSSEErrorMessage(body string) string {
 	return first
 }
 
-// pipeSSE 把上游的流式响应逐块透传给下游，并返回流里携带的 token 用量。
+// pipeSSEFrom 把上游的流式响应逐块透传给下游，并返回流里携带的 token 用量。
+// first 非空表示首个事件已被预读（流式故障转移的窥探结果）：先转发它，
+// 再从 br 继续读剩余流——客户端看到的仍是完整连续的流。
 //
-// 调用前必须确认响应确实是成功的流（状态码 < 400 且 Content-Type 是 SSE）：
+// 调用前必须确认响应确实是健康的流（状态码 < 400 且首事件不是错误帧）：
 // 这里会无条件写 200，一旦上游回的是错误响应，客户端就会以为请求成功。
-func (s *Server) pipeSSE(w http.ResponseWriter, resp *http.Response) stats.Usage {
+func (s *Server) pipeSSEFrom(w http.ResponseWriter, resp *http.Response, br *bufio.Reader, first string) stats.Usage {
 	header := w.Header()
 	header.Set("Content-Type", "text/event-stream; charset=utf-8")
 	header.Set("Cache-Control", "no-cache")
@@ -1225,7 +1248,7 @@ func (s *Server) pipeSSE(w http.ResponseWriter, resp *http.Response) stats.Usage
 		flusher.Flush()
 	}
 	var usage stats.Usage
-	err := openai.ReadSSEEvents(resp.Body, func(data string) error {
+	deliver := func(data string) error {
 		// 顺手从每个 data 事件里抽取 usage，最后一个带 usage 的事件覆盖先前的。
 		if u, ok := extractUsageString(data); ok {
 			usage = u
@@ -1237,7 +1260,18 @@ func (s *Server) pipeSSE(w http.ResponseWriter, resp *http.Response) stats.Usage
 			flusher.Flush()
 		}
 		return nil
-	})
+	}
+	if first != "" {
+		if err := deliver(first); err != nil {
+			s.log.Warnf("读取上游流失败: %v", err)
+			_, _ = io.WriteString(w, "data: [DONE]\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return usage
+		}
+	}
+	err := openai.ReadSSEEvents(br, deliver)
 	if err != nil {
 		s.log.Warnf("读取上游流失败: %v", err)
 	}
@@ -1246,6 +1280,81 @@ func (s *Server) pipeSSE(w http.ResponseWriter, resp *http.Response) stats.Usage
 		flusher.Flush()
 	}
 	return usage
+}
+
+// pipeSSEWithFailover 透传流式响应；上游在流的第一个事件就回报错误时
+// （额度 / 限流常以 200 + SSE 的形态出现，状态码完全正常），在写给下游
+// 任何字节之前冷却该账号、换同组下一个账号重来——客户端全程无感。
+//
+// 与 aggregateWithFailover（非流式）是同一套机制：只对「上游明确报错」
+// 换号，读取流失败（网络中断等）重试没有意义。已经开始透传之后才出现的
+// 错误无法换号（字节已经给下游了），按原有行为只在日志里记一笔。
+func (s *Server) pipeSSEWithFailover(
+	ctx context.Context,
+	w http.ResponseWriter,
+	providerID string,
+	resp *http.Response,
+	cred *upstream.Credential,
+	body []byte,
+	r *http.Request,
+	requestedModel string,
+) (stats.Usage, *upstream.Credential, error) {
+	exclude := map[string]bool{}
+	for attempt := 0; ; attempt++ {
+		// 防御性分支：doChatExcluding 契约上只返回 < 400 的响应（>= 400 的都在
+		// 组内跳过换号了，handleChat 也会先拦一道），正常情况下走不到这里。
+		// 真出现时（含测试直接驱动本函数）必须把上游错误按 HTTP 错误带回：
+		// 一个 ≥400 的响应体里没有 data 事件，PeekFirstEvent 会当它健康流，
+		// 于是客户端收到 200 + 原始错误体——以为成功，拿到的却是错误。
+		// 与 aggregateWithFailover 的同名分支保持同一口径。
+		if resp.StatusCode >= 400 {
+			kind, detail, retryAfter := inspectUpstreamFailure(resp)
+			_ = resp.Body.Close()
+			if kind != failNone && cred != nil {
+				until := s.markCooldown(cred.ID, kind, retryAfter)
+				s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(kind),
+					until.Format("15:04:05"), truncate(detail, 120))
+			}
+			return stats.Usage{}, cred, &upstreamHTTPError{Status: resp.StatusCode, Message: detail}
+		}
+		br := bufio.NewReader(resp.Body)
+		first, err := openai.PeekFirstEvent(br)
+		var serr *openai.StreamError
+		if !errors.As(err, &serr) || cred == nil {
+			// 健康流（或读不出事件就中断的空流）：正常透传。
+			//
+			// body 由本函数收口关闭：换号后拿到的响应体不在调用方的 defer
+			// 捕获范围内（那个 defer 只认识最初那个 resp），不关就会漏连接。
+			usage := s.pipeSSEFrom(w, resp, br, first)
+			_ = resp.Body.Close()
+			return usage, cred, nil
+		}
+
+		// 流首错误：此时还没给下游写过一个字节，可以安全换号。
+		_ = resp.Body.Close()
+		if kind := classifyMessage(serr.Message); kind != failNone {
+			until := s.markCooldown(cred.ID, kind, 0)
+			s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(kind),
+				until.Format("15:04:05"), truncate(serr.Message, 120))
+		}
+		exclude[cred.ID] = true
+		s.log.Warnf("[%s] %s 上游流首返回错误，换号重试: %s", providerID, requestedModel, truncate(serr.Message, 200))
+		if attempt >= aggregateRetries-1 {
+			return stats.Usage{}, cred, &openai.StreamError{Message: "上游返回错误: " + serr.Message}
+		}
+
+		next, nextCred, err := s.doChatExcluding(ctx, providerID, body, r, exclude)
+		if err != nil {
+			// 组内没有别的账号可换时，doChatExcluding 会返回 ErrNoAccount。
+			// 直接透传会把「额度已用尽」说成「尚未登录账号」——原始文案更有用。
+			if errors.Is(err, ErrNoAccount) || errors.Is(err, ErrAllPaused) {
+				return stats.Usage{}, cred, &openai.StreamError{Message: "上游返回错误: " + serr.Message}
+			}
+			// 其它错误（如整组冷却、组内账号都不健康）比原始文案更贴近实际。
+			return stats.Usage{}, cred, err
+		}
+		resp, cred = next, nextCred
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -1449,15 +1558,17 @@ var serverKeywords = []string{
 // 只在状态码 >= 400 时才有意义：此时响应还没交给下游，body 可以安全读取。
 // 上游偶尔会用 text/event-stream 的 Content-Type 回一个错误响应，
 // 这种 body 同样要读出来判断，否则限流不会触发换号，客户端还会收到一个 200。
-// 返回 failNone 表示这不是可退避的错误（按原有逻辑处理，例如认证失败）；
-// 这时读过的 body 会被塞回去，不影响后续处理。
+// 返回 failNone 表示这不是可退避的错误（按原有逻辑处理，例如认证失败、
+// 模型没在这个账号开通）；调用方读完 detail 后必须自己关闭 body。
+//
+// detail 一律是提取后的可读文案（见 extractUpstreamErrorMessage），分类用的
+// 则是原文——限流 / 额度关键词在 JSON 与 SSE 两种形态里都出现在正文中。
 func inspectUpstreamFailure(resp *http.Response) (failKind, string, time.Duration) {
 	if resp == nil || resp.StatusCode < 400 {
 		return failNone, "", 0
 	}
-	// 上限与 writeNonStreamUpstream 的 8MB 对齐：failNone 分支要把 body 原样
-	// 还回去交给下游透传，若读到的比下游能读到的还少，大体积错误正文（>64KB）
-	// 就会被截断，甚至因截断成非法 JSON 而被下游当成「上游 HTTP 400」丢失原意。
+	// 上限与 writeNonStreamUpstream 的 8MB 对齐：读满即可判定，
+	// 更大的错误正文没有额外信息。
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
 	msg := strings.TrimSpace(string(raw))
 	retryAfter := parseRetryAfter(resp.Header.Get("Retry-After"))
@@ -1474,12 +1585,11 @@ func inspectUpstreamFailure(resp *http.Response) (failKind, string, time.Duratio
 	default:
 		kind = classifyMessage(msg)
 	}
+	detail := extractUpstreamErrorMessage(resp, raw)
 	if kind == failNone {
-		// 不是可退避的错误，把完整 body 还回去供后续逻辑读取。
-		resp.Body = io.NopCloser(bytes.NewReader(raw))
-		return failNone, msg, 0
+		return failNone, detail, 0
 	}
-	return kind, truncate(msg, 200), retryAfter
+	return kind, truncate(detail, 200), retryAfter
 }
 
 // hasAny 报告正文里是否出现任一关键词（调用方负责先把大小写统一）。
@@ -1758,6 +1868,12 @@ func (s *Server) doChat(ctx context.Context, providerID string, body []byte, r *
 // 非流式请求要把上游的 SSE 折叠成完整响应，这个过程本身还可能失败
 // （流里夹带 error 事件），失败后需要换同组下一个账号重来。exclude 传入
 // 上一轮已经用掉的账号，避免在同一账号上反复打转。
+//
+// 组内故障转移的总口径：账号有问题就跳过它换下一个，不把错误透传给下游——
+// 限流 / 额度 / 上游不可用冷却后换号；模型没开通、参数不对这类「这台账号
+// 接不了这单」的错误同样换号（不冷却，只在本请求内排除）。只有整组都试过
+// 仍无人能接，才把最后的错误带回：有客户端错误时按原状态码带回，否则汇总
+// 成带 Retry-After 的 429。用户侧因此只在整个组都不可用时才看到错误。
 func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []byte, r *http.Request, exclude map[string]bool) (*http.Response, *upstream.Credential, error) {
 	client, err := s.ClientFor(providerID)
 	if err != nil {
@@ -1811,6 +1927,10 @@ func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []
 	}
 
 	var lastErr error
+	// clientErr 是组内账号回过的「不可退避错误」：模型没在这个账号开通、
+	// 参数不对、404……换账号是对路的，但不能冷却账号（不是账号的错）。
+	// 穷尽整组时按原状态码带回，调用方照旧拿到可排查的文案。
+	var clientErr *upstreamHTTPError
 	var backed int // 因限流 / 额度耗尽而退避的次数
 	tried := make(map[string]bool, len(exclude))
 	for id := range exclude {
@@ -1844,14 +1964,15 @@ func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []
 
 		// 限流 / 额度耗尽：先让这个账号冷却，再换同组下一个账号。
 		// 只要组里还有能用的账号，请求就不会失败在下游面前。
-		if kind, detail, retryAfter := inspectUpstreamFailure(resp); kind != failNone {
+		respKind, respDetail, respRetryAfter := inspectUpstreamFailure(resp)
+		if respKind != failNone {
 			_ = resp.Body.Close()
-			until := s.markCooldown(cred.ID, kind, retryAfter)
+			until := s.markCooldown(cred.ID, respKind, respRetryAfter)
 			unlock()
 			backed++
-			lastErr = fmt.Errorf("账号 %s %s，冷却至 %s", cred.DisplayName(), failReason(kind), until.Format("15:04:05"))
-			s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(kind),
-				until.Format("15:04:05"), truncate(detail, 120))
+			lastErr = fmt.Errorf("账号 %s %s，冷却至 %s", cred.DisplayName(), failReason(respKind), until.Format("15:04:05"))
+			s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(respKind),
+				until.Format("15:04:05"), truncate(respDetail, 120))
 			continue
 		}
 
@@ -1876,20 +1997,32 @@ func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []
 			}
 			// 刷新令牌后重试的响应也要走同一套失败判定：429/402/5xx 不能当成成功返回，
 			// 否则该账号会继续被挑中并一直 429（且不该在非成功时落盘令牌）。
-			if kind, detail, retryAfter := inspectUpstreamFailure(retry); kind != failNone {
+			retryKind, retryDetail, retryAfter := inspectUpstreamFailure(retry)
+			if retryKind != failNone {
 				_ = retry.Body.Close()
-				until := s.markCooldown(cred.ID, kind, retryAfter)
+				until := s.markCooldown(cred.ID, retryKind, retryAfter)
 				unlock()
 				backed++
-				lastErr = fmt.Errorf("账号 %s %s，冷却至 %s", cred.DisplayName(), failReason(kind), until.Format("15:04:05"))
-				s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(kind),
-					until.Format("15:04:05"), truncate(detail, 120))
+				lastErr = fmt.Errorf("账号 %s %s，冷却至 %s", cred.DisplayName(), failReason(retryKind), until.Format("15:04:05"))
+				s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(retryKind),
+					until.Format("15:04:05"), truncate(retryDetail, 120))
 				continue
 			}
 			if retry.StatusCode == http.StatusUnauthorized || retry.StatusCode == http.StatusForbidden {
 				_ = retry.Body.Close()
 				unlock()
 				lastErr = fmt.Errorf("账号 %s 认证失败（已尝试刷新令牌）", cred.DisplayName())
+				continue
+			}
+			// 刷新令牌后重试仍被上游拒绝（模型没开通、参数不对等）：同样
+			// 跳过换号，不透传给下游——组里换个有权限的账号请求就成了。
+			if retry.StatusCode >= 400 {
+				_ = retry.Body.Close()
+				unlock()
+				clientErr = &upstreamHTTPError{Status: retry.StatusCode, Message: retryDetail}
+				lastErr = clientErr
+				s.log.Warnf("账号 %s 刷新后仍被上游拒绝（HTTP %d），换同组下一个账号: %s",
+					cred.DisplayName(), retry.StatusCode, truncate(retryDetail, 120))
 				continue
 			}
 			// 刷新令牌后重试成功：落盘新令牌并清掉冷却。
@@ -1900,6 +2033,24 @@ func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []
 			s.clearCooldown(cred.ID)
 			unlock()
 			return retry, cred, nil
+		}
+
+		// 走到这里 resp 一定不是 401/403（上面整段处理过），也不是可退避错误
+		// （同上面整段处理过）：若仍是 >= 400，就是「这台账号接不了这单」——
+		// 模型没在这个账号开通、参数不对、404……跳过它换同组下一个账号，
+		// 不把错误透传给下游：组里换个有权限的账号，请求就成了。
+		//
+		// 不冷却账号：这不是账号的错，只在本请求内排除（tried）。
+		// 穷尽整组都没有能用的账号时，最后的客户端错误按原状态码带回
+		// （见函数收尾），调用方照旧拿到可排查的文案。
+		if resp.StatusCode >= 400 {
+			_ = resp.Body.Close()
+			unlock()
+			clientErr = &upstreamHTTPError{Status: resp.StatusCode, Message: respDetail}
+			lastErr = clientErr
+			s.log.Warnf("账号 %s 请求被上游拒绝（HTTP %d），换同组下一个账号: %s",
+				cred.DisplayName(), resp.StatusCode, truncate(respDetail, 120))
+			continue
 		}
 
 		if cred.Auth.AccessToken != beforeToken || cred.Auth.ExpiresAt != beforeExpiry {
@@ -1915,7 +2066,15 @@ func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []
 	}
 
 	// 走到这里说明没有任何账号能完成请求。
-	// 全部因为限流 / 额度耗尽而退避时，告诉客户端多久后重试，而不是笼统报 502。
+	//
+	// 组里出现过「客户端错误」（模型没开通、参数不对等）时优先按原状态码
+	// 带回：这类错误换多少个账号都一样，状态码与文案对调用方排查最有意义
+	// （也避免被误当成可重试的临时故障而反复重发同一个坏请求）。
+	// 都是可退避错误（限流 / 额度 / 上游不可用）时才汇总成 429 + Retry-After，
+	// 告诉客户端多久后重试，而不是笼统报 502。
+	if clientErr != nil {
+		return nil, nil, clientErr
+	}
 	if backed > 0 {
 		if until, ok := s.earliestCooldown(creds); ok {
 			wait := time.Until(until)

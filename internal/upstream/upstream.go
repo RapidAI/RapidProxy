@@ -420,6 +420,13 @@ type LoginSession struct {
 	// SkipBrowser 表示不必在系统浏览器打开 AuthURL——本机已能找到凭据
 	// （如导入 OpenCode CLI 保存的密钥），打开网页只会让人困惑。
 	SkipBrowser bool
+	// LocalKey 是本机导入、等待用户确认的密钥（OpenCode 本地导入路径）。
+	// 为空表示没有待确认的导入密钥。本地导入不再自动落库：流程停在
+	// 等待确认的状态，用户提交空密钥即用它登录（App.SubmitLoginKey），
+	// 或粘贴一把新密钥覆盖——想换钥匙的用户不必先去删本机文件。
+	LocalKey string
+	// LocalKeyLabel 是 LocalKey 的脱敏展示名（如 sk-…abcd），供界面提示。
+	LocalKeyLabel string
 }
 
 // StartLogin 发起登录，返回需要用户在浏览器打开的授权链接。
@@ -612,6 +619,10 @@ func (c *Client) startQoderLogin(ctx context.Context) (*LoginSession, error) {
 // 回调：优先导入本机 OpenCode CLI 已保存的密钥（auth.json / OPENCODE_API_KEY）；
 // 找不到、或本机密钥形态不对，就打开官方密钥页，等用户在界面上粘贴（由
 // App.SubmitLoginKey 收口，这里只占位等待，超时由 ExpiresAt 收口）。
+//
+// 本机导入不等于用户就想用它：导入的密钥只进入「等待确认」状态
+// （openCodeLocalSession），由用户在界面上确认或粘贴新密钥覆盖，
+// 不会自动落库——否则想换钥匙的用户没有入口。
 func (c *Client) startOpenCodeLogin(ctx context.Context) (*LoginSession, error) {
 	if raw := opencode.LocalKey(); raw != "" {
 		// 本机密钥同样要过清洗：环境变量或 auth.json 里存的可能是带 Bearer
@@ -632,40 +643,29 @@ func (c *Client) startOpenCodeLogin(ctx context.Context) (*LoginSession, error) 
 	}, nil
 }
 
-// openCodeLocalSession 用本机导入的密钥构造「直接确认」的登录会话。
+// openCodeLocalSession 用本机导入的密钥构造「等待用户确认」的登录会话。
 //
-// 密钥在第一次轮询时过一次上游校验（跑在轮询 goroutine 上，不阻塞发起登录
-// 的调用方）：被 401/403 明确拒绝时 Poll 返回 ErrKeyRejected，由
-// App.pollLogin 把流程转成粘贴模式——否则一把坏密钥会静默落库，而用户不删掉
-// 本机 auth.json 就连粘贴框都等不到（本地导入永远优先）。联机类错误
-// （超时、DNS、5xx）放行保存，让运行时暴露真实问题。
+// 流程不会自动完成：Poll 只占位，停在等待确认的状态。用户在界面上提交
+// 空密钥即确认使用本机密钥（App.SubmitLoginKey 收口，提交前过一次上游
+// 校验，错键立刻提示），粘贴新密钥则直接覆盖登录。联机类错误放行保存，
+// 让运行时暴露真实问题。
 //
-// NeedKey 同时置位：导入本机密钥不等于用户就想用它，粘贴框常驻可供覆盖
-// （SkipBrowser 仍然为真——不替用户打开浏览器）。pollFn 的占位守卫认的是
-// State=="paste"（被拒后由 App 翻转），本地导入本身不受 NeedKey 影响。
+// NeedKey 常驻为真：粘贴框可见，想换一把钥匙的用户可以直接覆盖，
+// 不必先去删本机的 auth.json（SkipBrowser 仍为真——不替用户打开浏览器）。
 func (c *Client) openCodeLocalSession(key string) *LoginSession {
-	cred := c.openCodeCredential(key)
-	session := &LoginSession{
-		State:       "local",
-		AuthURL:     opencode.AuthURL,
-		ExpiresAt:   time.Now().Add(10 * time.Minute),
-		NeedKey:     true,
-		SkipBrowser: true,
-	}
-	session.pollFn = func(pollCtx context.Context) (*Credential, error) {
-		if session.NeedKey && session.State == "paste" {
-			// 已因密钥被拒转成粘贴模式：占位等 SubmitLoginKey，不再重复校验。
+	return &LoginSession{
+		State:         "local",
+		AuthURL:       opencode.AuthURL,
+		ExpiresAt:     time.Now().Add(10 * time.Minute),
+		NeedKey:       true,
+		SkipBrowser:   true,
+		LocalKey:      key,
+		LocalKeyLabel: opencode.KeyLabel(key),
+		pollFn: func(pollCtx context.Context) (*Credential, error) {
+			// 等待用户确认或粘贴：本机导入的密钥不自动落库。
 			return nil, nil
-		}
-		if err := c.VerifyOpenCodeKey(pollCtx, key); err != nil {
-			if errors.Is(err, opencode.ErrKeyRejected) {
-				return nil, err
-			}
-			// 联机类错误不判定密钥无效。
-		}
-		return cred, nil
+		},
 	}
-	return session
 }
 
 // openCodeCredential 用 Zen API Key 构造凭据。密钥制、不过期（ExpiresAt 为

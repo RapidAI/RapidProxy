@@ -108,9 +108,10 @@ var catalog = map[string]entry{
 
 	// ---- 登录 ----
 	"login.browserOpened":   {"已在系统浏览器打开官方登录页，请在该窗口完成授权", "The official sign-in page was opened in your default browser — finish authorizing there"},
-	"login.importing":       {"正在导入本机已保存的 OpenCode 密钥…（也可直接在下方粘贴其他密钥）", "Importing the OpenCode key saved on this device… (or paste a different key below)"},
+	"login.importing":       {"已找到本机保存的 OpenCode 密钥（%s），等待确认", "Found the OpenCode key saved on this device (%s) — waiting for confirmation"},
 	"login.pasteKey":        {"请在浏览器中创建 OpenCode 密钥，并粘贴到下方输入框", "Create an OpenCode key in your browser, then paste it into the box below"},
 	"login.keyInvalid":      {"OpenCode 密钥无效，请检查后重试", "That OpenCode key looks invalid — please check it and try again"},
+	"login.keyEmpty":        {"请输入 OpenCode 密钥，或直接确认使用本机已保存的密钥", "Enter an OpenCode key, or confirm the one saved on this device"},
 	"login.keyRejected":     {"OpenCode 密钥被上游拒绝，请确认密钥是否正确、未过期", "The OpenCode key was rejected by the server — make sure it is correct and still valid"},
 	"login.timeout":         {"登录超时或已取消", "Sign-in timed out or was cancelled"},
 	"login.expired":         {"登录链接已过期，请重新发起登录", "The sign-in link has expired — please start again"},

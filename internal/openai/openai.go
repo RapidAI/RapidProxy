@@ -285,6 +285,48 @@ type StreamError struct {
 
 func (e *StreamError) Error() string { return e.Message }
 
+// StreamEventError 判断一个 SSE data 事件是不是上游错误帧，返回错误文案。
+//
+// 判定与 Aggregate 完全一致：只有真的带了可读文案的 error 字段才算——
+// 某些上游的正常 chunk 可能带 "error": null 或空对象，不分青红皂白地
+// 当成失败会凭空把一次成功的请求打成错误。
+func StreamEventError(data string) (string, bool) {
+	var chunk map[string]any
+	if json.Unmarshal([]byte(data), &chunk) != nil {
+		return "", false
+	}
+	if env, ok := chunk["error"]; ok && env != nil {
+		return extractErrorText(env)
+	}
+	return "", false
+}
+
+// PeekFirstEvent 读取 SSE 的首个 data 事件文本（跳过注释与心跳），不关闭
+// 读取器——调用方拿到事件后继续用同一个读取器读剩余流。
+//
+// 首个事件是上游错误帧时返回 *StreamError：上游常以 200 + SSE 回报失败
+// （额度 / 限流），状态码完全正常，错误只出现在流的第一个事件里，调用方
+// 需要能和「读取流失败」区分开。流在首个事件前就中断（EOF / 网络错误）
+// 时返回 ("", 读取错误)，调用方按空流收尾即可。
+func PeekFirstEvent(br *bufio.Reader) (string, error) {
+	for {
+		line, err := br.ReadString('\n')
+		trimmed := strings.TrimRight(line, "\r\n")
+		if strings.HasPrefix(trimmed, "data:") {
+			data := strings.TrimSpace(strings.TrimPrefix(trimmed, "data:"))
+			if data != "" && data != "[DONE]" {
+				if msg, ok := StreamEventError(data); ok {
+					return "", &StreamError{Message: msg}
+				}
+				return data, nil
+			}
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
 // choiceState 累积单个 choice（index）的增量内容。
 type choiceState struct {
 	index     int
@@ -327,14 +369,10 @@ func Aggregate(r io.Reader, fallbackModel string) ([]byte, error) {
 		if json.Unmarshal([]byte(data), &chunk) != nil {
 			return nil
 		}
-		// 流中错误事件：上游以 200 + SSE 的形式回报失败（状态码上看不出来）。
-		// 必须确认真的带了错误文案才当成错误——某些上游的正常 chunk 可能带
-		// "error": null 或空对象，若不分青红皂白地当成失败，会凭空把一次成功的
-		// 请求打成错误返回。
-		if env, ok := chunk["error"]; ok && env != nil {
-			if msg, ok := extractErrorText(env); ok {
-				return &StreamError{Message: msg}
-			}
+		// 流中错误事件：上游以 200 + SSE 的形式回报失败（状态码看不出来）。
+		// 判定规则见 StreamEventError——只认真的带了错误文案的帧。
+		if msg, ok := StreamEventError(data); ok {
+			return &StreamError{Message: msg}
 		}
 		if v, ok := chunk["id"].(string); ok && v != "" {
 			respID = v

@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/json"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -283,5 +284,43 @@ func TestOldConfigGainsNewPresets(t *testing.T) {
 	// 用户原有配置不被覆盖：开关与自定义字段保持原样。
 	if !byID["workbuddy"].Enabled || byID["codebuddy"].Enabled {
 		t.Fatal("升级不应改动既有上游的启用状态")
+	}
+}
+
+// intl 是国际版上游的别名，占用它会让 intl:模型名 的强制路由失效。
+// 错误信息必须点明「保留名」，而不是复用「不能为空 / 不能含分隔符」那条——
+// 后者会让用户一头雾水。
+func TestValidateVirtualModelRejectsIntl(t *testing.T) {
+	cfg := Default()
+	err := cfg.ValidateVirtualModel(VirtualModel{Name: "intl"}, "")
+	if err == nil {
+		t.Fatal("intl 应被拒绝")
+	}
+	if !strings.Contains(err.Error(), "保留") {
+		t.Errorf("错误信息应说明 intl 是保留名，实际 %q", err.Error())
+	}
+	// 大小写不同也应拒绝。
+	if err := cfg.ValidateVirtualModel(VirtualModel{Name: "INTL"}, ""); err == nil {
+		t.Fatal("INTL 也应被拒绝")
+	}
+}
+
+// 手写配置可能塞进与上游 ID 同名的虚拟组。normalize 必须丢弃它，
+// 否则 resolveRoute 的「虚拟组优先」会把该上游的裸模型名全部截走。
+func TestNormalizeDropsVirtualNameCollidingWithProvider(t *testing.T) {
+	cfg := Default()
+	cfg.VirtualModels = []VirtualModel{
+		{Name: "workbuddy", Enabled: true, Members: []VirtualMember{{Provider: "workbuddy", Model: "gpt-5.4"}}},
+		{Name: "ok", Enabled: true, Members: []VirtualMember{{Provider: "workbuddy", Model: "gpt-5.4"}}},
+	}
+	cfg.Normalize()
+
+	for _, vm := range cfg.VirtualModels {
+		if vm.Name == "workbuddy" {
+			t.Fatal("与上游 ID 同名的虚拟组应被丢弃")
+		}
+	}
+	if len(cfg.VirtualModels) != 1 || cfg.VirtualModels[0].Name != "ok" {
+		t.Errorf("合法的那条应保留，实际 %+v", cfg.VirtualModels)
 	}
 }

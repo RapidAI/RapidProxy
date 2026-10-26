@@ -12,6 +12,9 @@ const S = {
   modelProvider: '', // 模型页的上游筛选：'' 表示全部上游，否则是 providerId
   dirty: false,
   stats: { period: 'day', provider: '', model: '' },
+  // 虚拟模型编辑器：editing 是正在编辑的原组名（新建时为空串），
+  // members 是编辑器里那份可增删改的成员副本（保存前不落库）。
+  vm: { editing: '', members: [] },
 };
 
 // OpenCode 密钥提交进行中：后端会联机校验，期间要挡住轮询刷新重复放开按钮。
@@ -458,7 +461,12 @@ function renderModels() {
   models.forEach((m) => {
     const row = el('tr');
     row.appendChild(el('td', 'mono', m.id));
-    row.appendChild(el('td', null, m.name || '-'));
+    // 虚拟组没有独立的展示名（后端只回组名），按当前语言补一个后缀说明，
+    // 避免它在表格里看起来和真实模型毫无区别。
+    const nameCell = el('td');
+    nameCell.appendChild(document.createTextNode(m.name || '-'));
+    if (m.virtual) nameCell.appendChild(el('span', 'tag on vm-tag', t('models.virtualTag')));
+    row.appendChild(nameCell);
     const pcell = el('td');
     pcell.appendChild(el('span', 'tag on', m.provider || '-'));
     row.appendChild(pcell);
@@ -529,6 +537,260 @@ async function copyRaw(value) {
     toast(t('toast.copied'));
   } catch (err) {
     toast(t('toast.copyFailedFmt', { err: String(err) }));
+  }
+}
+
+/* --------------------------- 虚拟模型组 --------------------------- */
+
+/* 上次渲染虚拟组列表的签名：数据没变就不重建，避免 20 秒轮询把用户
+ * 正在点的按钮或刚展开的编辑区打断。 */
+let _vmListSig = '';
+
+function renderVirtualModels() {
+  const list = $('vm-list');
+  if (!list) return;
+  const vms = (S.state && S.state.virtualModels) || [];
+  // 真实模型 ID 集合：用来提示「组名已被某个真实模型占用」。
+  const modelIDs = new Set(((S.state && S.state.models) || []).filter((m) => !m.virtual).map((m) => m.id));
+  const sig = [I18N.lang, JSON.stringify(vms), Array.from(modelIDs).join(',')].join('|');
+  if (sig !== _vmListSig) {
+    _vmListSig = sig;
+    list.innerHTML = '';
+    if (!vms.length) {
+      list.appendChild(el('div', 'empty', t('vm.empty')));
+    }
+    vms.forEach((vm) => {
+      const item = el('div', 'vm-item' + (vm.enabled ? '' : ' off'));
+      const head = el('div', 'vm-item-head');
+      head.appendChild(el('span', 'vm-item-name', vm.name));
+
+      const ops = el('div', 'ops');
+      // 可用成员数：0 表示这个组此刻一条路都走不通，用警示色标出来。
+      const total = (vm.members || []).length;
+      ops.appendChild(el('span', 'tag' + (vm.available > 0 ? ' on' : ' warn'),
+        t('vm.availableFmt', { n: vm.available, total: total })));
+      ops.appendChild(el('span', 'tag' + (vm.enabled ? ' on' : ''), vm.enabled ? t('tag.enabled') : t('tag.disabled')));
+      // 组名与某个真实模型 ID 相同时，模型页会显示真实模型（列表里不重复列出），
+      // 这里说明一下，免得用户以为自己的组没生效。
+      if (modelIDs.has(vm.name)) {
+        ops.appendChild(el('span', 'tag warn', t('vm.nameTaken')));
+      }
+
+      const edit = el('button', 'btn btn-mini', t('btn.edit'));
+      edit.onclick = () => openVirtualEditor(vm.name);
+      ops.appendChild(edit);
+
+      const del = el('button', 'btn btn-mini btn-danger', t('btn.delete'));
+      del.onclick = () => deleteVirtualModel(vm.name);
+      ops.appendChild(del);
+      head.appendChild(ops);
+      item.appendChild(head);
+
+      const members = el('div', 'vm-item-members');
+      (vm.members || []).forEach((m) => {
+        // 不可用的成员划掉：用户一眼能看出「配了 3 个，实际只有 2 个在跑」。
+        const chip = el('span', 'vm-member-chip' + (m.available ? '' : ' down'),
+          m.providerName + ' · ' + m.model);
+        if (m.weight > 1) chip.appendChild(el('span', 'w', '×' + m.weight));
+        members.appendChild(chip);
+      });
+      if (total === 0) members.appendChild(el('span', 'hint', t('vm.noMembers')));
+      item.appendChild(members);
+      list.appendChild(item);
+    });
+  }
+  // 正在编辑的组若已不存在（被另一个窗口删除、配置被手改），编辑器要收起来：
+  // 否则保存时会报「不存在」，而用户看着一个正常打开的编辑面板无法理解。
+  if (S.vm.editing && !vms.some((v) => v.name === S.vm.editing)) {
+    closeVirtualEditor();
+    toast(t('vm.editor.vanished'));
+  }
+  renderVirtualEditorSelects();
+}
+
+/* 编辑器里的「上游 → 模型」下拉：只列出已启用且已登录的上游，
+ * 因为未登录的上游加入组里也永远选不中。 */
+function renderVirtualEditorSelects() {
+  const pSel = $('vm-add-provider');
+  if (!pSel) return;
+  const providers = ((S.state && S.state.providers) || []).filter((p) => p.enabled);
+  const sig = [I18N.lang, providers.map((p) => p.id + ':' + p.name + ':' + p.accountCount).join(',')].join('|');
+  if (pSel._sig !== sig) {
+    pSel._sig = sig;
+    const prev = pSel.value;
+    pSel.innerHTML = '';
+    providers.forEach((p) => {
+      const o = el('option');
+      o.value = p.id;
+      o.textContent = p.name + (p.accountCount ? '' : ' ' + t('vm.notLogged'));
+      o.disabled = !p.accountCount;
+      pSel.appendChild(o);
+    });
+    const firstUsable = providers.find((p) => p.accountCount);
+    pSel.value = (prev && providers.some((p) => p.id === prev && p.accountCount))
+      ? prev
+      : (firstUsable ? firstUsable.id : '');
+  }
+  renderVirtualModelOptions();
+}
+
+/* 按当前选中的上游填充模型下拉。 */
+function renderVirtualModelOptions() {
+  const pSel = $('vm-add-provider');
+  const mSel = $('vm-add-model');
+  if (!pSel || !mSel) return;
+  const pid = pSel.value;
+  // 模型名取「该上游的原始模型 ID」：state.models 里的 ID 在多上游场景下
+  // 可能带 "intl:" 或 "上游ID:" 前缀，而成员存的是原始 ID。
+  const models = ((S.state && S.state.models) || [])
+    .filter((m) => m.providerId === pid && !m.virtual)
+    .map((m) => rawModelID(m, pid));
+  const sig = [pid, models.join(',')].join('|');
+  if (mSel._sig === sig) return;
+  mSel._sig = sig;
+  mSel.innerHTML = '';
+  models.forEach((id) => {
+    const o = el('option');
+    o.value = id;
+    o.textContent = id;
+    mSel.appendChild(o);
+  });
+}
+
+/* 把对外暴露的模型 ID 还原成该上游的原始 ID。
+ * 多上游场景下 intl 前缀、上游ID 前缀都会被剥掉；单上游时原样返回。 */
+function rawModelID(m, providerID) {
+  const id = m.id || '';
+  const cut = id.indexOf(':');
+  if (cut <= 0) return id;
+  const prefix = id.slice(0, cut);
+  if (prefix === 'intl' || prefix === providerID) return id.slice(cut + 1);
+  return id;
+}
+
+function openVirtualEditor(name) {
+  const vms = (S.state && S.state.virtualModels) || [];
+  const vm = name ? vms.find((v) => v.name === name) : null;
+  S.vm.editing = vm ? vm.name : '';
+  S.vm.members = vm
+    ? vm.members.map((m) => ({ provider: m.provider, providerName: m.providerName, model: m.model, weight: m.weight }))
+    : [];
+  $('vm-editor').classList.remove('hidden');
+  $('vm-editor-title').textContent = vm ? t('vm.editor.edit') : t('vm.editor.new');
+  $('vm-editor-hint').textContent = vm ? t('vm.editor.editHint') : '';
+  $('vm-name').value = vm ? vm.name : '';
+  $('vm-enabled').checked = vm ? vm.enabled : true;
+  $('vm-editor-msg').textContent = '';
+  renderVirtualMembers();
+  renderVirtualEditorSelects();
+  $('vm-name').focus();
+}
+
+function closeVirtualEditor() {
+  $('vm-editor').classList.add('hidden');
+  S.vm.editing = '';
+  S.vm.members = [];
+}
+
+function renderVirtualMembers() {
+  const wrap = $('vm-members');
+  if (!wrap) return;
+  wrap.innerHTML = '';
+  if (!S.vm.members.length) {
+    wrap.appendChild(el('div', 'empty', t('vm.editor.noMembers')));
+    return;
+  }
+  S.vm.members.forEach((m, index) => {
+    const row = el('div', 'vm-member-row');
+    const who = el('span', 'who');
+    who.appendChild(document.createTextNode(m.providerName + ' · '));
+    who.appendChild(el('em', null, m.model));
+    row.appendChild(who);
+
+    const weight = el('input', 'input weight');
+    weight.type = 'number';
+    weight.min = '1';
+    weight.value = String(m.weight || 1);
+    weight.title = t('vm.weight');
+    weight.oninput = () => {
+      S.vm.members[index].weight = Math.max(1, parseInt(weight.value, 10) || 1);
+    };
+    row.appendChild(weight);
+
+    const del = el('button', 'btn btn-mini btn-danger', t('btn.delete'));
+    del.onclick = () => {
+      S.vm.members.splice(index, 1);
+      renderVirtualMembers();
+    };
+    row.appendChild(del);
+    wrap.appendChild(row);
+  });
+}
+
+function addVirtualMember() {
+  const pSel = $('vm-add-provider');
+  const pid = pSel.value;
+  const model = $('vm-add-model').value;
+  // 区分「还没选」和「压根没有可选上游」：后者是登录/启用状态问题，
+  // 提示「请先选择」会让用户在下拉里反复找不存在的选项。
+  if (!pSel.options.length) return toast(t('vm.editor.noProvider'));
+  if (!pid || !model) return toast(t('vm.editor.pickFirst'));
+  // 同一 (上游, 模型) 只允许出现一次：重复加入不会让流量翻倍，
+  // 只会让权重语义变得难以理解。
+  if (S.vm.members.some((m) => m.provider === pid && m.model === model)) {
+    return toast(t('vm.editor.duplicate'));
+  }
+  const provider = ((S.state && S.state.providers) || []).find((p) => p.id === pid);
+  S.vm.members.push({
+    provider: pid,
+    providerName: provider ? provider.name : pid,
+    model: model,
+    weight: Math.max(1, parseInt($('vm-add-weight').value, 10) || 1),
+  });
+  renderVirtualMembers();
+}
+
+async function saveVirtualModel() {
+  const name = $('vm-name').value.trim();
+  if (!name) return toast(t('vm.editor.nameRequired'));
+  // 与后端 config.ValidVirtualName 保持同一套规则：: 和 / 是强制路由分隔符，
+  // 空白会让日志与统计难以辨认，intl 是国际版上游的别名。
+  if (/[:/\s]/.test(name)) return toast(t('vm.editor.badName'));
+  if (name.toLowerCase() === 'intl') return toast(t('vm.editor.reservedName'));
+  if (!S.vm.members.length) return toast(t('vm.editor.needMember'));
+
+  const input = {
+    name: name,
+    enabled: $('vm-enabled').checked,
+    originalName: S.vm.editing,
+    members: S.vm.members.map((m) => ({ provider: m.provider, model: m.model, weight: m.weight })),
+  };
+  $('btn-vm-save').disabled = true;
+  $('vm-editor-msg').textContent = t('save.saving');
+  try {
+    await call('SaveVirtualModel', input);
+    $('vm-editor-msg').textContent = '';
+    toast(t('vm.saved'));
+    closeVirtualEditor();
+    await refresh();
+  } catch (err) {
+    const msg = t('toast.opFailedFmt', { err: String(err) });
+    $('vm-editor-msg').textContent = msg;
+    toast(msg);
+  } finally {
+    $('btn-vm-save').disabled = false;
+  }
+}
+
+async function deleteVirtualModel(name) {
+  if (!confirm(t('vm.confirmDeleteFmt', { name: name }))) return;
+  try {
+    await call('DeleteVirtualModel', name);
+    toast(t('vm.deleted'));
+    if (S.vm.editing === name) closeVirtualEditor();
+    await refresh();
+  } catch (err) {
+    toast(t('toast.opFailedFmt', { err: String(err) }));
   }
 }
 
@@ -610,7 +872,10 @@ function renderSettings() {
 
 /* 构建「组 → 模型」的下拉选项：来源既包含已同步的模型（S.state.models），
  * 也包含历史上产生过流量的 (组, 模型) 组合（scopes），这样即使某模型当前被停用，
- * 也能回看它的历史流量。 */
+ * 也能回看它的历史流量。
+ *
+ * 虚拟模型组作为独立的组列出（值形如 "virtual:<组名>"）：它有自己的流量维度，
+ * 与真实上游并列供用户切换观察。 */
 function buildStatsOptions(scopes) {
   const providers = [];
   const modelsByProvider = {};
@@ -630,12 +895,37 @@ function buildStatsOptions(scopes) {
   };
 
   (S.state && S.state.providers || []).forEach((p) => ensureProvider(p.id, p.name));
-  (S.state && S.state.models || []).forEach((m) => ensureModel(m.providerId || m.provider, m.id));
-  (scopes || []).forEach((s) => ensureModel(s.provider, s.model));
+  (S.state && S.state.models || []).forEach((m) => {
+    if (m.virtual) return; // 虚拟组的成员明细来自它自己的维度，不混进真实上游
+    ensureModel(m.providerId || m.provider, m.id);
+  });
+  // 已配置的虚拟组即使还没有流量也要出现在下拉里：否则用户新建一个组后
+  // 在统计页根本选不到它，看到的是「这个组不存在」而不是「它还没跑过请求」。
+  (S.state && S.state.virtualModels || []).forEach((vm) => {
+    ensureProvider(virtualStatsValue(vm.name), t('stats.virtualFmt', { name: vm.name }));
+  });
+  (scopes || []).forEach((s) => {
+    if (s.kind === 'virtual') {
+      // 虚拟组只作为一个整体出现，model 恒为空（成员明细单独展示）。
+      ensureProvider(virtualStatsValue(s.provider), t('stats.virtualFmt', { name: s.provider }));
+      return;
+    }
+    ensureModel(s.provider, s.model);
+  });
 
-  providers.sort((a, b) => a.label.localeCompare(b.label));
+  providers.sort((a, b) => {
+    // 真实上游在前、虚拟组在后，与模型页的呈现顺序一致。
+    const av = a.value.startsWith('virtual:');
+    const bv = b.value.startsWith('virtual:');
+    if (av !== bv) return av ? 1 : -1;
+    return a.label.localeCompare(b.label);
+  });
   return { providers: providers, modelsByProvider: modelsByProvider };
 }
+
+/* 统计页里虚拟组的取值前缀：与后端 stats.VirtualKey 保持一致。 */
+const VIRTUAL_STATS_PREFIX = 'virtual:';
+const virtualStatsValue = (name) => VIRTUAL_STATS_PREFIX + name;
 
 /* 用 items 重建 select，尽量保留 sel 当前选中的值（若仍存在于新选项里）。 */
 function fillStatsSelect(sel, items, selectedValue, allLabel) {
@@ -731,9 +1021,19 @@ async function renderStatsOnce() {
   syncStatsSelect(providerSel, opts.providers, S.stats.provider);
   S.stats.provider = providerSel.value;
 
-  const models = opts.modelsByProvider[S.stats.provider] || [];
-  syncStatsSelect(modelSel, models, S.stats.model, t('stats.allModels'));
-  S.stats.model = modelSel.value;
+  // 虚拟组没有「按成员筛选」的下拉（成员明细单独一张表），把模型选择禁用并
+  // 只留「全部模型」一项，避免出现一个永远选不出东西的空下拉让人以为坏了。
+  // 必须在填充模型下拉之前判断：否则会先塞进一批真实模型再禁用，视觉上闪一下。
+  const isVirtual = S.stats.provider.startsWith(VIRTUAL_STATS_PREFIX);
+  modelSel.disabled = isVirtual;
+  if (isVirtual) {
+    S.stats.model = '';
+    syncStatsSelect(modelSel, [], '', t('stats.allModels'));
+  } else {
+    const models = opts.modelsByProvider[S.stats.provider] || [];
+    syncStatsSelect(modelSel, models, S.stats.model, t('stats.allModels'));
+    S.stats.model = modelSel.value;
+  }
 
   // 当前筛选条件。取数失败时用它判断能否沿用上次画面：筛选没变才保留，
   // 否则界面会「显示周、画着日」，比闪烁更误导。
@@ -762,6 +1062,7 @@ async function renderStatsOnce() {
     $('stats-chart').innerHTML = '';
     $('stats-empty').textContent = t('stats.noData');
     $('stats-empty').classList.remove('hidden');
+    renderStatsMembers(null);
     return;
   }
 
@@ -769,6 +1070,9 @@ async function renderStatsOnce() {
     res.series.every((p) => !p.in && !p.out && !p.total);
   $('stats-empty').classList.toggle('hidden', !empty);
   $('stats-chart').classList.toggle('hidden', empty);
+  // 成员分摊表独立于周期趋势：它展示的是全时段累计，即使当前周期
+  // 没有流量也照样有意义（用户切到「日」时仍想知道长期分摊是否均衡）。
+  renderStatsMembers(res.members);
   if (empty) {
     $('stats-cards').innerHTML = '';
     $('stats-chart').innerHTML = '';
@@ -780,6 +1084,31 @@ async function renderStatsOnce() {
     ? (res.startLabel + '  ' + t('stats.to') + '  ' + res.endLabel)
     : '';
   renderTrafficChart($('stats-chart'), res);
+}
+
+/* 渲染虚拟组的成员分摊表；members 为空（或不是虚拟组）时整张卡片隐藏。 */
+function renderStatsMembers(members) {
+  const card = $('stats-members-card');
+  const body = $('stats-members-body');
+  if (!card || !body) return;
+  if (!members || !members.length) {
+    card.classList.add('hidden');
+    return;
+  }
+  card.classList.remove('hidden');
+  body.innerHTML = '';
+  const total = members.reduce((acc, m) => acc + (m.total || 0), 0);
+  members.forEach((m) => {
+    const row = el('tr');
+    row.appendChild(el('td', 'mono', m.provider + ' · ' + m.model));
+    row.appendChild(el('td', 'mono', String(m.count || 0)));
+    row.appendChild(el('td', 'mono', formatTokens(m.in)));
+    row.appendChild(el('td', 'mono', formatTokens(m.out)));
+    row.appendChild(el('td', 'mono', formatTokens(m.total)));
+    const share = total > 0 ? Math.round(((m.total || 0) / total) * 100) : 0;
+    row.appendChild(el('td', 'mono', share + '%'));
+    body.appendChild(row);
+  });
 }
 
 function renderStatCards(sum) {
@@ -941,6 +1270,7 @@ function renderAll() {
   renderLoginProviders();
   renderAccounts();
   renderModels();
+  renderVirtualModels();
   renderSettings();
   // 流量统计不走这里：它由自己的定时器负责（见 syncStatsAutoRefresh），
   // 只在统计页激活时每几秒刷新一次。
@@ -1187,6 +1517,18 @@ function bindUI() {
     node.addEventListener('change', () => { S.dirty = true; });
   });
   $('btn-save').onclick = saveSettings;
+
+  // 虚拟模型组
+  $('btn-vm-new').onclick = () => openVirtualEditor('');
+  $('btn-vm-cancel').onclick = () => closeVirtualEditor();
+  $('btn-vm-save').onclick = () => saveVirtualModel();
+  $('btn-vm-add-member').onclick = () => addVirtualMember();
+  $('vm-add-provider').onchange = () => {
+    // 换上游后模型列表整批变化，强制重建（清掉签名）。
+    const mSel = $('vm-add-model');
+    if (mSel) mSel._sig = '';
+    renderVirtualModelOptions();
+  };
 
   $('btn-add-key').onclick = async () => {
     const value = $('new-key').value.trim();

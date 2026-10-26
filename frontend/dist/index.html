@@ -21,6 +21,7 @@
         <button class="nav-item active" data-tab="overview"><span class="nav-dot"></span><span data-i18n="nav.overview">概览</span></button>
         <button class="nav-item" data-tab="accounts"><span class="nav-dot"></span><span data-i18n="nav.accounts">账号</span></button>
         <button class="nav-item" data-tab="models"><span class="nav-dot"></span><span data-i18n="nav.models">模型</span></button>
+        <button class="nav-item" data-tab="virtual"><span class="nav-dot"></span><span data-i18n="nav.virtual">虚拟模型</span></button>
         <button class="nav-item" data-tab="stats"><span class="nav-dot"></span><span data-i18n="nav.stats">流量统计</span></button>
         <button class="nav-item" data-tab="settings"><span class="nav-dot"></span><span data-i18n="nav.settings">设置</span></button>
         <button class="nav-item" data-tab="about"><span class="nav-dot"></span><span data-i18n="nav.about">关于</span></button>
@@ -196,6 +197,56 @@
           </div>
         </section>
 
+        <!-- 虚拟模型 -->
+        <section class="tab" id="tab-virtual">
+          <div class="card">
+            <div class="card-head">
+              <h2 data-i18n="vm.title">虚拟模型组</h2>
+              <div class="row-actions">
+                <button class="btn btn-primary btn-mini" id="btn-vm-new" data-i18n="vm.new">新建虚拟组</button>
+              </div>
+            </div>
+            <span class="hint" data-i18n="vm.hint">用一个自定义模型名聚合多个上游的模型：客户端只请求这个名字，代理在组内按权重分摊，某个成员不可用时自动跳过。名字里不能含 : / 或空格。</span>
+            <div class="vm-list" id="vm-list"></div>
+          </div>
+
+          <div class="card hidden" id="vm-editor">
+            <div class="card-head">
+              <h2 id="vm-editor-title" data-i18n="vm.editor.new">新建虚拟组</h2>
+              <span class="hint" id="vm-editor-hint"></span>
+            </div>
+            <div class="form-grid">
+              <label class="form-item">
+                <span data-i18n="vm.name">虚拟模型名</span>
+                <input class="input" id="vm-name" data-i18n-ph="vm.namePh" placeholder="例如 fast" />
+                <em data-i18n="vm.nameHint">客户端请求时填写的 model 字段</em>
+              </label>
+              <label class="form-item">
+                <span data-i18n="vm.enabled">启用</span>
+                <label class="switch"><input type="checkbox" id="vm-enabled" /><span data-i18n="vm.enabledHint">启用后才会出现在模型列表中</span></label>
+              </label>
+            </div>
+
+            <div class="vm-members-head">
+              <strong data-i18n="vm.members">成员</strong>
+              <span class="hint" data-i18n="vm.membersHint">成员按权重分摊流量，权重越大分到越多</span>
+            </div>
+            <div class="vm-members" id="vm-members"></div>
+            <div class="vm-add-row">
+              <select class="input" id="vm-add-provider"></select>
+              <select class="input" id="vm-add-model"></select>
+              <input class="input vm-weight" id="vm-add-weight" type="number" min="1" value="1" data-i18n-title="vm.weight" title="权重" />
+              <button class="btn btn-mini" id="btn-vm-add-member" data-i18n="vm.addMember">添加成员</button>
+            </div>
+
+            <div class="row-actions vm-editor-actions">
+              <button class="btn btn-primary" id="btn-vm-save" data-i18n="vm.save">保存</button>
+              <button class="btn btn-ghost" id="btn-vm-cancel" data-i18n="btn.cancel">取消</button>
+              <span class="hint" id="vm-editor-msg"></span>
+            </div>
+          </div>
+        </section>
+
         <!-- 流量统计 -->
         <section class="tab" id="tab-stats">
           <div class="card">
@@ -221,6 +272,28 @@
           </div>
 
           <div class="stat-cards" id="stats-cards"></div>
+
+          <div class="card hidden" id="stats-members-card">
+            <div class="card-head">
+              <h2 data-i18n="stats.members.title">组内成员分摊</h2>
+              <span class="hint" data-i18n="stats.members.hint">该虚拟组各成员承接的流量（全时段累计）</span>
+            </div>
+            <div class="table-wrap">
+              <table class="table">
+                <thead>
+                  <tr>
+                    <th data-i18n="th.member">成员</th>
+                    <th data-i18n="th.requests">请求数</th>
+                    <th data-i18n="th.in">输入</th>
+                    <th data-i18n="th.out">输出</th>
+                    <th data-i18n="th.total">合计</th>
+                    <th data-i18n="th.share">占比</th>
+                  </tr>
+                </thead>
+                <tbody id="stats-members-body"></tbody>
+              </table>
+            </div>
+          </div>
 
           <div class="card">
             <div class="card-head">

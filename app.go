@@ -42,7 +42,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.5.1"
+const Version = "1.6.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -116,6 +116,45 @@ type ModelView struct {
 	// 多个账号时同名模型会在它们之间按权重分摊，这个数字就是分摊的宽度。
 	Accounts      int `json:"accounts"`
 	TotalAccounts int `json:"totalAccounts"`
+	// Virtual 为 true 表示这是一条虚拟模型组条目（ProviderID 恒为 "virtual"）。
+	Virtual bool `json:"virtual,omitempty"`
+}
+
+// VirtualMemberView 是虚拟组里的一个成员。
+type VirtualMemberView struct {
+	Provider     string `json:"provider"`
+	ProviderName string `json:"providerName"`
+	Model        string `json:"model"`
+	Weight       int    `json:"weight"`
+	// Accounts 是该成员此刻可承接请求的账号数，0 表示这条路径暂时走不通。
+	Accounts int `json:"accounts"`
+	// Available 为 true 表示该成员现在能被选中（上游启用、已登录、有可用账号）。
+	Available bool `json:"available"`
+}
+
+// VirtualModelView 是虚拟模型组。
+type VirtualModelView struct {
+	Name    string              `json:"name"`
+	Enabled bool                `json:"enabled"`
+	Members []VirtualMemberView `json:"members"`
+	// Available 是此刻可承接请求的成员数。
+	Available int `json:"available"`
+}
+
+// VirtualMemberInput 是保存虚拟组时的成员入参。
+type VirtualMemberInput struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	Weight   int    `json:"weight"`
+}
+
+// VirtualModelInput 是保存虚拟组的入参。
+type VirtualModelInput struct {
+	Name    string               `json:"name"`
+	Enabled bool                 `json:"enabled"`
+	Members []VirtualMemberInput `json:"members"`
+	// OriginalName 非空表示这是对已有组的修改（允许改名）。
+	OriginalName string `json:"originalName"`
 }
 
 // SettingsView 是设置面板数据。
@@ -148,9 +187,11 @@ type StateView struct {
 	Providers  []ProviderView `json:"providers"`
 	Accounts   []AccountView  `json:"accounts"`
 	Models     []ModelView    `json:"models"`
-	Settings   SettingsView   `json:"settings"`
-	Logs       []string       `json:"logs"`
-	Login      LoginView      `json:"login"`
+	// VirtualModels 是用户自定义的虚拟模型组。
+	VirtualModels []VirtualModelView `json:"virtualModels"`
+	Settings      SettingsView       `json:"settings"`
+	Logs          []string           `json:"logs"`
+	Login         LoginView          `json:"login"`
 }
 
 // LoginView 是登录流程状态。
@@ -633,7 +674,10 @@ func (a *App) GetState() StateView {
 	}
 	view.Providers = a.providerViews(creds)
 	view.Accounts = a.accountViews(creds)
-	view.Models = a.modelViews()
+	// 虚拟组只算一次，模型列表直接复用：两边都要「可用成员数」，
+	// 各算一遍会把凭据扫描与冷却查询翻倍。
+	view.VirtualModels = a.virtualModelViews()
+	view.Models = a.modelViews(view.VirtualModels)
 	view.Settings = SettingsView{
 		Listen:         cfg.Listen,
 		ModelSyncHours: cfg.ModelSyncHours,
@@ -757,17 +801,40 @@ func (a *App) accountViews(creds []*upstream.Credential) []AccountView {
 	return out
 }
 
-func (a *App) modelViews() []ModelView {
+// modelViews 构建模型列表。virtuals 是已算好的虚拟组视图（见 GetState），
+// 虚拟条目的可用成员数直接取用，避免重复扫描凭据。
+func (a *App) modelViews(virtuals []VirtualModelView) []ModelView {
 	cfg := a.settings()
 	names := map[string]string{}
 	for _, p := range cfg.Profiles {
 		names[p.ID] = p.Name
+	}
+	byName := make(map[string]VirtualModelView, len(virtuals))
+	for _, vm := range virtuals {
+		byName[vm.Name] = vm
 	}
 	models := a.srv.AllModels()
 	// 账号统计按上游缓存：同一个版本的模型共用一组账号。
 	stats := map[string]struct{ avail, total int }{}
 	out := make([]ModelView, 0, len(models))
 	for _, m := range models {
+		// 虚拟组条目没有真实上游账号，可用宽度是「有几个成员能接」。
+		if m.Provider == "virtual" {
+			vm := byName[m.ID]
+			out = append(out, ModelView{
+				ID:            m.ID,
+				Name:          m.DisplayName,
+				Provider:      a.virtualProviderLabel(),
+				ProviderID:    "virtual",
+				Context:       m.ContextLength,
+				MaxOut:        m.MaxOutputTokens,
+				Images:        m.SupportsImages,
+				Accounts:      vm.Available,
+				TotalAccounts: len(vm.Members),
+				Virtual:       true,
+			})
+			continue
+		}
 		st, ok := stats[m.Provider]
 		if !ok {
 			st.avail, st.total = a.srv.AccountStats(m.Provider)
@@ -786,6 +853,143 @@ func (a *App) modelViews() []ModelView {
 		})
 	}
 	return out
+}
+
+// virtualProviderLabel 返回虚拟组在界面上显示的上游名。
+func (a *App) virtualProviderLabel() string {
+	if locale.Current() == locale.En {
+		return "Virtual group"
+	}
+	return "虚拟组"
+}
+
+// virtualModelViews 构建虚拟组列表（含每个成员的实时可用状态）。
+func (a *App) virtualModelViews() []VirtualModelView {
+	cfg := a.settings()
+	names := map[string]string{}
+	enabled := make(map[string]bool, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		names[p.ID] = p.Name
+		enabled[p.ID] = p.Enabled
+	}
+	// 账号可用数按上游缓存：一个组里常有多个成员来自同一上游，
+	// 每个成员各查一次会重复扫凭据（虽有 2 秒缓存，但没必要）。
+	type avail struct{ n int }
+	avails := map[string]avail{}
+
+	out := make([]VirtualModelView, 0, len(cfg.VirtualModels))
+	for _, vm := range cfg.VirtualModels {
+		view := VirtualModelView{Name: vm.Name, Enabled: vm.Enabled}
+		view.Members = make([]VirtualMemberView, 0, len(vm.Members))
+		for _, m := range vm.Members {
+			mv := VirtualMemberView{
+				Provider:     m.Provider,
+				ProviderName: names[m.Provider],
+				Model:        m.Model,
+				Weight:       m.EffectiveWeight(),
+			}
+			if mv.ProviderName == "" {
+				mv.ProviderName = m.Provider
+			}
+			av, ok := avails[m.Provider]
+			if !ok {
+				av.n, _ = a.srv.AccountStats(m.Provider)
+				avails[m.Provider] = av
+			}
+			mv.Accounts = av.n
+			mv.Available = enabled[m.Provider] && av.n > 0
+			if mv.Available {
+				view.Available++
+			}
+			view.Members = append(view.Members, mv)
+		}
+		out = append(out, view)
+	}
+	return out
+}
+
+// SaveVirtualModel 新增或修改一个虚拟模型组。
+//
+// input.OriginalName 非空时表示修改已有组（允许改名）；改名时历史流量
+// 一并迁移，否则用户会看到新组从零开始、旧数据又选不到。
+func (a *App) SaveVirtualModel(input VirtualModelInput) error {
+	cfg := a.settings().Clone()
+
+	vm := config.VirtualModel{Name: strings.TrimSpace(input.Name), Enabled: input.Enabled}
+	for _, m := range input.Members {
+		vm.Members = append(vm.Members, config.VirtualMember{
+			Provider: strings.TrimSpace(m.Provider),
+			Model:    strings.TrimSpace(m.Model),
+			Weight:   m.Weight,
+		})
+	}
+
+	original := strings.TrimSpace(input.OriginalName)
+	if err := cfg.UpsertVirtualModel(vm, original); err != nil {
+		return err
+	}
+	if err := cfg.Save(); err != nil {
+		a.log.Errorf("保存虚拟模型失败: %v", err)
+		return err
+	}
+
+	// 顺序很重要：先把旧名的历史流量搬到新名下，再让新配置生效。
+	//
+	// 反过来的话会有一个窗口：新配置已经对外可见（新名字开始接流量），
+	// 而 RenameVirtual 随后才把旧名整段删掉——若新名恰好等于某个刚被
+	// 删除的旧组名，或改名瞬间有请求落到新键上，这段新数据会被
+	// RenameVirtual 的 delete 一并抹掉。先迁移再切配置，窗口就不存在。
+	renamed := original != "" && original != vm.Name
+	if renamed {
+		if st := a.srv.Stats(); st != nil {
+			st.RenameVirtual(original, vm.Name)
+		}
+		// 两个名字的状态都要清：旧名的偏移对新名没有意义，而新名若曾经
+		// 是个被删掉的组，表里可能还留着它的历史偏移——不清会让新组
+		// 一开始的分配明显偏向某个成员。
+		a.srv.ClearVirtualState(original)
+		a.srv.ClearVirtualState(vm.Name)
+	}
+
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+	a.srv.SetConfig(cfg)
+
+	if renamed {
+		a.log.Infof("虚拟模型 %s 已改名为 %s", original, vm.Name)
+	} else {
+		// 成员或权重可能变了：清掉分摊状态，避免旧偏移让分配短期倾斜。
+		a.srv.ClearVirtualState(vm.Name)
+		a.log.Infof("虚拟模型 %s 已保存（%d 个成员）", vm.Name, len(vm.Members))
+	}
+	a.pushState()
+	return nil
+}
+
+// DeleteVirtualModel 删除一个虚拟模型组及其历史流量。
+func (a *App) DeleteVirtualModel(name string) error {
+	name = strings.TrimSpace(name)
+	cfg := a.settings().Clone()
+	if !cfg.RemoveVirtualModel(name) {
+		return fmt.Errorf("虚拟模型 %s 不存在", name)
+	}
+	if err := cfg.Save(); err != nil {
+		a.log.Errorf("删除虚拟模型失败: %v", err)
+		return err
+	}
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+	a.srv.SetConfig(cfg)
+	a.srv.ClearVirtualState(name)
+	// 一并清掉历史流量：否则「删掉再建同名组」会继承上一个组的数据。
+	if st := a.srv.Stats(); st != nil {
+		st.DropVirtual(name)
+	}
+	a.log.Infof("虚拟模型 %s 已删除", name)
+	a.pushState()
+	return nil
 }
 
 // GetLogs 返回最近日志。

@@ -482,3 +482,32 @@ html, body {
 .chart-legend { display: flex; gap: 16px; margin-bottom: 10px; flex-wrap: wrap; }
 .legend-item { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-muted); }
 .legend-chip { width: 12px; height: 4px; border-radius: 2px; display: inline-block; }
+
+/* ----------------------------- 虚拟模型组 ----------------------------- */
+
+.vm-list { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; }
+
+.vm-item { border: 1px solid var(--border); border-radius: var(--radius-sm); background: var(--panel-soft); padding: 12px 14px; }
+.vm-item.off { opacity: .62; }
+.vm-item-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.vm-item-name { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 14px; font-weight: 600; }
+.vm-item-head .ops { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.vm-item-members { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 9px; }
+.vm-member-chip { font-size: 11.5px; padding: 3px 9px; border-radius: 20px; background: var(--panel); border: 1px solid var(--border); color: var(--text-muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.vm-member-chip.down { opacity: .55; text-decoration: line-through; }
+.vm-member-chip .w { opacity: .6; margin-left: 4px; }
+
+.vm-members-head { display: flex; align-items: baseline; gap: 10px; margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+.vm-members { display: flex; flex-direction: column; gap: 8px; margin-top: 10px; }
+.vm-member-row { display: flex; align-items: center; gap: 10px; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 8px 12px; background: var(--panel-soft); }
+.vm-member-row .who { flex: 1 1 auto; min-width: 0; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.vm-member-row .who em { font-style: normal; color: var(--text-faint); }
+.vm-member-row .weight { width: 78px; flex: 0 0 auto; }
+
+.vm-add-row { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
+.vm-add-row select.input { max-width: 260px; }
+.vm-add-row .vm-weight { width: 90px; }
+.vm-editor-actions { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+
+/* 模型表格里虚拟组条目的行内标签 */
+.vm-tag { margin-left: 6px; }

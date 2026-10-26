@@ -40,6 +40,7 @@ Each signable provider is one **group**: accounts inside a group are served with
 - **In-group failure auto-skip**: whenever an account runs into trouble, the proxy moves to the next account in the group instead of passing the error to the client — rate limits / exhausted credits / upstream outages cool the account down and switch; "this account can't serve this request" errors (model not enabled, bad parameters…) switch without cooling; for streaming requests, an upstream that reports failure at the very first SSE event (HTTP 200 + error frame) also triggers a switch before a single byte is written downstream; when a window-limited error states its reset time in the message body (e.g. code=6004 "usage will reset at …"), the cooldown lasts until that moment instead of a few dozen seconds. Only after every account in the group has been tried does the last error come back with its original status code (retryable failures are summarized as 429 + Retry-After).
 - **Multi-provider routing**: use the bare model name (auto-matched), or prefix it with `provider:model` / `provider/model` (the International edition accepts the `intl:` shorthand); you can also force routing with the `X-RapidProxy-Provider` header (`intl` accepted) or `?provider=`, and pin an account with `X-RapidProxy-Account`.
 - **Multi-provider model disambiguation**: when several providers are enabled, International (workbuddy) models are listed as `intl:model`; for the remaining providers, a bare model name belongs to the first provider (config order) that exposes it, and every other provider's copy is listed as `provider:model`; with a single provider enabled, all IDs stay plain.
+- **Virtual model groups**: give a custom model name (e.g. `fast`) to a pool of models drawn from different providers. Clients request only that name; the proxy balances across members by weight and skips any member that is unavailable. Groups can be created, renamed, enabled/disabled and deleted, and they get their own traffic dimension plus a per-member distribution breakdown.
 - **API key auth**: multiple keys supported with one-click generation; with no key configured, requests are unauthenticated (recommended only for loopback listening).
 - **Built-in + auto-synced model list**: a built-in whitelist keeps models callable even when the upstream config endpoint under-reports; new upstream models are pulled periodically. Manual "extra models" and "disabled models" are also supported.
 - **Deep thinking & tool calls**: `hy3` models automatically request the highest reasoning effort; `delta.reasoning_content` is passed through; OpenAI-style `tool_calls` deltas are merged correctly by `index`.
@@ -57,13 +58,15 @@ Each signable provider is one **group**: accounts inside a group are served with
 
 ## UI Overview
 
-Four tabs in the left sidebar:
+Six tabs in the left sidebar:
 
 | Tab | Contents |
 |---|---|
 | **Overview** | Access info card (Base URL, API Key show/hide/regenerate, model list entry, curl example), service status, provider list, live logs |
 | **Accounts** | Pick a provider to sign in, copy the sign-in link, login status polling, manage/delete signed-in accounts |
 | **Models** | Available models (name, context length, output limit, source provider) with search and a manual "sync models" button |
+| **Virtual** | Manage virtual model groups: create / edit / rename / enable / delete, set member weights, and see live availability per member |
+| **Traffic** | Token usage by group (provider or virtual group) and model, switchable between day / week / month; selecting a virtual group also shows its per-member distribution |
 | **Settings** | Listen address, model auto-sync interval, sanitization / forced-thinking toggles, CORS toggle, provider on-off and proxy, API key management, data file locations |
 
 Top bar: status pill, listen address, "Minimize to tray", "Reset window", "Start/Stop service". "Quit" sits at the bottom of the sidebar.
@@ -189,6 +192,23 @@ curl ... -H "X-RapidProxy-Account: <account-id>" -d '{"model":"glm-5.3", ...}'
 - **Auto sync**: the upstream model list is pulled every 6 hours by default (change in Settings; `0` disables auto sync). New upstream models are added automatically.
 - **Extra / disabled models**: manage by model ID (comma-separated) under Settings → Providers.
 - **Deep thinking**: `hy3*` models automatically request the highest reasoning effort; the thinking text is returned in `reasoning_content`.
+
+### Virtual model groups
+
+A virtual model name pools models from several providers, so different vendors' models can behave as one availability pool:
+
+- **Create**: open the Virtual tab, pick a name (e.g. `fast`), then add models from providers that are enabled and signed in. Each member has its own weight (default 1; higher weight gets more traffic).
+- **Call it**: set `model` to the group name — it works exactly like a real model ID:
+
+  ```bash
+  curl http://127.0.0.1:8787/v1/chat/completions     -H "Authorization: Bearer sk-wbp-xxxx"     -d '{"model":"fast","messages":[{"role":"user","content":"hello"}]}'
+  ```
+
+- **Balancing and skipping**: members are served by smooth weighted round-robin. When a member as a whole is unavailable (provider disabled / not signed in / all accounts paused / all cooling down / the upstream does not accept that model), the request moves to the next member and the client never sees the error. Only after every member has been tried does the proxy return an error, following the existing rules (client errors keep their status code, retryable failures become 429 + Retry-After).
+- **Naming rules**: no `:`, `/` or spaces (both are force-routing separators), and the name must not collide with a provider ID or `intl`. If it collides with a real model ID, the virtual group wins.
+- **Precedence**: explicit force-routing (`provider:model`, `X-RapidProxy-Provider`, `?provider=`) takes precedence over a virtual group, so you can always bypass it temporarily.
+- **Traffic stats**: each group has its own dimension, while every request is still recorded against the real provider and real model (for reconciling upstream quota). Selecting a virtual group also shows the per-member breakdown.
+- **Rename and delete**: renaming migrates the traffic history to the new name; deleting clears the history so a later same-named group does not inherit old data.
 
 ---
 

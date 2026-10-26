@@ -135,7 +135,10 @@ func New(cfg *config.Config, st *store.Store, logger *applog.Logger) *Server {
 func (s *Server) Stats() *stats.Recorder { return s.stats }
 
 // recordUsage 把一次成功请求的 token 用量计入流量统计。
-func (s *Server) recordUsage(provider, model string, u stats.Usage) {
+//
+// virtualName 非空时同时记入虚拟组维度（见 stats.Entry.Virtual）：真实维度
+// 用于核对上游额度，虚拟维度用于观察别名维度的用量，两者各自累加。
+func (s *Server) recordUsage(provider, model, virtualName string, u stats.Usage) {
 	if s.stats == nil || !u.Observed {
 		return
 	}
@@ -146,6 +149,7 @@ func (s *Server) recordUsage(provider, model string, u stats.Usage) {
 		In:       u.In,
 		Out:      u.Out,
 		Total:    u.Total,
+		Virtual:  virtualName,
 	})
 }
 
@@ -492,6 +496,8 @@ type modelEntry struct {
 	// profileID 是目标上游；upstreamID 是转发给上游时使用的模型名。
 	profileID  string
 	upstreamID string
+	// virtualName 非空表示这是一条虚拟组条目（此时 profileID/upstreamID 为空）。
+	virtualName string
 }
 
 // modelEntries 汇总所有已登录上游的模型。
@@ -577,6 +583,100 @@ func (s *Server) buildModelEntries() []modelEntry {
 				upstreamID: m.ID,
 			})
 		}
+	}
+	out = append(out, s.virtualModelEntries(active, modelSets, out)...)
+	return out
+}
+
+// virtualModelEntries 把已启用、且有可用成员的虚拟组转成模型条目。
+//
+// 只有「至少一个成员的上游已登录」时才暴露：未登录时列出一个必然失败的
+// 模型名，只会让客户端在列表里看到一堆调不通的选项。这与真实模型
+// 「未登录上游不暴露模型」的既有约定一致。
+//
+// 元信息取成员中最宽的那份（上下文最大、输出上限最大、任一支持图片即支持）。
+//
+// active/modelSets 是调用方已经取好的「已登录上游 + 各自模型列表」，
+// 直接复用而不重新查：modelsFor 每次都走一遍凭据扫描，汇总在每次路由与
+// /v1/models 都会跑，重复取等于把这项开销翻倍。
+//
+// taken 是已产出的真实模型条目：虚拟名与某个真实模型 ID 相同时跳过。
+// 单上游场景下真实模型用裸名，与虚拟名撞车会让 /v1/models 出现重复 ID，
+// 客户端（以及按 ID 去重的客户端缓存）会拿到两条互相矛盾的条目。
+// 虚拟组本身仍然可路由——resolveRoute 里虚拟组优先，只是列表里不重复列。
+func (s *Server) virtualModelEntries(active []config.Profile, modelSets [][]upstream.ModelInfo, taken []modelEntry) []modelEntry {
+	cfg := s.Config()
+	vms := cfg.EnabledVirtualModels()
+	if len(vms) == 0 {
+		return nil
+	}
+	used := make(map[string]bool, len(taken))
+	for _, e := range taken {
+		used[e.ID] = true
+	}
+	// 已登录上游的模型索引：用来取成员元信息，也用来判断成员是否「真的存在」。
+	// 成员模型可能已从上游下线，那种条目在列表里显示出来毫无意义。
+	index := make(map[string]upstream.ModelInfo, len(active)*8)
+	for i, p := range active {
+		if i >= len(modelSets) {
+			break
+		}
+		for _, m := range modelSets[i] {
+			index[p.ID+"/"+m.ID] = m
+		}
+	}
+
+	out := make([]modelEntry, 0, len(vms))
+	for _, vm := range vms {
+		if used[vm.Name] {
+			continue
+		}
+		var best upstream.ModelInfo
+		usable := 0
+		for _, m := range vm.Members {
+			info, ok := index[m.Key()]
+			if !ok {
+				continue
+			}
+			if usable == 0 {
+				// 第一个可用成员提供基线（名称、创建时间等）。
+				//
+				// 不能每轮都整体赋值：后一个成员的较小值会把前面的较大值
+				// 冲掉，最终结果取决于成员顺序而不是真实能力。
+				best = info
+			}
+			usable++
+			if info.ContextLength > best.ContextLength {
+				best.ContextLength = info.ContextLength
+			}
+			if info.MaxOutputTokens > best.MaxOutputTokens {
+				best.MaxOutputTokens = info.MaxOutputTokens
+			}
+			if info.SupportsImages {
+				best.SupportsImages = true
+			}
+		}
+		if usable == 0 {
+			continue
+		}
+		out = append(out, modelEntry{
+			Model: openai.Model{
+				ID:       vm.Name,
+				Object:   "model",
+				Created:  best.Created,
+				OwnedBy:  "virtual",
+				Provider: "virtual",
+				// DisplayName 只放组名本身：这是 API 响应字段，客户端可能
+				// 直接展示，也可能按语言自行标注。在这里拼「（虚拟组）」
+				// 会让英文界面的用户看到中文后缀。前端按 provider=virtual
+				// 自行渲染本地化标签。
+				DisplayName:     vm.Name,
+				ContextLength:   best.ContextLength,
+				MaxOutputTokens: best.MaxOutputTokens,
+				SupportsImages:  best.SupportsImages,
+			},
+			virtualName: vm.Name,
+		})
 	}
 	return out
 }
@@ -904,7 +1004,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 	wantStream, _ := payload["stream"].(bool)
 
-	profile, upstreamModel, err := s.resolveModel(requestedModel, r)
+	profile, upstreamModel, virtual, err := s.resolveRoute(requestedModel, r)
 	if err != nil {
 		status := http.StatusBadRequest
 		// 「没登录 / 全暂停」是鉴权问题，不是模型名写错，返回 401 更贴合客户端处理。
@@ -914,25 +1014,20 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, status, err.Error(), "invalid_request_error", "model_not_found")
 		return
 	}
+
+	started := time.Now()
+	if virtual != nil {
+		s.handleVirtualChat(w, r, payload, *virtual, requestedModel, wantStream, started)
+		return
+	}
+
 	payload["model"] = upstreamModel
-	// WorkBuddy 协议族要求首条 system 消息、stream_options 与模板句改写；
-	// 其它协议族（lobsterai / trae / qoder）的请求体由各自适配层处理，
-	// 这里保持客户端原样（仅强制流式）。强制思考档只对 hy3 系列有意义，
-	// 同样限定在 WorkBuddy 协议族——qoder 的签名体多一个未知字段都可能
-	// 被上游拒绝。
-	workBuddyFamily := upstream.ProfileKind(profile) == upstream.KindWorkBuddy
-	body, _, err := openai.PrepareRequestBody(mustJSON(payload), openai.TransformOptions{
-		Sanitize:           workBuddyFamily && s.Config().SanitizeEnabled(),
-		ForceMaxThinking:   workBuddyFamily && s.Config().MaxThinkingEnabled(),
-		EnsureSystemPrompt: workBuddyFamily,
-		AddStreamOptions:   workBuddyFamily,
-	})
+	body, err := s.prepareBody(payload, profile)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "构造上游请求失败: "+err.Error(), "invalid_request_error", "invalid_body")
 		return
 	}
 
-	started := time.Now()
 	resp, cred, err := s.doChat(r.Context(), profile.ID, body, r)
 	if err != nil {
 		s.writeChatError(w, err, profile.ID, requestedModel)
@@ -968,7 +1063,7 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 			s.writeChatError(w, err, profile.ID, requestedModel)
 			return
 		}
-		s.recordUsage(profile.ID, requestedModel, usage)
+		s.recordUsage(profile.ID, requestedModel, "", usage)
 		s.log.Infof("[%s] %s 流式转发完成，耗时 %s（账号 %s）", profile.ID, requestedModel, time.Since(started).Round(time.Millisecond), cred.DisplayName())
 		return
 	}
@@ -988,9 +1083,307 @@ func (s *Server) handleChat(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(result)
 	// 折叠后的完整响应里带着 usage，提取并计入流量统计。
 	if u, ok := extractUsageString(string(result)); ok {
-		s.recordUsage(profile.ID, requestedModel, u)
+		s.recordUsage(profile.ID, requestedModel, "", u)
 	}
 	s.log.Infof("[%s] %s 非流式转发完成，耗时 %s（账号 %s）", profile.ID, requestedModel, time.Since(started).Round(time.Millisecond), cred.DisplayName())
+}
+
+// prepareBody 按目标上游的协议族改写请求体。
+//
+// 必须按「每次转发实际使用的上游」分别调用，不能在进入转发前只准备一次：
+// 虚拟组里的成员可能来自不同协议族，而两族的改写规则互相冲突——
+// WorkBuddy 族要求首条 system 消息、stream_options 与模板句改写，
+// Qoder 的签名体多一个未知字段都可能被上游拒绝。
+func (s *Server) prepareBody(payload map[string]any, profile config.Profile) ([]byte, error) {
+	// WorkBuddy 协议族要求首条 system 消息、stream_options 与模板句改写；
+	// 其它协议族（lobsterai / trae / qoder）的请求体由各自适配层处理，
+	// 这里保持客户端原样（仅强制流式）。强制思考档只对 hy3 系列有意义，
+	// 同样限定在 WorkBuddy 协议族——qoder 的签名体多一个未知字段都可能
+	// 被上游拒绝。
+	workBuddyFamily := upstream.ProfileKind(profile) == upstream.KindWorkBuddy
+	body, _, err := openai.PrepareRequestBody(mustJSON(payload), openai.TransformOptions{
+		Sanitize:           workBuddyFamily && s.Config().SanitizeEnabled(),
+		ForceMaxThinking:   workBuddyFamily && s.Config().MaxThinkingEnabled(),
+		EnsureSystemPrompt: workBuddyFamily,
+		AddStreamOptions:   workBuddyFamily,
+	})
+	return body, err
+}
+
+// virtualRetryLimit 返回一轮请求内最多尝试的成员数。
+//
+// 不写成固定常量：每轮循环至少排除一个成员，所以「成员数」本身就是
+// 天然的终止条件。用固定值（早先是 6）会让成员多于 6 个的组永远试不到
+// 后面的成员——排在尾部的成员等于白配。
+//
+// 仍留一道上限兜底，防止成员表异常（同一成员反复被选中）时死循环。
+func virtualRetryLimit(memberCount int) int {
+	const ceiling = 32
+	if memberCount < 1 {
+		return 1
+	}
+	if memberCount > ceiling {
+		return ceiling
+	}
+	return memberCount
+}
+
+// handleVirtualChat 处理命中虚拟组的请求：在成员之间按权重分摊，
+// 某个成员整体不可用时自动换下一个。
+//
+// 「成员整体不可用」比账号级失败更宽：它可能是该上游未登录、账号全暂停、
+// 全部冷却，也可能是该上游没有这个模型。这几种情况对用户而言都是
+// 「这个别名此刻走不通这条路」，换成员才是对的动作。
+//
+// 流式与非流式的差别只在最后一步：流式需要先窥探首事件确认上游没有
+// 在流首报错，否则一旦写出字节就无法再换成员。
+func (s *Server) handleVirtualChat(
+	w http.ResponseWriter,
+	r *http.Request,
+	payload map[string]any,
+	vm config.VirtualModel,
+	requestedModel string,
+	wantStream bool,
+	started time.Time,
+) {
+	cfg := s.Config()
+	// X-RapidProxy-Account 钉住的账号必须属于组内某个成员的上游，否则无论
+	// 换到哪个成员都匹配不上。提前挡住并回 400，比让每个成员各打一次上游、
+	// 最后返回一个 502 更准确——这是客户端传错了参数，不是上游故障。
+	if want := strings.TrimSpace(r.Header.Get("X-RapidProxy-Account")); want != "" {
+		if !s.virtualGroupHasAccount(cfg, &vm, want) {
+			writeError(w, http.StatusBadRequest,
+				fmt.Sprintf("虚拟模型 %s 的成员里没有 ID 或 UID 为 %q 的账号，请检查 X-RapidProxy-Account", vm.Name, want),
+				"invalid_request_error", "invalid_account")
+			return
+		}
+	}
+	exclude := map[string]bool{}
+	var lastErr error
+	var clientErr *upstreamHTTPError
+	limit := virtualRetryLimit(len(vm.Members))
+
+	for attempt := 0; attempt < limit; attempt++ {
+		members := s.usableVirtualMembers(cfg, &vm, exclude)
+		if len(members) == 0 {
+			break
+		}
+		member, ok := s.pickVirtualMember(vm.Name, members, nil)
+		if !ok {
+			break
+		}
+		exclude[member.Key()] = true
+
+		profile, ok := cfg.ProfileByID(member.Provider)
+		if !ok {
+			continue
+		}
+		// 每次换成员都要按该成员的协议族重新准备请求体（见 prepareBody）。
+		payload["model"] = member.Model
+		body, err := s.prepareBody(payload, profile)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "构造上游请求失败: "+err.Error(), "invalid_request_error", "invalid_body")
+			return
+		}
+
+		resp, cred, err := s.doChat(r.Context(), profile.ID, body, r)
+		if err != nil {
+			lastErr = err
+			// 「该上游没有这个模型」这类客户端错误留着兜底带回：
+			// 全部成员都接不了时，它的文案最能说明问题。
+			var uhe *upstreamHTTPError
+			if errors.As(err, &uhe) {
+				clientErr = uhe
+			}
+			s.log.Warnf("[虚拟 %s] 成员 %s 不可用，换下一个: %v", vm.Name, member.Key(), err)
+			continue
+		}
+
+		// 防御性分支：doChatExcluding 的契约是「>= 400 都在组内跳过换号」，
+		// 只在全部账号都无法承接时返回错误，因此正常路径下这里拿到的 resp
+		// 一定 < 400。真出现时按「该成员接不了这单」处理：换下一个成员，
+		// 并把上游的真实错误留着兜底带回。
+		//
+		// 这里刻意不调 markCooldown：限流 / 额度的冷却已在 doChatExcluding
+		// 内部按账号记过一次，再记一次会让指数退避连加两级，把账号打得更死。
+		if resp.StatusCode >= 400 {
+			_, detail, _ := inspectUpstreamFailure(resp)
+			_ = resp.Body.Close()
+			clientErr = &upstreamHTTPError{Status: resp.StatusCode, Message: detail}
+			lastErr = clientErr
+			s.log.Warnf("[虚拟 %s] 成员 %s 被上游拒绝（HTTP %d），换下一个: %s",
+				vm.Name, member.Key(), resp.StatusCode, truncate(detail, 120))
+			continue
+		}
+
+		if !isSSE(resp) {
+			// 上游以 200 + 非 SSE 形态返回：原样透传，带 usage 时记流量。
+			// 非流式聚合与流式透传都会自己关闭 body。
+			s.writeNonStreamUpstreamVirtual(w, resp, requestedModel, profile.ID, vm.Name, started)
+			return
+		}
+
+		if wantStream {
+			// pipeSSEWithFailover 内部负责关闭 resp.Body（含换号后的每一个响应体），
+			// 这里不能再关一次：错误路径上它可能已经关过了。
+			usage, _, err := s.pipeSSEWithFailover(r.Context(), w, profile.ID, resp, cred, body, r, requestedModel)
+			if err != nil {
+				lastErr = err
+				s.log.Warnf("[虚拟 %s] 成员 %s 流首报错，换下一个: %v", vm.Name, member.Key(), err)
+				continue
+			}
+			s.recordUsage(profile.ID, member.Model, vm.Name, usage)
+			s.log.Infof("[虚拟 %s] %s → %s/%s 流式转发完成，耗时 %s（账号 %s）",
+				vm.Name, requestedModel, profile.ID, member.Model,
+				time.Since(started).Round(time.Millisecond), cred.DisplayName())
+			return
+		}
+
+		// 同 aggregateWithFailover 的约定：它负责关闭自己读过的每一个 body。
+		result, _, err := s.aggregateWithFailover(r.Context(), profile.ID, resp, cred, body, r, requestedModel, member.Model)
+		if err != nil {
+			lastErr = err
+			s.log.Warnf("[虚拟 %s] 成员 %s 聚合失败，换下一个: %v", vm.Name, member.Key(), err)
+			continue
+		}
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(result)
+		if u, ok := extractUsageString(string(result)); ok {
+			s.recordUsage(profile.ID, member.Model, vm.Name, u)
+		}
+		s.log.Infof("[虚拟 %s] %s → %s/%s 非流式转发完成，耗时 %s（账号 %s）",
+			vm.Name, requestedModel, profile.ID, member.Model,
+			time.Since(started).Round(time.Millisecond), cred.DisplayName())
+		return
+	}
+
+	// 组内没有任何成员能承接：优先带回「客户端错误」（模型没开通等），
+	// 它的状态码与文案对排查最有用；否则按可退避错误处理。
+	if clientErr != nil {
+		s.writeChatError(w, clientErr, "虚拟:"+vm.Name, requestedModel)
+		return
+	}
+	if lastErr == nil {
+		// 一个成员都没试过就退出了：不是没登录，就是账号全暂停、全在冷却，
+		// 或者组里根本没有成员。这些都不是「上游故障」，按 401 回更贴合
+		// 客户端的处理方式（与 ErrNoAccount / ErrAllPaused 的口径一致），
+		// 502 会让调用方误以为是可以重试的网关抖动而反复重发。
+		lastErr = &virtualUnavailableError{name: vm.Name, reason: s.virtualUnavailableReason(cfg, &vm)}
+	}
+	s.writeChatError(w, lastErr, "虚拟:"+vm.Name, requestedModel)
+}
+
+// virtualUnavailableError 表示虚拟组此刻没有可承接请求的成员。
+//
+// 单独一个类型是为了让 writeChatError 能把它映射成 401 而不是 502：
+// 「组里没人能接」是配置/登录状态问题，重试同一个请求不会变好。
+type virtualUnavailableError struct {
+	name   string
+	reason string
+}
+
+func (e *virtualUnavailableError) Error() string {
+	return fmt.Sprintf("虚拟模型 %s 暂时不可用：%s", e.name, e.reason)
+}
+
+// virtualGroupHasAccount 报告被钉住的账号是否属于组内某个成员的上游。
+//
+// 只查成员所属的上游：一个账号属于不在组里的上游时，钉它没有任何意义
+// （那个上游的模型不在这个组里）。
+func (s *Server) virtualGroupHasAccount(cfg *config.Config, vm *config.VirtualModel, want string) bool {
+	checked := make(map[string]bool, len(vm.Members))
+	for _, m := range vm.Members {
+		if checked[m.Provider] {
+			continue
+		}
+		checked[m.Provider] = true
+		profile, ok := cfg.ProfileByID(m.Provider)
+		if !ok || !profile.Enabled {
+			continue
+		}
+		creds, err := s.loadCreds(m.Provider)
+		if err != nil {
+			continue
+		}
+		for _, c := range creds {
+			if c.ID == want || c.Account.UID == want {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// virtualUnavailableReason 给出一句能指导用户下一步动作的原因。
+//
+// 按「最可能是哪个环节断了」的顺序归类：上游没启用 → 没登录 → 账号不可用。
+// 三种情况用户的处理动作完全不同，笼统一句「请检查配置」等于没说。
+func (s *Server) virtualUnavailableReason(cfg *config.Config, vm *config.VirtualModel) string {
+	if len(vm.Members) == 0 {
+		return "该组还没有配置成员"
+	}
+	var disabled, noAccount, noUsable int
+	for _, m := range vm.Members {
+		profile, ok := cfg.ProfileByID(m.Provider)
+		if !ok || !profile.Enabled {
+			disabled++
+			continue
+		}
+		creds, err := s.loadCreds(m.Provider)
+		if err != nil || len(creds) == 0 {
+			noAccount++
+			continue
+		}
+		// 有账号但都不可用（全暂停 / 全在冷却）。
+		if avail, _ := s.AccountStats(m.Provider); avail == 0 {
+			noUsable++
+		}
+	}
+	total := len(vm.Members)
+	switch {
+	case disabled == total:
+		return "成员所属上游都未启用，请在设置中启用"
+	case noAccount == total:
+		return "成员所属上游还没有登录账号，请先登录"
+	case noAccount+disabled+noUsable == total:
+		return "成员所属上游的账号都已暂停或正在冷却，请稍后重试或恢复账号"
+	default:
+		return "请检查成员所属上游是否已启用并登录账号"
+	}
+}
+
+// writeNonStreamUpstreamVirtual 与 writeNonStreamUpstream 相同，但把流量
+// 同时记入虚拟组维度，并自己关闭响应体。
+//
+// 自己关是必须的：虚拟路径上没有 handleChat 那个 defer resp.Body.Close()
+// 兜底（那里只认识最初的那个 resp，换成员后拿到的响应体不在它的范围内），
+// 不关就会漏连接，随请求数持续累积。
+func (s *Server) writeNonStreamUpstreamVirtual(w http.ResponseWriter, resp *http.Response, model, provider, virtual string, started time.Time) {
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if resp.StatusCode < 400 {
+		ct := resp.Header.Get("Content-Type")
+		if ct == "" {
+			ct = "application/json; charset=utf-8"
+		}
+		w.Header().Set("Content-Type", ct)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(raw)
+		if u, ok := extractUsageString(string(raw)); ok {
+			s.recordUsage(provider, model, virtual, u)
+		}
+		return
+	}
+	// 走到这里说明成员已判定失败（调用方已按失败处理），不应再写响应。
+	// 保留兜底：把上游的真实错误按原状态码带回。
+	message := extractUpstreamErrorMessage(resp, raw)
+	status := resp.StatusCode
+	if status >= 500 {
+		status = http.StatusBadGateway
+	}
+	s.log.Errorf("[%s] %s 上游异常: %s", provider, model, truncate(message, 200))
+	writeError(w, status, message, "upstream_error", "upstream_error")
 }
 
 // aggregateRetries 是「上游以流的形式报错」时换号重试的上限，非流式
@@ -1103,6 +1496,7 @@ func (s *Server) writeChatError(w http.ResponseWriter, err error, providerID, re
 	}
 	status := http.StatusBadGateway
 	var fail *upstreamFailError
+	var vunavail *virtualUnavailableError
 	switch {
 	case errors.As(err, &fail):
 		// 整组账号都在限流 / 额度冷却中：这是可重试的，按 429 回给客户端，
@@ -1116,6 +1510,10 @@ func (s *Server) writeChatError(w http.ResponseWriter, err error, providerID, re
 			w.Header().Set("Retry-After", strconv.Itoa(secs))
 		}
 	case errors.Is(err, ErrNoAccount), errors.Is(err, ErrAllPaused):
+		status = http.StatusUnauthorized
+	case errors.As(err, &vunavail):
+		// 虚拟组里没人能接：与「未登录 / 全暂停」同属鉴权与配置问题，
+		// 回 502 会被调用方当成可重试的网关抖动而反复重发同一个请求。
 		status = http.StatusUnauthorized
 	}
 	writeError(w, status, err.Error(), "upstream_error", "upstream_error")
@@ -1186,7 +1584,7 @@ func (s *Server) writeNonStreamUpstream(w http.ResponseWriter, resp *http.Respon
 		_, _ = w.Write(raw)
 		// 成功响应若带 usage（部分上游以非 SSE 形态返回完整 JSON），一并计入流量。
 		if u, ok := extractUsageString(string(raw)); ok {
-			s.recordUsage(provider, model, u)
+			s.recordUsage(provider, model, "", u)
 		}
 		return
 	}
@@ -1415,11 +1813,31 @@ func (s *Server) profileByIDOrAlias(cfg *config.Config, id string) (config.Profi
 //  1. 直接写模型名（按已启用上游的模型列表匹配）
 //  2. "上游ID:模型名" 或 "上游ID/模型名" 强制指定（国际版可用 "intl:模型名"）
 //  3. 请求头 X-RapidProxy-Provider 或查询参数 ?provider= 强制指定（同样兼容 intl）
+//
+// 虚拟模型组不在这里解析：它的名字不指向单个上游，由 resolveRoute 单独处理。
+// 命中虚拟组时显式报错，而不是返回一个 ID 为空的 Profile——后者会让调用方
+// 拿到「看起来成功、实际没有目标」的结果，比直接失败更难排查。
 func (s *Server) resolveModel(name string, r *http.Request) (config.Profile, string, error) {
+	profile, model, vm, err := s.resolveRoute(name, r)
+	if err != nil {
+		return profile, model, err
+	}
+	if vm != nil {
+		return config.Profile{}, "", fmt.Errorf("%s 是虚拟模型组，不能按单个上游解析", vm.Name)
+	}
+	return profile, model, nil
+}
+
+// resolveRoute 是 resolveModel 的完整版，额外返回命中的虚拟组（未命中时为 nil）。
+//
+// 虚拟组的优先级低于显式强制路由：客户端写了 "qoder-cn:xxx" 或带了
+// X-RapidProxy-Provider 头，就说明它明确要打到那个上游，此时即使存在同名
+// 虚拟组也应当按强制路由走。
+func (s *Server) resolveRoute(name string, r *http.Request) (config.Profile, string, *config.VirtualModel, error) {
 	cfg := s.Config()
 	enabled := cfg.EnabledProfiles()
 	if len(enabled) == 0 {
-		return config.Profile{}, "", errors.New("没有启用任何上游，请先在设置中启用")
+		return config.Profile{}, "", nil, errors.New("没有启用任何上游，请先在设置中启用")
 	}
 
 	model := strings.TrimSpace(name)
@@ -1436,15 +1854,23 @@ func (s *Server) resolveModel(name string, r *http.Request) (config.Profile, str
 	if forced != "" {
 		profile, ok := s.profileByIDOrAlias(cfg, forced)
 		if !ok {
-			return config.Profile{}, "", fmt.Errorf("未知的上游: %s", forced)
+			return config.Profile{}, "", nil, fmt.Errorf("未知的上游: %s", forced)
 		}
 		if !profile.Enabled {
-			return config.Profile{}, "", fmt.Errorf("上游 %s 未启用", forced)
+			return config.Profile{}, "", nil, fmt.Errorf("上游 %s 未启用", forced)
 		}
 		if !s.hasCredential(profile.ID) {
-			return config.Profile{}, "", fmt.Errorf("上游 %s 还没有登录账号，请先登录", profile.ID)
+			return config.Profile{}, "", nil, fmt.Errorf("上游 %s 还没有登录账号，请先登录", profile.ID)
 		}
-		return profile, model, nil
+		return profile, model, nil, nil
+	}
+
+	// 裸模型名先看是不是虚拟组：虚拟名是用户自己起的，优先级高于真实模型名，
+	// 否则「虚拟组名恰好等于某个真实模型 ID」时用户永远调不到自己的组。
+	// ValidateVirtualModel 已禁止与上游 ID 冲突，但真实模型 ID 是上游动态返回的，
+	// 无法在保存时穷举，只能在这里按「虚拟优先」定序。
+	if vm, ok := cfg.VirtualModelByName(model); ok && vm.Enabled && len(vm.Members) > 0 {
+		return config.Profile{}, model, &vm, nil
 	}
 
 	// 裸模型名只在「对外暴露的模型名」里精确匹配。
@@ -1457,19 +1883,24 @@ func (s *Server) resolveModel(name string, r *http.Request) (config.Profile, str
 		if e.ID != model {
 			continue
 		}
+		// 虚拟条目在上面的 VirtualModelByName 分支已处理过（能走到这里说明
+		// 该组已停用或没有成员）；跳过它，免得把一个空的组当成真实上游。
+		if e.virtualName != "" {
+			continue
+		}
 		profile, ok := cfg.ProfileByID(e.profileID)
 		if !ok || !profile.Enabled {
 			continue
 		}
-		return profile, e.upstreamID, nil
+		return profile, e.upstreamID, nil, nil
 	}
 	// 未匹配到具体上游时交给第一个已登录的上游，避免客户端因别名而失败。
 	active := s.loggedInProfiles()
 	if len(active) == 0 {
-		return config.Profile{}, "", ErrNoAccount
+		return config.Profile{}, "", nil, ErrNoAccount
 	}
 	s.log.Warnf("模型 %s 不在已知列表中，按默认上游 %s 转发", model, active[0].ID)
-	return active[0], model, nil
+	return active[0], model, nil, nil
 }
 
 func (s *Server) lockCredential(id string) func() {
@@ -1945,6 +2376,134 @@ func (s *Server) pruneBalanceState(providerID string, all []*upstream.Credential
 			delete(s.balState, key)
 		}
 	}
+}
+
+// -----------------------------------------------------------------------------
+// 虚拟模型组
+// -----------------------------------------------------------------------------
+
+// virtualPick 是一次虚拟组成员选择的结果。
+type virtualPick struct {
+	Profile config.Profile
+	Model   string // 转发给上游时使用的模型名（该上游的原始 ID）
+	Member  config.VirtualMember
+}
+
+// virtualMemberKey 是虚拟组内某成员的 SWRR 状态键。
+//
+// 与账号级 balState 共用一张表但命名空间不同：账号键是 "上游/账号ID"，
+// 这里是 "virtual:组名/上游/模型"，两者不可能相撞（账号 ID 不会以
+// "virtual:" 开头，上游 ID 也不会）。
+func virtualMemberKey(virtualName string, m config.VirtualMember) string {
+	return stats.VirtualKey(virtualName) + "/" + m.Key()
+}
+
+// usableVirtualMembers 返回虚拟组里此刻能承接请求的成员。
+//
+// 逐个检查：上游是否启用、是否登录了账号、该上游是否还有可用账号
+// （非暂停、非冷却）。这些条件任一不满足就跳过——用户看到的应是
+// 「组里还有谁能接」，而不是「配置里写了几个成员」。
+//
+// exclude 里的成员不再考虑，供成员失败后依次换人重试。
+func (s *Server) usableVirtualMembers(cfg *config.Config, vm *config.VirtualModel, exclude map[string]bool) []config.VirtualMember {
+	if vm == nil {
+		return nil
+	}
+	// 可用账号数按上游缓存一次：成员失败重试时本函数会被反复调用，
+	// 同上游的多个成员也常指向同一账号池，逐成员查询纯属重复扫描。
+	avails := make(map[string]int, 4)
+	available := func(providerID string) bool {
+		n, ok := avails[providerID]
+		if !ok {
+			n, _ = s.AccountStats(providerID)
+			avails[providerID] = n
+		}
+		return n > 0
+	}
+	out := make([]config.VirtualMember, 0, len(vm.Members))
+	for _, m := range vm.Members {
+		if exclude[m.Key()] {
+			continue
+		}
+		profile, ok := cfg.ProfileByID(m.Provider)
+		if !ok || !profile.Enabled {
+			continue
+		}
+		if !available(m.Provider) {
+			continue
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// pickVirtualMember 按权重从虚拟组里挑一个成员（平滑加权轮询）。
+//
+// 与 pickCredential 是同一套算法，只是层级从「账号」上移到了「成员」：
+// 成员默认同权，可单独调权重；不可用的成员在 usableVirtualMembers 里
+// 已被排除，这里只做分摊。
+func (s *Server) pickVirtualMember(virtualName string, members []config.VirtualMember, exclude map[string]bool) (config.VirtualMember, bool) {
+	usable := make([]config.VirtualMember, 0, len(members))
+	total := 0
+	for _, m := range members {
+		if exclude[m.Key()] {
+			continue
+		}
+		usable = append(usable, m)
+		total += m.EffectiveWeight()
+	}
+	if len(usable) == 0 || total <= 0 {
+		return config.VirtualMember{}, false
+	}
+
+	s.balMu.Lock()
+	defer s.balMu.Unlock()
+	if s.balState == nil {
+		s.balState = map[string]int{}
+	}
+	best, bestCW := -1, 0
+	for i, m := range usable {
+		key := virtualMemberKey(virtualName, m)
+		cw := s.balState[key] + m.EffectiveWeight()
+		s.balState[key] = cw
+		if best < 0 || cw > bestCW {
+			best, bestCW = i, cw
+		}
+	}
+	if best < 0 {
+		return config.VirtualMember{}, false
+	}
+	chosen := usable[best]
+	s.balState[virtualMemberKey(virtualName, chosen)] = bestCW - total
+	return chosen, true
+}
+
+// ClearVirtualState 清掉某个虚拟组的分摊状态（改名、改成员后调用）。
+//
+// 不清的话，改名后新名字从零开始累积偏移、旧名字的条目永远留在表里；
+// 改权重后旧偏移（按旧权重累积）还可能让分配短暂倾斜。
+func (s *Server) ClearVirtualState(name string) {
+	prefix := stats.VirtualKey(name) + "/"
+	s.balMu.Lock()
+	defer s.balMu.Unlock()
+	for key := range s.balState {
+		if strings.HasPrefix(key, prefix) {
+			delete(s.balState, key)
+		}
+	}
+}
+
+// VirtualAvailableMembers 返回某个虚拟组此刻可承接请求的成员数。
+//
+// 界面侧由 app.virtualModelViews 统一计算（它还要逐成员状态，顺手就能
+// 数出可用数），这里保留为独立查询入口，便于排查与测试。
+func (s *Server) VirtualAvailableMembers(name string) int {
+	cfg := s.Config()
+	vm, ok := cfg.VirtualModelByName(name)
+	if !ok {
+		return 0
+	}
+	return len(s.usableVirtualMembers(cfg, &vm, nil))
 }
 
 // doChat 转发请求；账号之间按权重分摊，认证失败先刷新令牌再换号重试。

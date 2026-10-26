@@ -96,6 +96,60 @@ func (p Profile) ProxyRecommended() bool {
 	return strings.Contains(p.BaseURL, "workbuddy.ai")
 }
 
+// VirtualMember 是虚拟模型组的一个成员：指向某个上游的具体模型。
+//
+// Provider 是上游 ID（如 qoder-cn），Model 是该上游的原始模型 ID
+// （如 glm-5.3，不带 "上游ID:" 这类对外前缀）——对外暴露的名字会随
+// 登录了哪些上游而变化，存原始 ID 才能在任意登录组合下都解析得回来。
+type VirtualMember struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
+	// Weight 是组内负载均衡权重；未设置或 <=0 时按 1 处理。
+	Weight int `json:"weight,omitempty"`
+}
+
+// EffectiveWeight 返回参与负载均衡的权重，未设置（<=0）时为 1。
+func (m VirtualMember) EffectiveWeight() int {
+	if m.Weight > 0 {
+		return m.Weight
+	}
+	return 1
+}
+
+// Key 返回成员在负载均衡状态表里的键。
+func (m VirtualMember) Key() string { return m.Provider + "/" + m.Model }
+
+// VirtualModel 是用户自定义的虚拟模型名。
+//
+// 客户端只请求 Name，代理在 Members 之间按权重分摊；某个成员不可用
+// （上游未登录、账号全暂停、限流冷却、上游报错）就自动换下一个。
+// 成员引用的是「上游 + 原始模型 ID」，因此一个虚拟组可以横跨不同服务商。
+type VirtualModel struct {
+	Name    string          `json:"name"`
+	Enabled bool            `json:"enabled"`
+	Members []VirtualMember `json:"members"`
+}
+
+// ValidVirtualName 报告虚拟模型名是否可用作请求里的 model 字段。
+//
+// 禁止 ":" 与 "/"：这两个是 resolveModel 里「上游ID:模型名」强制路由的
+// 分隔符，虚拟名里带上会被拆成上游前缀，永远匹配不到组。
+// 禁止空白：客户端几乎不会传带空格的模型名，且空白会让日志与统计难以辨认。
+func ValidVirtualName(name string) bool {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	if strings.ContainsAny(name, ":/ \t\r\n") {
+		return false
+	}
+	// "intl" 是国际版上游的别名，占用它会让 intl:xxx 的强制路由失效。
+	if strings.EqualFold(name, "intl") {
+		return false
+	}
+	return true
+}
+
 // Config 是持久化到 <dataDir>/config.json 的全部设置。
 type Config struct {
 	Listen string `json:"listen"`
@@ -121,6 +175,8 @@ type Config struct {
 	Language string `json:"language,omitempty"`
 	// Profiles 是上游服务列表，顺序决定同名模型的优先级。
 	Profiles []Profile `json:"profiles"`
+	// VirtualModels 是用户自定义的虚拟模型组（一个名字聚合多个上游的模型）。
+	VirtualModels []VirtualModel `json:"virtual_models,omitempty"`
 
 	path string
 }
@@ -504,6 +560,61 @@ func (c *Config) normalize() {
 		}
 	}
 	c.APIKeys = cleanKeys(c.APIKeys)
+	c.normalizeVirtualModels()
+}
+
+// normalizeVirtualModels 清理虚拟组：丢弃非法名字、重复名字、空成员与
+// 指向未知上游的成员。
+//
+// 这里直接丢而不是报错：配置是手写 JSON 也可能被旧版本写坏，一个坏条目
+// 不该让整个设置页打不开。真正需要告知用户的地方（界面保存）会在
+// ValidateVirtualModel 里先挡住。
+func (c *Config) normalizeVirtualModels() {
+	if len(c.VirtualModels) == 0 {
+		c.VirtualModels = nil
+		return
+	}
+	known := make(map[string]bool, len(c.Profiles))
+	for _, p := range c.Profiles {
+		known[p.ID] = true
+	}
+	seen := make(map[string]bool, len(c.VirtualModels))
+	out := make([]VirtualModel, 0, len(c.VirtualModels))
+	for _, vm := range c.VirtualModels {
+		vm.Name = strings.TrimSpace(vm.Name)
+		if !ValidVirtualName(vm.Name) || seen[vm.Name] {
+			continue
+		}
+		// 与上游 ID 同名必须丢弃：resolveRoute 里虚拟组优先于真实模型匹配，
+		// 留着它会让该上游的所有裸模型名都被这个组截走。
+		// 保存路径已由 ValidateVirtualModel 拦住，这里兜住手写配置的情况。
+		if known[vm.Name] {
+			continue
+		}
+		members := make([]VirtualMember, 0, len(vm.Members))
+		seenMember := make(map[string]bool, len(vm.Members))
+		for _, m := range vm.Members {
+			m.Provider = strings.TrimSpace(m.Provider)
+			m.Model = strings.TrimSpace(m.Model)
+			if m.Provider == "" || m.Model == "" || !known[m.Provider] {
+				continue
+			}
+			if seenMember[m.Key()] {
+				continue
+			}
+			seenMember[m.Key()] = true
+			if m.Weight < 0 {
+				m.Weight = 0
+			}
+			members = append(members, m)
+		}
+		// 没有成员的组保留（用户可能刚建好还没加成员），但 Enabled 无意义；
+		// 保留 enabled 原值，让用户加完成员即可直接生效。
+		vm.Members = members
+		seen[vm.Name] = true
+		out = append(out, vm)
+	}
+	c.VirtualModels = out
 }
 
 func cleanKeys(in []string) []string {
@@ -576,6 +687,11 @@ func (c *Config) Clone() *Config {
 			cp.Profiles[i].SyncModels = &v
 		}
 	}
+	cp.VirtualModels = make([]VirtualModel, len(c.VirtualModels))
+	for i, vm := range c.VirtualModels {
+		cp.VirtualModels[i] = vm
+		cp.VirtualModels[i].Members = append([]VirtualMember(nil), vm.Members...)
+	}
 	return &cp
 }
 
@@ -611,6 +727,113 @@ func (c *Config) SetProfile(p Profile) {
 	}
 	c.Profiles = append(c.Profiles, p)
 	c.normalize()
+}
+
+// -----------------------------------------------------------------------------
+// 虚拟模型组
+// -----------------------------------------------------------------------------
+
+// VirtualModelByName 按名字查找虚拟组。
+func (c *Config) VirtualModelByName(name string) (VirtualModel, bool) {
+	name = strings.TrimSpace(name)
+	for _, vm := range c.VirtualModels {
+		if vm.Name == name {
+			return vm, true
+		}
+	}
+	return VirtualModel{}, false
+}
+
+// EnabledVirtualModels 返回已启用且至少有一个成员的虚拟组。
+//
+// 没有成员的组不参与路由：暴露一个永远返回「无可用上游」的模型名
+// 只会让客户端困惑。
+func (c *Config) EnabledVirtualModels() []VirtualModel {
+	out := make([]VirtualModel, 0, len(c.VirtualModels))
+	for _, vm := range c.VirtualModels {
+		if vm.Enabled && len(vm.Members) > 0 {
+			out = append(out, vm)
+		}
+	}
+	return out
+}
+
+// ValidateVirtualModel 校验一个待保存的虚拟组，返回可读的错误。
+//
+// 只做「一定不行」的检查：名字合法、不与真实模型/上游 ID 冲突、成员
+// 指向已知上游。成员模型是否真的存在不在此时校验——上游模型清单随登录
+// 状态变化，存的时候存在、用的时候可能已经下线，那种情况交给路由层跳过。
+func (c *Config) ValidateVirtualModel(vm VirtualModel, existingName string) error {
+	name := strings.TrimSpace(vm.Name)
+	if strings.EqualFold(name, "intl") {
+		// 单独给出原因：ValidVirtualName 也会拒绝它，但那条错误信息讲的是
+		// 「不能为空 / 不能含分隔符」，用户看到会一头雾水。
+		return errors.New("intl 是国际版上游的保留名，请换一个名字")
+	}
+	if !ValidVirtualName(name) {
+		return errors.New("虚拟模型名不能为空，且不能包含 : / 或空格（这两个是强制路由分隔符）")
+	}
+	for _, other := range c.VirtualModels {
+		// 改名时允许保留自己的名字。
+		if other.Name == name && other.Name != existingName {
+			return fmt.Errorf("虚拟模型名 %s 已存在", name)
+		}
+	}
+	for _, p := range c.Profiles {
+		if p.ID == name {
+			return fmt.Errorf("虚拟模型名 %s 与上游 ID 冲突，请换一个名字", name)
+		}
+	}
+	for _, m := range vm.Members {
+		if _, ok := c.ProfileByID(m.Provider); !ok {
+			return fmt.Errorf("成员指向未知上游: %s", m.Provider)
+		}
+		if strings.TrimSpace(m.Model) == "" {
+			return fmt.Errorf("上游 %s 的成员缺少模型名", m.Provider)
+		}
+	}
+	return nil
+}
+
+// UpsertVirtualModel 新增或按 existingName 改名覆盖一个虚拟组。
+//
+// existingName 为空表示新增；非空表示把原名 existingName 的组替换成 vm
+// （允许改名）。名字冲突由调用方先用 ValidateVirtualModel 挡住。
+func (c *Config) UpsertVirtualModel(vm VirtualModel, existingName string) error {
+	vm.Name = strings.TrimSpace(vm.Name)
+	if err := c.ValidateVirtualModel(vm, strings.TrimSpace(existingName)); err != nil {
+		return err
+	}
+	existingName = strings.TrimSpace(existingName)
+	if existingName == "" {
+		c.VirtualModels = append(c.VirtualModels, vm)
+		c.normalize()
+		return nil
+	}
+	for i := range c.VirtualModels {
+		if c.VirtualModels[i].Name == existingName {
+			c.VirtualModels[i] = vm
+			c.normalize()
+			return nil
+		}
+	}
+	return fmt.Errorf("虚拟模型 %s 不存在", existingName)
+}
+
+// RemoveVirtualModel 删除一个虚拟组，返回是否删除成功。
+func (c *Config) RemoveVirtualModel(name string) bool {
+	name = strings.TrimSpace(name)
+	out := c.VirtualModels[:0]
+	removed := false
+	for _, vm := range c.VirtualModels {
+		if vm.Name == name {
+			removed = true
+			continue
+		}
+		out = append(out, vm)
+	}
+	c.VirtualModels = out
+	return removed
 }
 
 // CORSEnabled 返回是否开启跨域。

@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/url"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1038,7 +1039,9 @@ func (s *Server) aggregateWithFailover(
 			return nil, cred, err
 		}
 		if kind := classifyMessage(serr.Message); kind != failNone {
-			until := s.markCooldown(cred.ID, kind, 0)
+			// 流首错误帧与 HTTP 层同一口径：正文里带了额度窗口重置时刻
+			// （code=6004 之类）就冷却到那个时刻，而不是几十秒的退避。
+			until := s.markCooldown(cred.ID, kind, parseUsageResetAt(serr.Message))
 			s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(kind),
 				until.Format("15:04:05"), truncate(serr.Message, 120))
 		}
@@ -1050,13 +1053,24 @@ func (s *Server) aggregateWithFailover(
 
 		next, nextCred, err := s.doChatExcluding(ctx, providerID, body, r, exclude)
 		if err != nil {
-			// 组内没有别的账号可换时，doChatExcluding 会返回 ErrNoAccount。
-			// 直接透传会把「额度已用尽」说成「尚未登录账号」，用户会去
-			// 反复检查登录状态，而真正的原因是额度或限流——原始文案更有用。
+			// 组内没有别的账号可换时，doChatExcluding 会返回 ErrNoAccount
+			// （账号被删光 / 全暂停）。直接透传会把「额度已用尽」说成
+			// 「尚未登录账号」，用户会去反复检查登录状态——原始文案更有用。
 			if errors.Is(err, ErrNoAccount) || errors.Is(err, ErrAllPaused) {
 				return nil, cred, &openai.StreamError{Message: "上游返回错误: " + serr.Message}
 			}
-			// 其它错误（如整组冷却、组内账号都不健康）比原始文案更贴近实际。
+			// 整组都在冷却（限流 / 额度）：按 429 + Retry-After 带回是对的，
+			// 但组级汇总只说「暂时不可用」，用户看不出真正原因——把上游的
+			// 原始错误拼回文案（原因在前，恢复时间在后），上限 500 字符
+			// 防止病态长的错误文案翻倍灌进 error.message。
+			var ufe *upstreamFailError
+			if errors.As(err, &ufe) {
+				return nil, cred, &upstreamFailError{
+					msg:        "上游返回错误: " + truncate(serr.Message, 500) + "；" + ufe.msg,
+					retryAfter: ufe.retryAfter,
+				}
+			}
+			// 其它错误（如组内账号都不健康）比原始文案更贴近实际。
 			return nil, cred, err
 		}
 		// 防御性分支：doChatExcluding 只会在状态码 < 400 时返回响应
@@ -1333,7 +1347,9 @@ func (s *Server) pipeSSEWithFailover(
 		// 流首错误：此时还没给下游写过一个字节，可以安全换号。
 		_ = resp.Body.Close()
 		if kind := classifyMessage(serr.Message); kind != failNone {
-			until := s.markCooldown(cred.ID, kind, 0)
+			// 流首错误帧与 HTTP 层同一口径：正文里带了额度窗口重置时刻
+			// （code=6004 之类）就冷却到那个时刻，而不是几十秒的退避。
+			until := s.markCooldown(cred.ID, kind, parseUsageResetAt(serr.Message))
 			s.log.Warnf("账号 %s %s，冷却至 %s（%s）", cred.DisplayName(), failReason(kind),
 				until.Format("15:04:05"), truncate(serr.Message, 120))
 		}
@@ -1350,7 +1366,16 @@ func (s *Server) pipeSSEWithFailover(
 			if errors.Is(err, ErrNoAccount) || errors.Is(err, ErrAllPaused) {
 				return stats.Usage{}, cred, &openai.StreamError{Message: "上游返回错误: " + serr.Message}
 			}
-			// 其它错误（如整组冷却、组内账号都不健康）比原始文案更贴近实际。
+			// 整组都在冷却：与 aggregateWithFailover 同一口径——429 + Retry-After
+			// 带回，文案里保留上游的原始错误（原因在前，恢复时间在后）。
+			var ufe *upstreamFailError
+			if errors.As(err, &ufe) {
+				return stats.Usage{}, cred, &upstreamFailError{
+					msg:        "上游返回错误: " + truncate(serr.Message, 500) + "；" + ufe.msg,
+					retryAfter: ufe.retryAfter,
+				}
+			}
+			// 其它错误（如组内账号都不健康）比原始文案更贴近实际。
 			return stats.Usage{}, cred, err
 		}
 		resp, cred = next, nextCred
@@ -1543,6 +1568,9 @@ var creditKeywords = []string{
 var rateLimitKeywords = []string{
 	"rate limit", "rate_limit", "rate-limit", "ratelimit",
 	"too many requests", "too_many_requests",
+	// "usage exceeds frequency limit"（上游 code=6004）这类窗口限流，
+	// 关键词在文案开头就得能命中，不能依赖句子尾部恰好出现 "rate limit"。
+	"frequency limit", "frequency_limit",
 	"限流", "请求过于频繁", "频率",
 }
 
@@ -1563,6 +1591,9 @@ var serverKeywords = []string{
 //
 // detail 一律是提取后的可读文案（见 extractUpstreamErrorMessage），分类用的
 // 则是原文——限流 / 额度关键词在 JSON 与 SSE 两种形态里都出现在正文中。
+// 返回的冷却时长取 Retry-After 头与正文里额度窗口重置时刻（如 code=6004 的
+// "usage will reset at ..."，见 parseUsageResetAt）中较长的一个，交由
+// markCooldown 择优采纳。
 func inspectUpstreamFailure(resp *http.Response) (failKind, string, time.Duration) {
 	if resp == nil || resp.StatusCode < 400 {
 		return failNone, "", 0
@@ -1588,6 +1619,14 @@ func inspectUpstreamFailure(resp *http.Response) (failKind, string, time.Duratio
 	detail := extractUpstreamErrorMessage(resp, raw)
 	if kind == failNone {
 		return failNone, detail, 0
+	}
+	// 上游在正文里明确给出额度窗口的重置时间（如 code=6004 的
+	// "usage will reset at 2026-10-26 17:36:44 UTC+8"）时也纳入参照：
+	// 这类窗口限流动辄几小时，按几十秒的限流退避只会让账号在窗口内
+	// 被反复选中、反复失败。与 Retry-After 头取更长的那个（markCooldown
+	// 只在超过退避时长时采纳，且受 cooldownCeiling 上限约束）。
+	if d := parseUsageResetAt(msg); d > retryAfter {
+		retryAfter = d
 	}
 	return kind, truncate(detail, 200), retryAfter
 }
@@ -1650,10 +1689,60 @@ func parseRetryAfter(v string) time.Duration {
 	return 0
 }
 
+// usageResetRe 匹配上游错误正文里「额度窗口的重置时刻」，如 code=6004 的
+// "usage will reset at 2026-10-26 17:36:44 UTC+8"（兼容 resets at）。
+// UTC 偏移允许整小时或带 / 不带冒号的分秒两种形态（UTC+8 / UTC+08:00 / UTC+0800）。
+var usageResetRe = regexp.MustCompile(
+	`(?i)resets?\s+at\s+(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})\s*UTC\s*([+-]\d{1,2})(?::?(\d{2}))?`)
+
+// parseUsageResetAt 从错误正文里解析额度窗口的重置时刻，返回距现在的时长。
+//
+// code=6004 "usage exceeds frequency limit" 这类窗口限流不是秒级抖动：
+// 上游明确说用量要到几点才重置，按限流的几十秒退避处理，账号会在窗口内
+// 被反复选中、反复失败，每次都白打一单上游再换号。能解析出时刻且尚未
+// 到达时返回该时长（冷却上限仍由 markCooldown 的 cooldownCeiling 把关），
+// 解析不出或时刻已过则返回 0，走原有退避。
+func parseUsageResetAt(msg string) time.Duration {
+	m := usageResetRe.FindStringSubmatch(msg)
+	if m == nil {
+		return 0
+	}
+	hours, err := strconv.Atoi(m[3])
+	if err != nil {
+		return 0
+	}
+	offs := hours * 3600
+	if m[4] != "" {
+		mins, err := strconv.Atoi(m[4])
+		if err != nil {
+			return 0
+		}
+		// 符号看匹配到的原文："UTC-0:30" 的小时位是 "-0"，Atoi 后丢符号，
+		// 按数值正负判断会把 -30 分钟偏移当成 +30 分钟。
+		if strings.HasPrefix(m[3], "-") {
+			offs -= mins * 60
+		} else {
+			offs += mins * 60
+		}
+	}
+	t, err := time.ParseInLocation("2006-01-02 15:04:05", m[1]+" "+m[2], time.FixedZone("", offs))
+	if err != nil {
+		return 0
+	}
+	d := time.Until(t)
+	if d <= 0 {
+		return 0
+	}
+	return d
+}
+
 // markCooldown 记录一次限流或额度耗尽，返回冷却截止时间。
 //
 // 同一个原因连续触发时按指数退避延长，避免把账号打得更死；
-// 上游给了明确的 Retry-After 时以其为准（受 cooldownCeiling 限制）。
+// 上游给了明确的恢复时间时以其为准（受 cooldownCeiling 限制）——
+// 来源可以是 Retry-After 头，也可以是错误正文里的额度窗口重置时刻
+// （如 code=6004 的 "usage will reset at ..."，见 parseUsageResetAt），
+// 这类窗口限流动辄几小时，几十秒的指数退避形同虚设。
 func (s *Server) markCooldown(credID string, kind failKind, retryAfter time.Duration) time.Time {
 	s.coolMu.Lock()
 	defer s.coolMu.Unlock()
@@ -2075,7 +2164,30 @@ func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []
 	if clientErr != nil {
 		return nil, nil, clientErr
 	}
-	if backed > 0 {
+	// 可退避的情况有两种：本次调用里退避过（backed > 0），或者还没打出去
+	// 就无号可挑（pickCredential 直接返回 nil）——剩下的账号不是暂停就是
+	// 全在冷却中。后者绝不能落进 ErrNoAccount：账号明明在线，只是都在
+	// 冷却，报「尚未登录账号」会把用户引去反复检查登录状态。窗口限流
+	// （code=6004 之类）按重置时刻冷却动辄几小时，整组撞进同一个窗口
+	// 后这条路径就是新请求的常态归宿。
+	// 判定口径：非暂停账号里，「在冷却」或「已被 exclude 排除」要覆盖
+	// 全部，且至少有一个真的在冷却——exclude 里的账号刚在本请求上游
+	// 失败过（可能已进冷却），只数非排除的会把单账号组漏成 ErrNoAccount。
+	cooling := 0
+	groupDown := true
+	for _, c := range creds {
+		switch {
+		case c.Paused:
+			// 不参与转发，不碍事。
+		case s.cooldownLeft(c.ID) > 0:
+			cooling++
+		case exclude[c.ID]:
+			// 本请求里已试过且未冷却（不可退避的客户端错误）：不推翻整组判定。
+		default:
+			groupDown = false
+		}
+	}
+	if backed > 0 || (cooling > 0 && groupDown) {
 		if until, ok := s.earliestCooldown(creds); ok {
 			wait := time.Until(until)
 			if wait < 0 {
@@ -2094,13 +2206,17 @@ func (s *Server) doChatExcluding(ctx context.Context, providerID string, body []
 }
 
 // earliestCooldown 返回这组账号里最早的冷却截止时间。
+//
+// 只统计尚未过期的条目：过期条目要等下次 markCooldown 才被回收，
+// 直接采用会把 Retry-After 算成 0 甚至负数，文案里还带着过去的时刻。
 func (s *Server) earliestCooldown(creds []*upstream.Credential) (time.Time, bool) {
 	s.coolMu.Lock()
 	defer s.coolMu.Unlock()
 	var best time.Time
+	now := time.Now()
 	for _, c := range creds {
 		st, ok := s.cool[c.ID]
-		if !ok {
+		if !ok || !st.Until.After(now) {
 			continue
 		}
 		if best.IsZero() || st.Until.Before(best) {

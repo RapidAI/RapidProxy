@@ -767,6 +767,237 @@ func TestInspectUpstreamFailureDetectsCreditByBody(t *testing.T) {
 	}
 }
 
+// 上游 code=6004 "usage exceeds frequency limit" 是窗口限流：文案开头就带
+// "frequency limit"，要在关键词阶段就认出来，不能依赖句子尾部恰好出现
+// "rate limit"（长文案被截断后就看不到了）。
+func TestClassifyMessageDetectsFrequencyLimit(t *testing.T) {
+	msg := `{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at 2026-10-26 17:36:44 UTC+8, and then you can retry"}`
+	if got := classifyMessage(msg); got != failRateLimit {
+		t.Fatalf("usage exceeds frequency limit 应认成限流，实际 %v", got)
+	}
+}
+
+// parseUsageResetAt 要能从 6004 的文案里解析出额度窗口的重置时刻：
+// 这类窗口限流动辄几小时，按几十秒的限流退避处理，账号会在窗口内被
+// 反复选中、反复失败。
+func TestParseUsageResetAt(t *testing.T) {
+	zone := time.FixedZone("", 8*3600)
+	at := time.Now().Add(90 * time.Minute).In(zone).Format("2006-01-02 15:04:05")
+
+	// 用户实机文案形态（UTC+8）。
+	msg := "usage exceeds frequency limit, but don't worry, your usage will reset at " + at + " UTC+8, and then you can retry"
+	if d := parseUsageResetAt(msg); d < 89*time.Minute || d > 91*time.Minute {
+		t.Fatalf("应解析出约 90 分钟的窗口，实际 %s（%q）", d, msg)
+	}
+	// 带完整偏移的形态（UTC+08:00）同样要认。
+	msg2 := "usage exceeds frequency limit, your usage will reset at " + at + " UTC+08:00"
+	if d := parseUsageResetAt(msg2); d < 89*time.Minute || d > 91*time.Minute {
+		t.Fatalf("UTC+08:00 形态应解析出约 90 分钟，实际 %s", d)
+	}
+	// 单复数变体（resets at）也要认。
+	msg3 := "usage window resets at " + at + " UTC+8"
+	if d := parseUsageResetAt(msg3); d < 89*time.Minute || d > 91*time.Minute {
+		t.Fatalf("resets at 形态应解析出约 90 分钟，实际 %s", d)
+	}
+	// 负偏移带分钟（UTC-0:30）：小时位是 "-0"，Atoi 后丢符号，
+	// 按数值正负判断符号会把 -30 分钟当成 +30 分钟，时刻差一小时。
+	zoneM := time.FixedZone("", -1800)
+	atM := time.Now().Add(90 * time.Minute).In(zoneM).Format("2006-01-02 15:04:05")
+	if d := parseUsageResetAt("usage will reset at " + atM + " UTC-0:30"); d < 89*time.Minute || d > 91*time.Minute {
+		t.Fatalf("UTC-0:30 形态应解析出约 90 分钟，实际 %s", d)
+	}
+	// 时刻已过：返回 0，走原有退避，不能给负数把冷却表弄乱。
+	past := time.Now().Add(-time.Hour).In(zone).Format("2006-01-02 15:04:05")
+	if d := parseUsageResetAt("usage will reset at " + past + " UTC+8"); d != 0 {
+		t.Fatalf("重置时刻已过应返回 0，实际 %s", d)
+	}
+	// 没有重置时刻：返回 0。
+	if d := parseUsageResetAt("rate limit exceeded"); d != 0 {
+		t.Fatalf("无重置时刻应返回 0，实际 %s", d)
+	}
+}
+
+// inspectUpstreamFailure 要把正文里的重置时刻折进 retryAfter，
+// 供 markCooldown 冷却到该时刻（与 Retry-After 头同一通路）。
+func TestInspectUpstreamFailureReturnsUsageResetRetryAfter(t *testing.T) {
+	zone := time.FixedZone("", 8*3600)
+	at := time.Now().Add(90 * time.Minute).In(zone).Format("2006-01-02 15:04:05")
+	resp := &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{},
+		Body: io.NopCloser(strings.NewReader(
+			`{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at ` + at + ` UTC+8, and then you can retry"}`)),
+	}
+	kind, detail, retryAfter := inspectUpstreamFailure(resp)
+	if kind != failRateLimit {
+		t.Fatalf("6004 窗口限流应认成 failRateLimit，实际 %v", kind)
+	}
+	if !strings.Contains(detail, "6004") {
+		t.Errorf("detail 应保留上游错误文案，实际 %q", detail)
+	}
+	if retryAfter < 89*time.Minute || retryAfter > 91*time.Minute {
+		t.Fatalf("retryAfter 应取正文里的重置时刻（约 90 分钟），实际 %s", retryAfter)
+	}
+}
+
+// code=6004 的窗口限流要按上游给的重置时刻把账号跳过（冷却）到那时为止，
+// 而不是按 30 秒的限流退避很快回到轮询里反复撞墙。换号行为不变：
+// 组里还有健康账号时，客户端拿到的仍是健康账号的响应。
+func TestUsageWindowResetHonoredInHTTPFailover(t *testing.T) {
+	zone := time.FixedZone("", 8*3600)
+	at := time.Now().Add(90 * time.Minute).In(zone).Format("2006-01-02 15:04:05")
+	up := newUpstreamStub(t, http.StatusBadRequest,
+		`{"code":6004,"msg":"usage exceeds frequency limit, but don't worry, your usage will reset at `+at+` UTC+8, and then you can retry"}`,
+		"token-a")
+
+	srv, _ := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	for _, uid := range []string{"a", "b"} {
+		cred := &upstream.Credential{
+			Provider: "workbuddy", ID: "workbuddy-" + uid,
+			Auth:    upstream.Tokens{AccessToken: "token-" + uid, ExpiresAt: time.Now().Add(time.Hour).Unix()},
+			Account: upstream.Account{UID: uid},
+		}
+		if err := srv.store.Save(cred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.InvalidateAccounts()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	resp, cred, err := srv.doChat(context.Background(), "workbuddy", []byte(`{"model":"x"}`), req)
+	if err != nil {
+		t.Fatalf("组内还有可用账号时不应报错，实际: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || cred.ID != "workbuddy-b" {
+		t.Fatalf("应换到健康账号 b 并返回 200，实际 %d（%s）", resp.StatusCode, cred.ID)
+	}
+	if left := srv.cooldownLeft("workbuddy-a"); left < 60*time.Minute {
+		t.Fatalf("6004 窗口限流应按重置时刻冷却（约 90 分钟），实际 %s", left)
+	}
+}
+
+// 流式路径同一口径：200 + SSE 错误帧里带着 6004 文案时，
+// 账号也要冷却到重置时刻，而不是几十秒后就回到轮询。
+func TestUsageWindowResetHonoredInStreamFailover(t *testing.T) {
+	zone := time.FixedZone("", 8*3600)
+	at := time.Now().Add(90 * time.Minute).In(zone).Format("2006-01-02 15:04:05")
+	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v3/config" {
+			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		if strings.Contains(r.Header.Get("Authorization"), "token-a") {
+			_, _ = w.Write([]byte("data: {\"error\":{\"code\":6004,\"message\":\"usage exceeds frequency limit, but don't worry, your usage will reset at " + at + " UTC+8, and then you can retry\"}}\n\n"))
+			return
+		}
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"流式ok\"},\"index\":0}]}\n\n"))
+		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+	}))
+	t.Cleanup(up.Close)
+
+	srv, base := newTestServer(t, func(cfg *config.Config) {
+		off := false
+		for i := range cfg.Profiles {
+			cfg.Profiles[i].BaseURL = up.URL
+			cfg.Profiles[i].Origin = up.URL
+			cfg.Profiles[i].SyncModels = &off
+		}
+	})
+	for _, uid := range []string{"a", "b"} {
+		cred := &upstream.Credential{
+			Provider: "workbuddy", ID: "workbuddy-" + uid,
+			Auth:    upstream.Tokens{AccessToken: "token-" + uid, ExpiresAt: time.Now().Add(time.Hour).Unix()},
+			Account: upstream.Account{UID: uid},
+		}
+		if err := srv.store.Save(cred); err != nil {
+			t.Fatal(err)
+		}
+	}
+	srv.InvalidateAccounts()
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "x"}})
+
+	status, raw := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"x","stream":true,"messages":[{"role":"user","content":"hi"}]}`, nil)
+
+	if status != http.StatusOK {
+		t.Fatalf("组内还有可用账号时应换号成功，实际 %d，响应 %s", status, raw)
+	}
+	if !strings.Contains(string(raw), "流式ok") {
+		t.Errorf("客户端应收到健康账号的流式内容，实际 %s", raw)
+	}
+	if left := srv.cooldownLeft("workbuddy-a"); left < 60*time.Minute {
+		t.Fatalf("流首 6004 窗口限流应按重置时刻冷却（约 90 分钟），实际 %s", left)
+	}
+}
+
+// 整组账号都已在冷却中时（如两个账号先后撞进同一个 6004 窗口），新请求
+// 要按 429 + 最早恢复时间带回，而不是「该上游尚未登录账号」——账号明明
+// 在线，只是都在冷却，报未登录会把用户引去反复检查登录状态。冷却只有
+// 几十秒时这条路径很难撞上；按重置时刻冷却动辄几小时，它就是窗口期内
+// 新请求的常态归宿。
+func TestAllAccountsCoolingReturns429NotUnauthorized(t *testing.T) {
+	srv := newTestServerIdle(t, nil)
+	login(t, srv, "workbuddy", "a")
+	login(t, srv, "workbuddy", "b")
+	srv.markCooldown("workbuddy-a", failRateLimit, 30*time.Minute)
+	srv.markCooldown("workbuddy-b", failRateLimit, time.Hour)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	_, _, err := srv.doChat(context.Background(), "workbuddy", []byte(`{"model":"x"}`), req)
+	if err == nil {
+		t.Fatal("整组冷却时应返回错误")
+	}
+	var fail *upstreamFailError
+	if !errors.As(err, &fail) {
+		t.Fatalf("整组冷却应报带重试时间的错误，实际 %v", err)
+	}
+	// Retry-After 取组内最早的冷却截止（a 的 30 分钟）。
+	if fail.retryAfter <= 25*time.Minute || fail.retryAfter > 30*time.Minute {
+		t.Fatalf("Retry-After 应约等于最早的冷却剩余 30 分钟，实际 %s", fail.retryAfter)
+	}
+	if !strings.Contains(err.Error(), "恢复") {
+		t.Errorf("错误文案应说明恢复时间，实际 %s", err)
+	}
+	if errors.Is(err, ErrNoAccount) {
+		t.Error("整组冷却不能误报成尚未登录账号")
+	}
+}
+
+// earliestCooldown 只统计未过期的条目：过期条目要等下次 markCooldown 才回收，
+// 直接采用会把 Retry-After 算成 0 甚至负数，文案里还带着过去的时刻。
+// 场景：a 的冷却已过期但条目残留（且本请求里被 exclude），b 还在冷却——
+// Retry-After 应取 b 的截止时间，而不是 a 那个已经过去的时刻。
+func TestEarliestCooldownIgnoresExpiredEntries(t *testing.T) {
+	srv := newTestServerIdle(t, nil)
+	login(t, srv, "workbuddy", "a")
+	login(t, srv, "workbuddy", "b")
+	srv.coolMu.Lock()
+	srv.cool["workbuddy-a"] = &cooldownState{Until: time.Now().Add(-time.Minute)}
+	srv.coolMu.Unlock()
+	srv.markCooldown("workbuddy-b", failRateLimit, time.Hour)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	_, _, err := srv.doChatExcluding(context.Background(), "workbuddy", []byte(`{"model":"x"}`), req,
+		map[string]bool{"workbuddy-a": true})
+	var fail *upstreamFailError
+	if !errors.As(err, &fail) {
+		t.Fatalf("换号穷尽且其余账号全在冷却应报 429 类错误，实际 %v", err)
+	}
+	if fail.retryAfter <= 30*time.Minute {
+		t.Fatalf("Retry-After 应取未过期的最早冷却（b 的约 1 小时），实际 %s", fail.retryAfter)
+	}
+}
+
 // 成功的请求要清掉连续失败计数，让冷却时长回到起点。
 func TestClearCooldownResetsBackoff(t *testing.T) {
 	srv, _ := newTestServer(t, nil)
@@ -1283,11 +1514,17 @@ func TestStreamErrorEventBecomesHTTPError(t *testing.T) {
 	status, raw := postJSON(t, base+"/v1/chat/completions",
 		`{"model":"x","messages":[{"role":"user","content":"hi"}]}`, nil)
 
-	if status != http.StatusBadGateway {
-		t.Fatalf("流中 error 事件应回 502，实际 %d，响应 %s", status, raw)
+	// 换号穷尽后整组都进了冷却：按 429（可重试）带回，文案里既保留上游
+	// 的原始错误，也带上最早恢复时间。502 会把「账号额度问题」伪装成
+	// 「服务端临时故障」，429 + Retry-After 才是对口的语义。
+	if status != http.StatusTooManyRequests {
+		t.Fatalf("流中 error 事件且整组冷却应回 429，实际 %d，响应 %s", status, raw)
 	}
 	if !strings.Contains(string(raw), "额度已用尽") {
 		t.Errorf("响应应包含上游错误文案，实际 %s", raw)
+	}
+	if !strings.Contains(string(raw), "恢复") {
+		t.Errorf("响应应说明整组的恢复时间，实际 %s", raw)
 	}
 }
 
@@ -1433,7 +1670,8 @@ func TestAggregateStreamErrorFallsOverToNextAccount(t *testing.T) {
 // 换号也用尽时，必须报上游的真实错误，而不是「尚未登录账号」。
 //
 // 用户看到「尚未登录」会去反复检查登录状态，而实际原因是额度用尽，
-// 这种误导比报 502 更糟。
+// 这种误导比报 5xx 更糟。整组随冷却进入 429 语义后，原始文案仍要
+// 拼在组级汇总前面——用户既看到原因，也看到恢复时间。
 func TestAggregateStreamErrorKeepsUpstreamMessageWhenNoAccountLeft(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/v3/config" {
@@ -1460,11 +1698,14 @@ func TestAggregateStreamErrorKeepsUpstreamMessageWhenNoAccountLeft(t *testing.T)
 	status, raw := postJSON(t, base+"/v1/chat/completions",
 		`{"model":"x","messages":[{"role":"user","content":"hi"}]}`, nil)
 
-	if status != http.StatusBadGateway {
+	if status != http.StatusTooManyRequests {
 		t.Fatalf("状态码 = %d，响应 %s", status, raw)
 	}
 	if !strings.Contains(string(raw), "额度不足") {
 		t.Errorf("应保留上游的错误文案，实际 %s", raw)
+	}
+	if !strings.Contains(string(raw), "恢复") {
+		t.Errorf("应带上整组的恢复时间，实际 %s", raw)
 	}
 	if strings.Contains(string(raw), "尚未登录账号") {
 		t.Errorf("不应把额度问题误报成未登录: %s", raw)

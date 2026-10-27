@@ -100,7 +100,14 @@ jobs:
       - name: Package (Windows)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          VERSION: ${{ github.ref_name }}
         run: |
+          # 版本号从 tag 推导（与 macOS 打包一致），传给 NSIS 覆盖脚本里的
+          # 默认值。不传的话「应用和功能」会一直显示脚本里写死的旧版本。
+          $VER = $env:VERSION -replace '^v', ''
+          if ($VER -eq $env:VERSION) { $VER = "1.0.0" }
+
           # 双架构合一安装包：安装时自动检测 x86/x64 选择对应 exe
           $nsis = "C:\Program Files (x86)\NSIS\makensis.exe"
           # makensis 的 File 相对路径以脚本所在目录为基准（不是仓库根），
@@ -108,6 +115,7 @@ jobs:
           & $nsis `
             -DARG_WAILS_AMD64_BINARY="..\..\bin\RapidProxy-amd64.exe" `
             -DARG_RAPIDPROXY_386_BINARY="..\..\bin\RapidProxy-386.exe" `
+            -DINFO_PRODUCTVERSION="$VER" `
             build/windows/installer/project.nsi
           if ($LASTEXITCODE -ne 0) { throw "NSIS 打包失败" }
 

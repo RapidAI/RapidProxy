@@ -15,8 +15,12 @@
 //	qoder     （internal/upstream/qoder）：PKCE 设备登录 + wasm COSY 签名对话。
 //	opencode  （internal/upstream/opencode）：API Key 登录 + OpenAI 形状对话，
 //	          连线时改写 User-Agent 与 x-opencode-session（官方网关校验）。
+//	custom    （internal/upstream/custom）：通用「URL + API Key + 线协议」上游，
+//	          xAI / Claude / ChatGPT / 智谱编程 与任意自建 OpenAI / Anthropic
+//	          兼容端点都归到这一族；Anthropic 线协议时由 anthropicconv 在边界
+//	          把 Anthropic SSE 实时翻译成 OpenAI SSE。
 //
-// Client 按 Profile.Kind 把六个协议动作（StartLogin/Poll/Refresh/
+// Client 按 Profile.Kind 把协议动作（StartLogin/Poll/Refresh/
 // EnsureToken/FetchUpstreamModels/Chat）分发到对应实现；所有对话路径在
 // 适配包边界上统一翻译成 OpenAI SSE，服务层与 Failover 逻辑对上游无感知。
 package upstream
@@ -38,10 +42,12 @@ import (
 	"unicode/utf8"
 
 	"github.com/znsoftm/RapidProxy/internal/config"
+	"github.com/znsoftm/RapidProxy/internal/upstream/custom"
 	"github.com/znsoftm/RapidProxy/internal/upstream/lobsterai"
 	"github.com/znsoftm/RapidProxy/internal/upstream/opencode"
 	"github.com/znsoftm/RapidProxy/internal/upstream/qoder"
 	"github.com/znsoftm/RapidProxy/internal/upstream/trae"
+	"github.com/znsoftm/RapidProxy/internal/upstream/zcode"
 )
 
 // ErrNoAccessToken 表示凭据里没有可用的访问令牌。
@@ -193,6 +199,10 @@ func ProfileKind(p config.Profile) string {
 	if k := strings.TrimSpace(p.Kind); k != "" {
 		return k
 	}
+	// 用户自建的 custom-<hash> 组统一归到 custom 族（即便旧配置没写 Kind）。
+	if strings.HasPrefix(p.ID, "custom-") || p.ID == "custom" {
+		return KindCustom
+	}
 	switch p.ID {
 	case "lobsterai":
 		return KindLobsterAI
@@ -202,6 +212,8 @@ func ProfileKind(p config.Profile) string {
 		return KindQoder
 	case "opencode":
 		return KindOpenCode
+	case "xai", "claude", "chatgpt", "zhipu", "zcode", "custom":
+		return KindCustom
 	default:
 		return KindWorkBuddy
 	}
@@ -215,6 +227,9 @@ const (
 	KindTrae      = "trae"
 	KindQoder     = "qoder"
 	KindOpenCode  = "opencode"
+	// KindCustom 是通用「URL + API Key + 线协议(OpenAI/Anthropic)」上游：
+	// xAI / Claude / ChatGPT / 智谱编程 与用户自建的任意兼容端点都归到这一族。
+	KindCustom = "custom"
 )
 
 // NewClient 按上游配置创建客户端。proxy 为空时跟随系统环境变量。
@@ -260,6 +275,15 @@ func NewClient(p config.Profile, platform, product string) (*Client, error) {
 
 // Kind 返回客户端的协议族。
 func (c *Client) Kind() string { return c.kind }
+
+// protocol 返回上游的线协议：custom 上游取 Profile.Protocol；其它协议族
+// 恒为 openai（它们已在适配层翻译成 OpenAI SSE）。空值按 openai 处理。
+func (c *Client) protocol() string {
+	if p := strings.ToLower(strings.TrimSpace(c.profile.Protocol)); p == "anthropic" {
+		return "anthropic"
+	}
+	return "openai"
+}
 
 func newTransport(proxyRaw string) (*http.Transport, error) {
 	t := &http.Transport{
@@ -440,6 +464,13 @@ func (c *Client) StartLogin(ctx context.Context) (*LoginSession, error) {
 		return c.startQoderLogin(ctx)
 	case KindOpenCode:
 		return c.startOpenCodeLogin(ctx)
+	case KindCustom:
+		// zcode 是智谱 ZCode 在线 OAuth（浏览器授权 → 换 coding-plan Key）；
+		// 其余 custom 上游是 API Key 制。
+		if c.profile.ID == "zcode" {
+			return c.startZCodeLogin(ctx)
+		}
+		return c.startCustomLogin(ctx)
 	default:
 		return c.startWorkBuddyLogin(ctx)
 	}
@@ -728,6 +759,139 @@ func (c *Client) VerifyOpenCodeKey(ctx context.Context, key string) error {
 	return err
 }
 
+// startCustomLogin 发起 custom 上游的 API Key 制登录：一律引导用户到
+// 「粘贴密钥」流程（每个 custom 上游的密钥各不相同，没有可安全复用的本机
+// 密钥；AuthURL 为空，界面不应打开浏览器）。
+func (c *Client) startCustomLogin(ctx context.Context) (*LoginSession, error) {
+	return &LoginSession{
+		State:     "paste",
+		AuthURL:   "",
+		ExpiresAt: time.Now().Add(10 * time.Minute),
+		NeedKey:   true,
+		pollFn: func(pollCtx context.Context) (*Credential, error) {
+			return nil, nil
+		},
+	}, nil
+}
+
+// customCredential 用 API Key 构造 custom 凭据（密钥制、不过期）。
+func (c *Client) customCredential(key string) *Credential {
+	key = strings.TrimSpace(key)
+	cred := &Credential{
+		Provider: c.profile.ID,
+		Auth:     Tokens{AccessToken: key},
+		Account:  Account{UID: shortHash(key), Nickname: custom.KeyLabel(key)},
+	}
+	c.Finalize(cred)
+	return cred
+}
+
+// CustomCredential 用一份 API Key 构造可保存的 custom 凭据（供界面粘贴密钥）。
+func (c *Client) CustomCredential(key string) *Credential {
+	return c.customCredential(key)
+}
+
+// ErrCustomKeyInvalid 是 custom 密钥格式错误的应用层哨兵。
+var ErrCustomKeyInvalid = custom.ErrKeyInvalid
+
+// ErrCustomKeyRejected 是 custom 密钥被上游拒绝（401/403）的应用层哨兵。
+var ErrCustomKeyRejected = custom.ErrKeyRejected
+
+// NormalizeAPIKey 清洗用户粘贴的 custom 密钥。
+func (c *Client) NormalizeAPIKey(key string) (string, error) {
+	if ProfileKind(c.profile) != KindCustom {
+		return "", fmt.Errorf("上游 %s 不使用 API Key 登录", c.profile.Name)
+	}
+	return custom.NormalizeAPIKey(key)
+}
+
+// VerifyAPIKey 用一次模型目录请求校验 custom 密钥是否被上游接受。
+func (c *Client) VerifyAPIKey(ctx context.Context, key string) error {
+	if ProfileKind(c.profile) != KindCustom {
+		return fmt.Errorf("上游 %s 不使用 API Key 登录", c.profile.Name)
+	}
+	normalized, err := custom.NormalizeAPIKey(key)
+	if err != nil {
+		return err
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return custom.VerifyAPIKey(ctx, c.http, c.profile.BaseURL, c.protocol(), c.profile.UserAgent, normalized)
+}
+
+// startZCodeLogin 发起智谱 ZCode 在线登录：在浏览器打开智谱授权页，后台轮询
+// 审批结果，落地后用 OAuth 访问令牌换出 coding-plan API Key 作为凭据。
+//
+// 与 WorkBuddy 的浏览器登录不同，ZCode 的授权页由它自己创建、无回调端口：
+// Poll 在本机轮询登录端点，拿到访问令牌后再请求 bigmodel 业务接口换 Key。
+func (c *Client) startZCodeLogin(ctx context.Context) (*LoginSession, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	hc := c.isolatedClient(0)
+	login, err := zcode.StartLogin(ctx, hc)
+	if err != nil {
+		return nil, err
+	}
+	session := &LoginSession{
+		State:     "zcode",
+		AuthURL:   login.AuthURL(),
+		ExpiresAt: time.Now().Add(login.Lifetime()),
+	}
+	session.pollFn = func(pollCtx context.Context) (*Credential, error) {
+		token, err := zcode.PollUntilReady(pollCtx, hc, login)
+		if err != nil {
+			return nil, err
+		}
+		apiKey, err := zcode.ResolveCodingPlanAPIKey(pollCtx, hc, token.AccessToken)
+		if err != nil {
+			return nil, err
+		}
+		cred := c.zcodeCredential(apiKey, token)
+		return cred, nil
+	}
+	return session, nil
+}
+
+// zcodeCredential 用换出的 coding-plan API Key 构造凭据。Nickname 用智谱账号名
+// （若有），方便同一 ZCode 账号多次登录时识别。
+func (c *Client) zcodeCredential(apiKey string, token zcode.Token) *Credential {
+	apiKey = strings.TrimSpace(apiKey)
+	nickname := strings.TrimSpace(token.UserName)
+	if nickname == "" {
+		nickname = custom.KeyLabel(apiKey)
+	} else {
+		nickname = nickname + "（ZCode）"
+	}
+	cred := &Credential{
+		Provider: c.profile.ID,
+		Auth:     Tokens{AccessToken: apiKey},
+		Account:  Account{UID: shortHash(token.UserID + "|" + apiKey), Nickname: nickname},
+	}
+	c.Finalize(cred)
+	return cred
+}
+
+// fetchCustomModels 从 custom 上游的模型目录拉取模型列表。
+func (c *Client) fetchCustomModels(ctx context.Context, cred *Credential) ([]UpstreamModel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	models, err := custom.ListModels(ctx, c.http, c.profile.BaseURL, c.protocol(), cred.Auth.AccessToken, c.profile.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UpstreamModel, 0, len(models))
+	for _, m := range models {
+		if m.ID == "" {
+			continue
+		}
+		out = append(out, UpstreamModel{ID: m.ID, Name: m.Name})
+	}
+	return out, nil
+}
+
 // EmbeddedAuthURL 返回可嵌入应用内 iframe 的授权链接。
 //
 // 官方登录页原生支持 embed=iframe 模式：登录完成后会向 parent_origin
@@ -737,6 +901,11 @@ func (c *Client) VerifyOpenCodeKey(ctx context.Context, key string) error {
 func (s *LoginSession) EmbeddedAuthURL(parentOrigin string) string {
 	if s.embedFn != nil {
 		return s.embedFn(parentOrigin)
+	}
+	// 没有授权页（如 custom 的粘贴密钥登录）时不要拼出一个 ?embed=iframe 的
+	// 伪地址——前端把它当 iframe 地址会尝试加载一个空页面。
+	if strings.TrimSpace(s.AuthURL) == "" {
+		return ""
 	}
 	u, err := url.Parse(s.AuthURL)
 	if err != nil {
@@ -845,6 +1014,9 @@ func (c *Client) Refresh(ctx context.Context, cred *Credential) error {
 	case KindOpenCode:
 		// Zen 是 API Key 制、不过期：没有刷新端点。EnsureToken 也因
 		// ExpiresAt 为零值而不会走到这里，保留分支只为语义完整。
+		return nil
+	case KindCustom:
+		// 通用 API Key 制、不过期：无刷新端点。
 		return nil
 	default:
 		return c.refreshWorkBuddy(ctx, cred)
@@ -990,6 +1162,8 @@ func (c *Client) FetchUpstreamModels(ctx context.Context, cred *Credential) ([]U
 		return c.fetchQoderModels(ctx, cred)
 	case KindOpenCode:
 		return c.fetchOpenCodeModels(ctx, cred)
+	case KindCustom:
+		return c.fetchCustomModels(ctx, cred)
 	default:
 		return c.fetchWorkBuddyModels(ctx, cred)
 	}
@@ -1183,6 +1357,11 @@ func (c *Client) Chat(ctx context.Context, cred *Credential, body []byte) (*http
 		// 设置里保存的 User-Agent 是裸 "opencode"；适配层只在连往
 		// OpenCode 主机时改写成 opencode/1.18.31 并带上 x-opencode-session。
 		return opencode.Chat(ctx, c.http, c.profile.BaseURL, cred.Auth.AccessToken, c.profile.UserAgent, body)
+	case KindCustom:
+		// 通用 API Key 制上游：按 Profile.Protocol 区分 OpenAI / Anthropic。
+		// Anthropic 线协议时，适配层会把上游的 Anthropic SSE 实时翻译成
+		// OpenAI SSE（见 upstream/custom），服务层对协议差异无感知。
+		return custom.Chat(ctx, c.http, c.profile.BaseURL, cred.Auth.AccessToken, c.protocol(), c.profile.UserAgent, body)
 	default:
 		return c.chatWorkBuddy(ctx, cred, body)
 	}

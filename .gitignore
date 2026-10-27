@@ -16,6 +16,7 @@ accounts/
 # 编辑器
 .idea/
 .vscode/
+.zcode/
 .DS_Store
 
 # 临时截图/二维码

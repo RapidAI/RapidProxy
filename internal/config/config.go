@@ -53,6 +53,10 @@ const (
 	KindQoder = "qoder"
 	// KindOpenCode 是 OpenCode Zen（opencode.ai），API Key 制。
 	KindOpenCode = "opencode"
+	// KindCustom 是通用「URL + API Key + 线协议(OpenAI/Anthropic)」上游：
+	// xAI / Claude / ChatGPT / 智谱编程 以及用户自建的任意 OpenAI、Anthropic
+	// 兼容端点都归到这一族，按 Profile.Protocol 区分线协议。登录是 API Key 制。
+	KindCustom = "custom"
 )
 
 // Edition 区分同一服务商的国内/国际版。
@@ -74,6 +78,9 @@ type Profile struct {
 	UserAgent string `json:"user_agent"`
 	// Kind 是协议族，见 Kind* 常量；为空时按 ID 推断（兼容旧配置文件）。
 	Kind string `json:"kind,omitempty"`
+	// Protocol 仅对 KindCustom 有效，表示上游线协议："openai"（默认）或
+	// "anthropic"。其它协议族忽略此字段。空值按 "openai" 处理。
+	Protocol string `json:"protocol,omitempty"`
 	// Edition 区分国内/国际版（trae、qoder 使用）：cn / global。
 	Edition string `json:"edition,omitempty"`
 	// Proxy 为空时跟随系统环境变量；显式设置则强制走该代理。
@@ -90,10 +97,40 @@ type Profile struct {
 //
 // 国际版上游从国内直连通常不可达或极慢；国内版无需代理。
 func (p Profile) ProxyRecommended() bool {
-	if p.Edition == EditionGlobal || p.Kind == KindOpenCode {
+	if p.Edition == EditionGlobal || p.Kind == KindOpenCode || p.Kind == KindCustom {
 		return true
 	}
 	return strings.Contains(p.BaseURL, "workbuddy.ai")
+}
+
+// isValidProtocol 报告线协议名是否被 custom 上游接受。
+func isValidProtocol(protocol string) bool {
+	switch strings.ToLower(strings.TrimSpace(protocol)) {
+	case "openai", "anthropic", "":
+		return true
+	}
+	return false
+}
+
+// setIfEmpty 用预设把 p 的空字段补齐；同名预设不存在时不动 p。
+func setIfEmpty(p *Profile, preset Profile) {
+	if p.BaseURL == "" {
+		p.BaseURL = preset.BaseURL
+	}
+	if p.Origin == "" {
+		p.Origin = preset.Origin
+	}
+	if p.Name == "" {
+		p.Name = preset.Name
+	}
+	if p.Protocol == "" {
+		p.Protocol = preset.Protocol
+	}
+	// 智谱编程（zhipu / zcode）预设带「编程客户端」身份 opencode：智谱据此
+	// 把请求计入 ZCode / 编程套餐赠送额度。其它预设该字段为空，不覆盖。
+	if p.UserAgent == "" {
+		p.UserAgent = preset.UserAgent
+	}
 }
 
 // VirtualMember 是虚拟模型组的一个成员：指向某个上游的具体模型。
@@ -294,6 +331,80 @@ func OpenCodePreset() Profile {
 	}
 }
 
+// XAIPreset 返回 xAI（api.x.ai，Grok 系列）预设，OpenAI 线协议、API Key 制。
+func XAIPreset() Profile {
+	return Profile{
+		ID:       "xai",
+		Name:     "xAI（Grok）",
+		Enabled:  false,
+		Kind:     KindCustom,
+		Protocol: "openai",
+		// 与 upstream/custom 的默认 OpenAI 端点构造一致：base 已是 /v1 形态。
+		BaseURL: "https://api.x.ai/v1",
+		Origin:  "https://x.ai",
+	}
+}
+
+// ClaudePreset 返回 Anthropic Claude 预设，Anthropic 线协议、API Key 制。
+func ClaudePreset() Profile {
+	return Profile{
+		ID:       "claude",
+		Name:     "Claude（Anthropic）",
+		Enabled:  false,
+		Kind:     KindCustom,
+		Protocol: "anthropic",
+		BaseURL:  "https://api.anthropic.com/v1",
+		Origin:   "https://www.anthropic.com",
+	}
+}
+
+// ChatGPTPreset 返回 OpenAI ChatGPT 预设，OpenAI 线协议、API Key 制。
+func ChatGPTPreset() Profile {
+	return Profile{
+		ID:       "chatgpt",
+		Name:     "ChatGPT（OpenAI）",
+		Enabled:  false,
+		Kind:     KindCustom,
+		Protocol: "openai",
+		BaseURL:  "https://api.openai.com/v1",
+		Origin:   "https://chat.openai.com",
+	}
+}
+
+// ZhipuPreset 返回智谱编程（bigmodel，GLM 系列）预设，Anthropic 线协议、
+// API Key 制。BaseURL 指向智谱的 coding-plan Anthropic 网关，且 UserAgent 用
+// 一个「编程客户端」身份（opencode）——只有这样智谱才会把请求计入 ZCode /
+// 编程套餐赠送的额度，否则会走付费通道。
+func ZhipuPreset() Profile {
+	return Profile{
+		ID:        "zhipu",
+		Name:      "智谱编程（GLM）",
+		Enabled:   false,
+		Kind:      KindCustom,
+		Protocol:  "anthropic",
+		BaseURL:   "https://open.bigmodel.cn/api/anthropic/v1",
+		Origin:    "https://open.bigmodel.cn",
+		UserAgent: "opencode",
+	}
+}
+
+// ZCodePreset 返回智谱 ZCode 登录的智谱编程预设，Anthropic 线协议、ZCode 在线
+// OAuth 登录（浏览器授权 → 换 coding-plan API Key）。与 ZhipuPreset 共用同一
+// 套 coding-plan 网关与客户端身份，区别仅在于登录方式：ZCode 走浏览器授权、
+// 不用手动粘贴 Key。
+func ZCodePreset() Profile {
+	return Profile{
+		ID:        "zcode",
+		Name:      "智谱编程（ZCode 登录）",
+		Enabled:   false,
+		Kind:      KindCustom,
+		Protocol:  "anthropic",
+		BaseURL:   "https://open.bigmodel.cn/api/anthropic/v1",
+		Origin:    "https://open.bigmodel.cn",
+		UserAgent: "opencode",
+	}
+}
+
 // Default 返回内置默认配置。
 func Default() *Config {
 	return &Config{
@@ -310,6 +421,11 @@ func Default() *Config {
 			QoderCNPreset(),
 			QoderGlobalPreset(),
 			OpenCodePreset(),
+			XAIPreset(),
+			ClaudePreset(),
+			ChatGPTPreset(),
+			ZhipuPreset(),
+			ZCodePreset(),
 		},
 	}
 }
@@ -408,7 +524,7 @@ func (c *Config) normalize() {
 		c.Profiles = []Profile{
 			WorkBuddyPreset(), CodeBuddyPreset(), LobsterAIPreset(),
 			TraeCNPreset(), TraeGlobalPreset(), QoderCNPreset(), QoderGlobalPreset(),
-			OpenCodePreset(),
+			OpenCodePreset(), XAIPreset(), ClaudePreset(), ChatGPTPreset(), ZhipuPreset(), ZCodePreset(),
 		}
 	} else {
 		// 版本升级带来的新预设要补齐：旧配置文件里只有当时的上游清单，
@@ -417,7 +533,7 @@ func (c *Config) normalize() {
 		missing := []Profile{
 			WorkBuddyPreset(), CodeBuddyPreset(), LobsterAIPreset(),
 			TraeCNPreset(), TraeGlobalPreset(), QoderCNPreset(), QoderGlobalPreset(),
-			OpenCodePreset(),
+			OpenCodePreset(), XAIPreset(), ClaudePreset(), ChatGPTPreset(), ZhipuPreset(), ZCodePreset(),
 		}
 		for _, preset := range missing {
 			found := false
@@ -435,6 +551,11 @@ func (c *Config) normalize() {
 	for i := range c.Profiles {
 		p := &c.Profiles[i]
 		p.ID = strings.TrimSpace(p.ID)
+		// 用户自建的 custom-<hash> 组：协议族统一归到 custom（即便旧配置里
+		// Kind 为空），具体线协议在下面按 KindCustom 统一校正。
+		if strings.HasPrefix(p.ID, "custom-") || p.ID == "custom" {
+			p.Kind = KindCustom
+		}
 		switch p.ID {
 		case "workbuddy":
 			preset := WorkBuddyPreset()
@@ -544,6 +665,33 @@ func (c *Config) normalize() {
 			// 上游侧（见 upstream/opencode），不落进配置文件。
 			if p.UserAgent == "" {
 				p.UserAgent = preset.UserAgent
+			}
+		case "xai", "claude", "chatgpt", "zhipu", "zcode":
+			// 通用「URL + API Key + 线协议」上游的五个命名预设。Protocol、
+			// BaseURL/Origin/Name 缺失时回退预设。
+			p.Kind = KindCustom
+			p.Edition = ""
+			switch p.ID {
+			case "xai":
+				setIfEmpty(p, XAIPreset())
+			case "claude":
+				setIfEmpty(p, ClaudePreset())
+			case "chatgpt":
+				setIfEmpty(p, ChatGPTPreset())
+			case "zhipu":
+				setIfEmpty(p, ZhipuPreset())
+			case "zcode":
+				// zcode 与 zhipu 共用同一套 coding-plan 网关与客户端身份，
+				// 区别仅在于登录方式（ZCode 浏览器 OAuth）与显示名。
+				setIfEmpty(p, ZCodePreset())
+			}
+		}
+		// 所有 Kind=custom 的上游（命名预设与用户自建组）统一校正线协议：
+		// 空值与未知值一律按 openai 处理，Editon 不参与。
+		if p.Kind == KindCustom {
+			p.Edition = ""
+			if !isValidProtocol(p.Protocol) {
+				p.Protocol = "openai"
 			}
 		}
 		if p.UserAgent == "" && (p.Kind == "" || p.Kind == KindWorkBuddy) {

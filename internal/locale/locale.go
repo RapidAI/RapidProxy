@@ -107,17 +107,26 @@ var catalog = map[string]entry{
 	"dlg.minimized.ok": {"知道了", "Got it"},
 
 	// ---- 登录 ----
-	"login.browserOpened":   {"已在系统浏览器打开官方登录页，请在该窗口完成授权", "The official sign-in page was opened in your default browser — finish authorizing there"},
-	"login.importing":       {"已找到本机保存的 OpenCode 密钥（%s），等待确认", "Found the OpenCode key saved on this device (%s) — waiting for confirmation"},
-	"login.pasteKey":        {"请在浏览器中创建 OpenCode 密钥，并粘贴到下方输入框", "Create an OpenCode key in your browser, then paste it into the box below"},
-	"login.keyInvalid":      {"OpenCode 密钥无效，请检查后重试", "That OpenCode key looks invalid — please check it and try again"},
-	"login.keyEmpty":        {"请输入 OpenCode 密钥，或直接确认使用本机已保存的密钥", "Enter an OpenCode key, or confirm the one saved on this device"},
-	"login.keyRejected":     {"OpenCode 密钥被上游拒绝，请确认密钥是否正确、未过期", "The OpenCode key was rejected by the server — make sure it is correct and still valid"},
-	"login.timeout":         {"登录超时或已取消", "Sign-in timed out or was cancelled"},
-	"login.expired":         {"登录链接已过期，请重新发起登录", "The sign-in link has expired — please start again"},
-	"login.saveFailed":      {"保存凭据失败: %s", "Failed to save credentials: %s"},
-	"login.success":         {"登录成功", "Signed in"},
-	"login.unknownProvider": {"未知的上游: %s", "Unknown provider: %s"},
+	"login.browserOpened":      {"已在系统浏览器打开官方登录页，请在该窗口完成授权", "The official sign-in page was opened in your default browser — finish authorizing there"},
+	"login.importing":          {"已找到本机保存的 OpenCode 密钥（%s），等待确认", "Found the OpenCode key saved on this device (%s) — waiting for confirmation"},
+	"login.pasteKey":           {"请在浏览器中创建 OpenCode 密钥，并粘贴到下方输入框", "Create an OpenCode key in your browser, then paste it into the box below"},
+	"login.pasteKey.custom":    {"请粘贴该服务商的 API Key 完成登录", "Paste the provider's API key to sign in"},
+	"login.keyInvalid":         {"OpenCode 密钥无效，请检查后重试", "That OpenCode key looks invalid — please check it and try again"},
+	"login.keyEmpty":           {"请输入 OpenCode 密钥，或直接确认使用本机已保存的密钥", "Enter an OpenCode key, or confirm the one saved on this device"},
+	"login.keyRejected":        {"OpenCode 密钥被上游拒绝，请确认密钥是否正确、未过期", "The OpenCode key was rejected by the server — make sure it is correct and still valid"},
+	"login.keyInvalid.custom":  {"密钥无效，请检查后重试", "That key looks invalid — please check it and try again"},
+	"login.keyRejected.custom": {"密钥被上游拒绝，请确认密钥是否正确、未过期", "The key was rejected by the server — make sure it is correct and still valid"},
+	"login.timeout":            {"登录超时或已取消", "Sign-in timed out or was cancelled"},
+	"login.expired":            {"登录链接已过期，请重新发起登录", "The sign-in link has expired — please start again"},
+	"login.saveFailed":         {"保存凭据失败: %s", "Failed to save credentials: %s"},
+	"login.success":            {"登录成功", "Signed in"},
+	"login.unknownProvider":    {"未知的上游: %s", "Unknown provider: %s"},
+
+	// ---- 自定义服务商 ----
+	"provider.nameEmpty":  {"服务商名称不能为空", "The provider name must not be empty"},
+	"provider.urlEmpty":   {"接口地址（Base URL）不能为空", "The base URL must not be empty"},
+	"provider.urlInvalid": {"接口地址无效，需为 http(s):// 开头的完整地址", "Invalid base URL — it must be a full http(s):// URL"},
+	"provider.modelEmpty": {"模型 ID 不能为空", "The model ID must not be empty"},
 
 	// ---- API Key ----
 	"key.empty":     {"API Key 不能为空", "The API key must not be empty"},

@@ -584,7 +584,7 @@ func (s *Server) buildModelEntries() []modelEntry {
 			})
 		}
 	}
-	out = append(out, s.virtualModelEntries(active, modelSets, out)...)
+	out = append(out, s.virtualModelEntries(modelSets, active, out)...)
 	return out
 }
 
@@ -604,7 +604,7 @@ func (s *Server) buildModelEntries() []modelEntry {
 // 单上游场景下真实模型用裸名，与虚拟名撞车会让 /v1/models 出现重复 ID，
 // 客户端（以及按 ID 去重的客户端缓存）会拿到两条互相矛盾的条目。
 // 虚拟组本身仍然可路由——resolveRoute 里虚拟组优先，只是列表里不重复列。
-func (s *Server) virtualModelEntries(active []config.Profile, modelSets [][]upstream.ModelInfo, taken []modelEntry) []modelEntry {
+func (s *Server) virtualModelEntries(modelSets [][]upstream.ModelInfo, active []config.Profile, taken []modelEntry) []modelEntry {
 	cfg := s.Config()
 	vms := cfg.EnabledVirtualModels()
 	if len(vms) == 0 {
@@ -614,15 +614,36 @@ func (s *Server) virtualModelEntries(active []config.Profile, modelSets [][]upst
 	for _, e := range taken {
 		used[e.ID] = true
 	}
-	// 已登录上游的模型索引：用来取成员元信息，也用来判断成员是否「真的存在」。
-	// 成员模型可能已从上游下线，那种条目在列表里显示出来毫无意义。
+	// 成员可能指向「已登录但全局停用」的上游（虚拟组允许这种用法），
+	// 而 active/modelSets 只覆盖已启用的上游。这里补上那些上游的模型，
+	// 否则它们的成员会被误判为「模型不存在」而被漏掉。
 	index := make(map[string]upstream.ModelInfo, len(active)*8)
+	addSet := func(p config.Profile, models []upstream.ModelInfo) {
+		for _, m := range models {
+			index[p.ID+"/"+m.ID] = m
+		}
+	}
 	for i, p := range active {
 		if i >= len(modelSets) {
 			break
 		}
-		for _, m := range modelSets[i] {
-			index[p.ID+"/"+m.ID] = m
+		addSet(p, modelSets[i])
+	}
+	// 成员引用到的、但不在 active 里的上游（即未启用的），按需补查一次。
+	// 只查真正被成员引用到的上游，不做全量扫描。
+	for _, vm := range vms {
+		for _, m := range vm.Members {
+			if _, ok := index[m.Key()]; ok {
+				continue
+			}
+			p, ok := cfg.ProfileByID(m.Provider)
+			if !ok {
+				continue
+			}
+			if !s.hasCredential(p.ID) {
+				continue
+			}
+			addSet(p, s.modelsFor(p.ID))
 		}
 	}
 
@@ -691,9 +712,45 @@ func (s *Server) AllModels() []openai.Model {
 	return out
 }
 
+// hasCachedModels 报告某上游是否已有非空的模型缓存。
+//
+// 用于区分「首次同步还没成功」与「曾经成功、这次临时失败」：
+// 前者用白名单兜底是合理的，后者必须保留旧数据。
+func (s *Server) hasCachedModels(providerID string) bool {
+	s.modelsMu.RLock()
+	defer s.modelsMu.RUnlock()
+	return len(s.models[providerID]) > 0
+}
+
 // ModelIDs 返回所有可用模型 ID。
 func (s *Server) ModelIDs() []string {
 	models := s.AllModels()
+	out := make([]string, 0, len(models))
+	for _, m := range models {
+		out = append(out, m.ID)
+	}
+	return out
+}
+
+// LoggedInModels 返回「所有已登录上游」的模型，不区分上游是否全局启用。
+//
+// 与 AllModels 的区别：AllModels 只包含已启用上游的模型（那是对外暴露的
+// 清单），而虚拟组编辑器需要看到「已登录但没启用」的上游也能用哪些模型——
+// 否则用户明明登录了账号，却在组编辑器里选不到任何模型。
+//
+// 返回的 ID 是该上游的原始模型 ID（不带 "intl:" / "上游ID:" 前缀），
+// 与 VirtualMember.Model 的存储形式一致。
+func (s *Server) LoggedInModels(providerID string) []string {
+	providerID = strings.TrimSpace(providerID)
+	if providerID == "" {
+		return nil
+	}
+	cfg := s.Config()
+	profile, ok := cfg.ProfileByID(providerID)
+	if !ok || !s.hasCredential(providerID) {
+		return nil
+	}
+	models := s.modelsFor(profile.ID)
 	out := make([]string, 0, len(models))
 	for _, m := range models {
 		out = append(out, m.ID)
@@ -719,7 +776,20 @@ func (s *Server) RefreshModels(ctx context.Context) {
 	defer s.syncMu.Unlock()
 
 	cfg := s.Config()
-	for _, p := range cfg.EnabledProfiles() {
+	// 同步范围是「所有已登录账号的上游」，不只是已启用的。
+	//
+	// 虚拟组允许使用已登录但全局停用的上游（见 usableVirtualMembers），
+	// 那些上游的模型若不同步，modelsFor 只能退回内置白名单——白名单可能
+	// 缺少上游新上线的模型，也可能残留已下线的模型，用户在虚拟组编辑器里
+	// 就会看到一份过时的清单。
+	//
+	// 未登录的上游仍然跳过：没有账号就无从拉取，白名单兜底已经够用。
+	for _, p := range cfg.Profiles {
+		if !s.hasCredential(p.ID) {
+			// 之前有账号、现在没有：清掉旧缓存，避免账号删除后模型残留。
+			s.setModels(p.ID, nil)
+			continue
+		}
 		client, err := s.ClientFor(p.ID)
 		if err != nil {
 			continue
@@ -766,6 +836,14 @@ func (s *Server) RefreshModels(ctx context.Context) {
 			}
 		}
 		models := client.BuildModelList(p.ExtraModels, p.DisabledModels, upstreamModels)
+		// 所有账号都没拉到模型时（上游故障、令牌全失效），不要把上一次成功
+		// 同步的真实清单覆盖成纯白名单：上游只是临时不可达，模型并没有下线。
+		// 覆盖会让虚拟组里引用了「白名单之外模型」的成员凭空变成不可用，
+		// 用户看到的是「我的模型怎么没了」。
+		if len(upstreamModels) == 0 && s.hasCachedModels(p.ID) {
+			s.log.Warnf("上游 %s 本轮未取到模型，保留上次缓存", p.ID)
+			continue
+		}
 		s.setModels(p.ID, models)
 		s.log.Infof("上游 %s 可用模型 %d 个（%d 个账号）", p.ID, len(models), len(creds))
 	}
@@ -1835,9 +1913,11 @@ func (s *Server) resolveModel(name string, r *http.Request) (config.Profile, str
 // 虚拟组也应当按强制路由走。
 func (s *Server) resolveRoute(name string, r *http.Request) (config.Profile, string, *config.VirtualModel, error) {
 	cfg := s.Config()
-	enabled := cfg.EnabledProfiles()
-	if len(enabled) == 0 {
-		return config.Profile{}, "", nil, errors.New("没有启用任何上游，请先在设置中启用")
+	// 不能因为「没有启用任何上游」就提前失败：虚拟组允许使用已登录但未全局
+	// 启用的上游（见 usableVirtualMembers），只由这类成员组成的组仍应可用。
+	// 各分支会各自判断自己需要的条件。
+	if len(cfg.Profiles) == 0 {
+		return config.Profile{}, "", nil, errors.New("没有配置任何上游")
 	}
 
 	model := strings.TrimSpace(name)
@@ -2400,9 +2480,14 @@ func virtualMemberKey(virtualName string, m config.VirtualMember) string {
 
 // usableVirtualMembers 返回虚拟组里此刻能承接请求的成员。
 //
-// 逐个检查：上游是否启用、是否登录了账号、该上游是否还有可用账号
-// （非暂停、非冷却）。这些条件任一不满足就跳过——用户看到的应是
-// 「组里还有谁能接」，而不是「配置里写了几个成员」。
+// 判据是「该上游是否还有可用账号」（非暂停、非冷却）。这些条件任一不满足
+// 就跳过——用户看到的应是「组里还有谁能接」，而不是「配置里写了几个成员」。
+//
+// 刻意不检查上游的全局启用开关：虚拟组是用户对「用哪个上游的哪个模型」
+// 的显式选择，优先级高于上游的全局开关。想掐断整组流量就停用这个组本身
+// （VirtualModel.Enabled），而不是去关上游——关上游会连带影响所有裸模型名
+// 的调用，语义过重。这与 /v1/models 的暴露规则也是自洽的：全局停用的上游
+// 不会让它的全部模型出现在列表里，但虚拟组把它单独拎出来用是用户的意思。
 //
 // exclude 里的成员不再考虑，供成员失败后依次换人重试。
 func (s *Server) usableVirtualMembers(cfg *config.Config, vm *config.VirtualModel, exclude map[string]bool) []config.VirtualMember {
@@ -2425,8 +2510,8 @@ func (s *Server) usableVirtualMembers(cfg *config.Config, vm *config.VirtualMode
 		if exclude[m.Key()] {
 			continue
 		}
-		profile, ok := cfg.ProfileByID(m.Provider)
-		if !ok || !profile.Enabled {
+		// 上游必须存在（成员可能在配置被手改后指向已删除的上游）。
+		if _, ok := cfg.ProfileByID(m.Provider); !ok {
 			continue
 		}
 		if !available(m.Provider) {

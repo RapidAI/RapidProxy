@@ -12,8 +12,8 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.Listen != DefaultListen {
 		t.Errorf("默认监听地址 = %q", cfg.Listen)
 	}
-	if len(cfg.Profiles) != 8 {
-		t.Fatalf("默认应有 8 个上游，实际 %d", len(cfg.Profiles))
+	if len(cfg.Profiles) != 13 {
+		t.Fatalf("默认应有 13 个上游，实际 %d", len(cfg.Profiles))
 	}
 	kinds := map[string]string{}
 	for _, p := range cfg.Profiles {
@@ -24,6 +24,11 @@ func TestDefaultConfig(t *testing.T) {
 		kinds["qoder-global"] != KindQoder || kinds["workbuddy"] != KindWorkBuddy ||
 		kinds["opencode"] != KindOpenCode {
 		t.Errorf("上游协议族标注不符合预期: %v", kinds)
+	}
+	for _, id := range []string{"xai", "claude", "chatgpt", "zhipu", "zcode"} {
+		if kinds[id] != KindCustom {
+			t.Errorf("上游 %s 应标注为 %s，实际 %q", id, KindCustom, kinds[id])
+		}
 	}
 	enabled := cfg.EnabledProfiles()
 	if len(enabled) != 1 || enabled[0].ID != "workbuddy" {
@@ -86,7 +91,7 @@ func TestNormalizeFillsMissingFields(t *testing.T) {
 	if c.Platform != DefaultPlatform || c.Product != DefaultProduct {
 		t.Error("platform / product 未补默认值")
 	}
-	if len(c.Profiles) != 8 {
+	if len(c.Profiles) != 13 {
 		t.Errorf("上游未补默认值: %d", len(c.Profiles))
 	}
 }
@@ -265,14 +270,14 @@ func TestOldConfigGainsNewPresets(t *testing.T) {
 		t.Fatal(err)
 	}
 	cfg.Normalize()
-	if len(cfg.Profiles) != 8 {
-		t.Fatalf("升级后应有 8 个上游，实际 %d", len(cfg.Profiles))
+	if len(cfg.Profiles) != 13 {
+		t.Fatalf("升级后应有 13 个上游，实际 %d", len(cfg.Profiles))
 	}
 	byID := map[string]Profile{}
 	for _, p := range cfg.Profiles {
 		byID[p.ID] = p
 	}
-	for _, id := range []string{"lobsterai", "trae-cn", "trae-global", "qoder-cn", "qoder-global", "opencode"} {
+	for _, id := range []string{"lobsterai", "trae-cn", "trae-global", "qoder-cn", "qoder-global", "opencode", "xai", "claude", "chatgpt", "zhipu", "zcode"} {
 		p, ok := byID[id]
 		if !ok {
 			t.Fatalf("升级后缺少预设 %s", id)

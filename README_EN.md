@@ -2,7 +2,7 @@
 
 [中文说明](README.md) | **English**
 
-Turn **WorkBuddy** (international), **CodeBuddy** (China), **LobsterAI**, **Trae** (China / International) and **Qoder** (China / International) accounts into a local **OpenAI-compatible API**. Sign in once, and any client that supports a custom OpenAI endpoint (Cherry Studio, ChatBox, LobeChat, Open WebUI, Cursor, Cline, various SDKs and scripts, …) can call the models directly.
+Turn **WorkBuddy** (international), **CodeBuddy** (China), **LobsterAI**, **Trae** (China / International), **Qoder** (China / International) and **OpenCode** accounts — plus any **xAI / Claude / ChatGPT / Zhipu** or arbitrary OpenAI- or Anthropic-compatible endpoint — into a local **OpenAI-compatible API**. Sign in once, and any client that supports a custom OpenAI endpoint (Cherry Studio, ChatBox, LobeChat, Open WebUI, Cursor, Cline, various SDKs and scripts, …) can call the models directly.
 
 - Language / framework: Go + Wails v2 (native WebView, small installer, low memory footprint)
 - Platforms: Windows / macOS / Linux
@@ -29,12 +29,28 @@ Each signable provider is one **group**: accounts inside a group are served with
 | `qoder-cn` | Qoder (China) | Device code (PKCE) | COSY-signed chat, approve in the browser |
 | `qoder-global` | Qoder (International) | Device code (PKCE) | Separate from the China edition |
 | `opencode` | OpenCode Zen (opencode.ai) | API key | Imports the key saved by the local OpenCode CLI and waits for confirmation (paste a new key to override), or paste a key directly; a proxy is recommended |
+| `xai` | xAI (Grok) | API key | OpenAI wire protocol, `api.x.ai` |
+| `claude` | Claude (Anthropic) | API key | Anthropic wire protocol, `api.anthropic.com` |
+| `chatgpt` | ChatGPT (OpenAI) | API key | OpenAI wire protocol, `api.openai.com` |
+| `zhipu` | Zhipu Coding (GLM) | API key | Anthropic wire protocol via the coding-plan gateway, client identity `opencode` |
+| `zcode` | Zhipu Coding (ZCode sign-in) | Browser authorization | ZCode online OAuth (China `zcode.chatglm.site` / international `zcode.z.ai`) resolves a coding-plan API key and calls it as a coding client |
+
+### Custom models (each is its own group)
+
+Beyond the fixed presets, the backend method `AddCustomProvider(name, baseURL, apiKey, protocol, model)` adds **any** OpenAI- or Anthropic-compatible endpoint (DeepSeek, Moonshot, Qwen, Volcengine Ark, self-hosted gateways, …). **Every call creates an independent group**, so each custom model is its own group and never mixes with the other providers; adding the same name again reuses that group.
+
+- `protocol` is `openai` (default) or `anthropic`; `baseURL` may include `/v1` or not (it is completed automatically).
+- Zhipu's gifted quota is decided by the request **User-Agent** (coding-client identity), so the `zhipu` / `zcode` presets send `opencode` by default; if an account's quota requires a different client identity (e.g. `claude code`, `codex`), change `user_agent` in that profile in `config.json`.
+- With the Anthropic wire protocol the proxy performs full **OpenAI ⇄ Anthropic** translation at the boundary (system, tools/tool_calls, thinking, streamed SSE deltas), so clients only ever see an OpenAI-compatible API.
+- You can also edit `config.json` directly and add `{"id":"custom-xxx","kind":"custom","protocol":"anthropic","base_url":"...","extra_models":["..."]}` to `profiles`.
 
 ---
 
 ## Features
 
-- **Graphical sign-in**: built-in presets for WorkBuddy, CodeBuddy, LobsterAI, Trae (China / International) and Qoder (China / International). Click "Sign in" and the authorization page opens in your system browser; tokens are saved and refreshed automatically. Sign-in status is shown on the Overview tab.
+- **Graphical sign-in**: built-in presets for WorkBuddy, CodeBuddy, LobsterAI, Trae (China / International), Qoder (China / International), OpenCode, xAI, Claude, ChatGPT and Zhipu Coding (including ZCode sign-in). Click "Sign in" to authorize in your system browser or paste an API key; tokens/keys are saved and refreshed automatically. Sign-in status is shown on the Overview tab.
+- **xAI / Claude / ChatGPT / Zhipu Coding**: use the fixed presets, or call `AddCustomProvider` to add any OpenAI- or Anthropic-compatible endpoint; the proxy translates requests and SSE streams both ways for the Anthropic wire protocol, transparently to the client.
+- **ZCode sign-in**: Zhipu Coding supports ZCode online OAuth (with automatic China / international fallback), resolves a coding-plan API key after authorization, and calls it with a coding-client User-Agent so the gifted ZCode / coding-plan quota applies.
 - **OpenAI-compatible service**: exposes `/v1/models`, `/v1/chat/completions` (plus equivalent paths without `/v1`) and `/healthz`. Both streaming and non-streaming requests are supported (streaming-only upstreams are aggregated server-side).
 - **Multi-account load balancing**: sign in with several accounts per provider; requests are served by weighted round-robin. Expired tokens are refreshed automatically and 401/403 responses are retried once.
 - **In-group failure auto-skip**: whenever an account runs into trouble, the proxy moves to the next account in the group instead of passing the error to the client — rate limits / exhausted credits / upstream outages cool the account down and switch; "this account can't serve this request" errors (model not enabled, bad parameters…) switch without cooling; for streaming requests, an upstream that reports failure at the very first SSE event (HTTP 200 + error frame) also triggers a switch before a single byte is written downstream; when a window-limited error states its reset time in the message body (e.g. code=6004 "usage will reset at …"), the cooldown lasts until that moment instead of a few dozen seconds. Only after every account in the group has been tried does the last error come back with its original status code (retryable failures are summarized as 429 + Retry-After).
@@ -197,7 +213,7 @@ curl ... -H "X-RapidProxy-Account: <account-id>" -d '{"model":"glm-5.3", ...}'
 
 A virtual model name pools models from several providers, so different vendors' models can behave as one availability pool:
 
-- **Create**: open the Virtual tab, pick a name (e.g. `fast`), then add models from providers that are enabled and signed in. Each member has its own weight (default 1; higher weight gets more traffic).
+- **Create**: open the Virtual tab, pick a name (e.g. `fast`), then add models from any provider that has a signed-in account. Whether a provider is globally enabled does not affect whether its models can join a virtual group. Each member has its own weight (default 1; higher weight gets more traffic).
 - **Call it**: set `model` to the group name — it works exactly like a real model ID:
 
   ```bash
@@ -207,6 +223,7 @@ A virtual model name pools models from several providers, so different vendors' 
 - **Balancing and skipping**: members are served by smooth weighted round-robin. When a member as a whole is unavailable (provider disabled / not signed in / all accounts paused / all cooling down / the upstream does not accept that model), the request moves to the next member and the client never sees the error. Only after every member has been tried does the proxy return an error, following the existing rules (client errors keep their status code, retryable failures become 429 + Retry-After).
 - **Naming rules**: no `:`, `/` or spaces (both are force-routing separators), and the name must not collide with a provider ID or `intl`. If it collides with a real model ID, the virtual group wins.
 - **Precedence**: explicit force-routing (`provider:model`, `X-RapidProxy-Provider`, `?provider=`) takes precedence over a virtual group, so you can always bypass it temporarily.
+- **Relationship to provider switches**: a virtual group is an explicit choice of "which provider's which model", and outranks the provider's global enable switch — members keep working even if the provider is disabled in Settings. To cut a group's traffic, disable the group itself, so bare model calls to that provider are unaffected.
 - **Traffic stats**: each group has its own dimension, while every request is still recorded against the real provider and real model (for reconciling upstream quota). Selecting a virtual group also shows the per-member breakdown.
 - **Rename and delete**: renaming migrates the traffic history to the new name; deleting clears the history so a later same-named group does not inherit old data.
 

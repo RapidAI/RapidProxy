@@ -110,6 +110,51 @@ var OpenCodeSpecs = []ModelSpec{
 	{"big-pickle", "Big Pickle", 128000, 0},
 }
 
+// XAISpecs 是 xAI（Grok）的内置兜底目录（OpenAI 线协议）。
+// 真实目录以远端 /models 为准，同步失败时也不至于列表为空。
+var XAISpecs = []ModelSpec{
+	{"grok-4", "Grok 4", 256000, 8096},
+	{"grok-4-fast", "Grok 4 Fast", 256000, 8096},
+	{"grok-3", "Grok 3", 131072, 8096},
+	{"grok-3-mini", "Grok 3 Mini", 131072, 8096},
+	{"grok-2", "Grok 2", 131072, 8096},
+	{"grok-2-mini", "Grok 2 Mini", 131072, 8096},
+}
+
+// ClaudeSpecs 是 Anthropic Claude 的内置兜底目录（Anthropic 线协议）。
+// 真实目录以远端 /v1/models 为准，同步失败时也不至于列表为空。
+var ClaudeSpecs = []ModelSpec{
+	{"claude-opus-4-5", "Claude Opus 4.5", 200000, 32000},
+	{"claude-sonnet-4-5", "Claude Sonnet 4.5", 200000, 64000},
+	{"claude-sonnet-4-5-thinking", "Claude Sonnet 4.5 (Thinking)", 200000, 64000},
+	{"claude-haiku-4-5", "Claude Haiku 4.5", 200000, 32000},
+	{"claude-3-5-sonnet", "Claude 3.5 Sonnet", 200000, 8192},
+	{"claude-3-5-haiku", "Claude 3.5 Haiku", 200000, 8192},
+	{"claude-3-opus", "Claude 3 Opus", 200000, 4096},
+}
+
+// ChatGPTSpecs 是 OpenAI ChatGPT 的内置兜底目录（OpenAI 线协议）。
+var ChatGPTSpecs = []ModelSpec{
+	{"gpt-5", "GPT-5", 272000, 128000},
+	{"gpt-5-mini", "GPT-5 Mini", 272000, 128000},
+	{"gpt-5-nano", "GPT-5 Nano", 272000, 128000},
+	{"gpt-4.1", "GPT-4.1", 1047576, 32768},
+	{"gpt-4.1-mini", "GPT-4.1 Mini", 1047576, 32768},
+	{"gpt-4.1-nano", "GPT-4.1 Nano", 1047576, 32768},
+	{"gpt-4o", "GPT-4o", 128000, 16384},
+	{"gpt-4o-mini", "GPT-4o Mini", 128000, 16384},
+	{"o3", "o3", 200000, 100000},
+	{"o4-mini", "o4-mini", 200000, 100000},
+}
+
+// ZhipuSpecs 是智谱编程（GLM，bigmodel Anthropic 网关）的内置兜底目录
+// （Anthropic 线协议）。真实目录以远端 /v1/models 为准，同步失败时也不至于列表为空。
+var ZhipuSpecs = []ModelSpec{
+	{"glm-5.3", "GLM-5.3", 128000, 8192},
+	{"glm-5.3-flash", "GLM-5.3-Flash", 128000, 8192},
+	{"glm-5.2", "GLM-5.2", 128000, 8192},
+}
+
 // Allowlist 返回指定上游的内置白名单。
 func Allowlist(profileID string) []ModelSpec {
 	switch profileID {
@@ -129,6 +174,14 @@ func Allowlist(profileID string) []ModelSpec {
 		return QoderGlobalSpecs
 	case "opencode":
 		return OpenCodeSpecs
+	case "xai":
+		return XAISpecs
+	case "claude":
+		return ClaudeSpecs
+	case "chatgpt":
+		return ChatGPTSpecs
+	case "zhipu", "zcode":
+		return ZhipuSpecs
 	default:
 		return nil
 	}

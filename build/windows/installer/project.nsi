@@ -24,6 +24,17 @@
 ## 直接拒绝（requires elevation）。真正的提权在 .onInit 里做（自提权）。
 ####
 !define REQUEST_EXECUTION_LEVEL "user"
+
+## 公司名与产品名同为 RapidProxy：wails 默认用「公司名+产品名」拼卸载项名，
+## 会得到 RapidProxyRapidProxy，这里固定成 RapidProxy。
+!define UNINST_KEY_NAME "RapidProxy"
+
+## 旧版（≤ v1.6.0）的产品名是 WorkBuddy Proxy：安装目录在
+## $PROGRAMFILES\RapidProxy\WorkBuddy Proxy（公司名目录下再套产品名），
+## 快捷方式与卸载项也用这个名字。升级时必须显式清理，否则「应用和功能」
+## 和桌面上会新旧条目并存。
+!define LEGACY_PRODUCTNAME "WorkBuddy Proxy"
+!define LEGACY_UNINST_KEY_NAME "RapidProxyWorkBuddy Proxy"
 ## Include the wails tools
 ####
 !include "wails_tools.nsh"
@@ -81,8 +92,11 @@ LangString MsgWin10Required ${LANG_SIMPCHINESE} "${INFO_PRODUCTNAME} 需要 Wind
 
 Name "${INFO_PRODUCTNAME}"
 OutFile "..\..\bin\${INFO_PROJECTNAME}-windows-setup.exe" # 双架构合一安装包
-InstallDir "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}" # .onInit 按架构重设
+InstallDir "$PROGRAMFILES64\${INFO_PRODUCTNAME}" # .onInit 按架构重设
 ShowInstDetails show # This will always show the installation details.
+
+# 旧版安装目录（按旧版布局算出来），供 RemoveLegacyInstall 使用。
+Var LEGACY_INSTDIR
 
 Function .onInit
     # 自提权：非提权会话（管理员普通运行、标准用户、旧版本在线更新直接
@@ -115,10 +129,39 @@ Function .onInit
 
     # 按系统架构选择安装目录（32 位系统上 $PROGRAMFILES32 即 $PROGRAMFILES）
     ${If} ${RunningX64}
-        StrCpy $INSTDIR "$PROGRAMFILES64\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}"
+        StrCpy $INSTDIR "$PROGRAMFILES64\${INFO_PRODUCTNAME}"
     ${Else}
-        StrCpy $INSTDIR "$PROGRAMFILES32\${INFO_COMPANYNAME}\${INFO_PRODUCTNAME}"
+        StrCpy $INSTDIR "$PROGRAMFILES32\${INFO_PRODUCTNAME}"
     ${EndIf}
+
+    # 旧版布局是 $PROGRAMFILES\<公司名>\<产品名>，按已知布局直接拼出来，
+    # 不从注册表读任意路径再做递归删除。
+    ${If} ${RunningX64}
+        StrCpy $LEGACY_INSTDIR "$PROGRAMFILES64\${INFO_COMPANYNAME}\${LEGACY_PRODUCTNAME}"
+    ${Else}
+        StrCpy $LEGACY_INSTDIR "$PROGRAMFILES32\${INFO_COMPANYNAME}\${LEGACY_PRODUCTNAME}"
+    ${EndIf}
+FunctionEnd
+
+# 清理旧版「WorkBuddy Proxy」的安装目录、快捷方式与卸载注册表项。
+# 注意旧目录是新 INSTDIR 的子目录（公司名与产品名同为 RapidProxy），
+# 所以只删这个子目录本身，绝不能碰它的父目录。
+Function RemoveLegacyInstall
+    ${If} ${FileExists} "$LEGACY_INSTDIR\${PRODUCT_EXECUTABLE}"
+        # 旧程序可能还在运行（用户手动双击安装包而非走「在线更新」）。
+        # 被锁住的 exe 会让 RMDir 留下残骸；新旧可执行文件同名，
+        # 安装期间结束它是安全的：安装完成后由完成页重新拉起。
+        nsExec::ExecToLog 'taskkill /F /IM ${PRODUCT_EXECUTABLE}'
+        Sleep 500
+    ${EndIf}
+
+    RMDir /r "$LEGACY_INSTDIR"
+
+    Delete "$SMPROGRAMS\${LEGACY_PRODUCTNAME}.lnk"
+    Delete "$DESKTOP\${LEGACY_PRODUCTNAME}.lnk"
+
+    SetRegView 64
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${LEGACY_UNINST_KEY_NAME}"
 FunctionEnd
 
 Section
@@ -128,6 +171,9 @@ Section
     SetShellVarContext all
 
     !insertmacro wails.webview2runtime
+
+    # 旧版「WorkBuddy Proxy」残留：安装前先清掉，避免新旧条目并存。
+    Call RemoveLegacyInstall
 
     SetOutPath $INSTDIR
 
@@ -156,12 +202,30 @@ Section "uninstall"
     # 清理应用写入的开机自启动条目（HKCU Run 键，见 internal/autostart）
     DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "RapidProxy"
 
-    RMDir /r "$AppData\${PRODUCT_EXECUTABLE}" # Remove the WebView2 DataPath
+    # WebView2 用户数据目录在「当前用户」的 Roaming 下，但上面设的是 all
+    # 上下文（$APPDATA 会指向 C:\ProgramData）。临时切回 current 才能删到
+    # 真正的位置——原来的写法一直删的是 ProgramData 下一个不存在的目录。
+    SetShellVarContext current
+    RMDir /r "$APPDATA\${PRODUCT_EXECUTABLE}"
+    SetShellVarContext all
 
     RMDir /r $INSTDIR
 
     Delete "$SMPROGRAMS\${INFO_PRODUCTNAME}.lnk"
     Delete "$DESKTOP\${INFO_PRODUCTNAME}.lnk"
+
+    # 旧版残留兜底（正常升级时安装侧已清理）。
+    # 卸载器是独立进程，安装器的 .onInit 不会执行，这里必须自己算一遍路径。
+    ${If} ${RunningX64}
+        StrCpy $LEGACY_INSTDIR "$PROGRAMFILES64\${INFO_COMPANYNAME}\${LEGACY_PRODUCTNAME}"
+    ${Else}
+        StrCpy $LEGACY_INSTDIR "$PROGRAMFILES32\${INFO_COMPANYNAME}\${LEGACY_PRODUCTNAME}"
+    ${EndIf}
+    RMDir /r "$LEGACY_INSTDIR"
+    Delete "$SMPROGRAMS\${LEGACY_PRODUCTNAME}.lnk"
+    Delete "$DESKTOP\${LEGACY_PRODUCTNAME}.lnk"
+    SetRegView 64
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\${LEGACY_UNINST_KEY_NAME}"
 
     !insertmacro wails.unassociateFiles
     !insertmacro wails.unassociateCustomProtocols

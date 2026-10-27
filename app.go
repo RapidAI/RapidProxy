@@ -2,10 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -42,7 +44,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.6.0"
+const Version = "1.7.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -128,8 +130,12 @@ type VirtualMemberView struct {
 	Weight       int    `json:"weight"`
 	// Accounts 是该成员此刻可承接请求的账号数，0 表示这条路径暂时走不通。
 	Accounts int `json:"accounts"`
-	// Available 为 true 表示该成员现在能被选中（上游启用、已登录、有可用账号）。
+	// Available 为 true 表示该成员现在能被选中（已登录、有可用账号）。
+	// 注意这里不要求上游全局启用：虚拟组是显式选择，优先于上游开关。
 	Available bool `json:"available"`
+	// ProviderOff 表示该成员所属上游在设置里是停用状态。
+	// 它不影响该成员能否使用（见 Available），只用于界面上做个标注。
+	ProviderOff bool `json:"providerOff,omitempty"`
 }
 
 // VirtualModelView 是虚拟模型组。
@@ -227,6 +233,19 @@ type ProfileInput struct {
 	ID      string `json:"id"`
 	Enabled bool   `json:"enabled"`
 	Proxy   string `json:"proxy"`
+}
+
+// CustomProviderInput 是新增一个自定义服务商（每组一个自定义模型）的入参。
+//
+// 每个调用都会创建一个独立的上游分组（Profile，Kind=custom），彼此互不干扰——
+// 这正是「自定义模型自成一组」的语义：xAI / Claude / ChatGPT / 智谱编程 四个
+// 命名预设是预先建好的分组，而用户自建的每一个自定义端点也是各自一组。
+type CustomProviderInput struct {
+	Name     string `json:"name"`     // 显示名，如「我的 DeepSeek」
+	BaseURL  string `json:"baseUrl"`  // 兼容 OpenAI / Anthropic 的 base_url（含 /v1 与否皆可）
+	APIKey   string `json:"apiKey"`   // 上游 API Key
+	Protocol string `json:"protocol"` // "openai"（默认）或 "anthropic"
+	Model    string `json:"model"`    // 该组默认模型 ID（也是对外暴露的模型名）
 }
 
 // SettingsInput 是保存设置的入参。
@@ -867,9 +886,14 @@ func (a *App) virtualProviderLabel() string {
 func (a *App) virtualModelViews() []VirtualModelView {
 	cfg := a.settings()
 	names := map[string]string{}
+	known := make(map[string]bool, len(cfg.Profiles))
+	// 上游的全局启用状态只用于「标注」，不参与可用性判断：
+	// 虚拟组允许使用已登录但全局停用的上游（见 proxysrv.usableVirtualMembers），
+	// 界面必须与转发行为一致，否则会把明明能用的成员显示成划掉的。
 	enabled := make(map[string]bool, len(cfg.Profiles))
 	for _, p := range cfg.Profiles {
 		names[p.ID] = p.Name
+		known[p.ID] = true
 		enabled[p.ID] = p.Enabled
 	}
 	// 账号可用数按上游缓存：一个组里常有多个成员来自同一上游，
@@ -887,6 +911,7 @@ func (a *App) virtualModelViews() []VirtualModelView {
 				ProviderName: names[m.Provider],
 				Model:        m.Model,
 				Weight:       m.EffectiveWeight(),
+				ProviderOff:  known[m.Provider] && !enabled[m.Provider],
 			}
 			if mv.ProviderName == "" {
 				mv.ProviderName = m.Provider
@@ -897,7 +922,7 @@ func (a *App) virtualModelViews() []VirtualModelView {
 				avails[m.Provider] = av
 			}
 			mv.Accounts = av.n
-			mv.Available = enabled[m.Provider] && av.n > 0
+			mv.Available = known[m.Provider] && av.n > 0
 			if mv.Available {
 				view.Available++
 			}
@@ -1085,6 +1110,178 @@ func (a *App) RefreshModels() error {
 // API Key
 // -----------------------------------------------------------------------------
 
+// GetProviderModels 返回某个已登录上游的原始模型 ID 列表，供虚拟组编辑器选择。
+//
+// 与 state.models 的区别：那里只有已启用上游的模型（对外暴露的清单），
+// 而虚拟组允许使用「已登录但未全局启用」的上游，编辑器必须能看到这些模型。
+func (a *App) GetProviderModels(providerID string) []string {
+	models := a.srv.LoggedInModels(strings.TrimSpace(providerID))
+	if models == nil {
+		return []string{}
+	}
+	return models
+}
+
+// AddCustomProvider 新增一个自定义服务商：每个调用创建一个独立的上游分组
+// （Profile，Kind=custom），并立即用传入的 API Key 登录一份凭据。
+//
+// 这就是「自定义模型自成一组」的落地方式——与 xAI / Claude / ChatGPT / 智谱
+// 编程 四个命名预设一样，用户自建的每一个自定义端点都是各自独立的一组，互不
+// 干扰。返回的 providerID 可后续用于登录、设置与统计。
+func (a *App) AddCustomProvider(input CustomProviderInput) (string, error) {
+	name := strings.TrimSpace(input.Name)
+	baseURL := strings.TrimSpace(input.BaseURL)
+	if name == "" {
+		return "", errors.New(locale.T("provider.nameEmpty"))
+	}
+	if baseURL == "" {
+		return "", errors.New(locale.T("provider.urlEmpty"))
+	}
+	if err := validateBaseURL(baseURL); err != nil {
+		return "", errors.New(locale.T("provider.urlInvalid"))
+	}
+	protocol := strings.ToLower(strings.TrimSpace(input.Protocol))
+	if protocol != "anthropic" {
+		protocol = "openai"
+	}
+	model := strings.TrimSpace(input.Model)
+	if model == "" {
+		return "", errors.New(locale.T("provider.modelEmpty"))
+	}
+
+	cfg := a.settings().Clone()
+
+	// 由显示名派生一个稳定的分组 ID（custom-<hash>），避免名称里出现空格 /
+	// 中文 / 特殊字符作为配置文件主键；同名重复添加会复用同一组。
+	providerID := deriveCustomProviderID(name)
+	if existing, ok := cfg.ProfileByID(providerID); ok {
+		// 同名组重复添加：更新端点/协议，模型并入 ExtraModels，保留已有账号。
+		existing.Name = name
+		existing.Protocol = protocol
+		existing.BaseURL = strings.TrimRight(baseURL, "/")
+		existing.ExtraModels = mergeModel(existing.ExtraModels, model)
+		existing.Enabled = true
+		cfg.SetProfile(existing)
+	} else {
+		profile := config.Profile{
+			ID:          providerID,
+			Name:        name,
+			Enabled:     true,
+			Kind:        config.KindCustom,
+			Protocol:    protocol,
+			BaseURL:     strings.TrimRight(baseURL, "/"),
+			ExtraModels: []string{model},
+		}
+		cfg.SetProfile(profile)
+	}
+	cfg.Normalize()
+
+	// 此时新 profile 还没进服务端的客户端表（SetConfig 在下面才调用），
+	// 直接按规范化后的 profile 构造客户端，避免 ClientFor 查不到而报错。
+	profile, ok := cfg.ProfileByID(providerID)
+	if !ok {
+		return "", fmt.Errorf("新增上游 %s 失败", providerID)
+	}
+	client, err := upstream.NewClient(profile, cfg.Platform, cfg.Product)
+	if err != nil {
+		return "", err
+	}
+	// 若提供了 API Key，则校验并落库一份凭据（密钥制登录）。
+	if raw := strings.TrimSpace(input.APIKey); raw != "" {
+		normalized, nerr := client.NormalizeAPIKey(raw)
+		if nerr != nil {
+			if errors.Is(nerr, upstream.ErrCustomKeyInvalid) {
+				return "", errors.New(locale.T("login.keyInvalid.custom"))
+			}
+			return "", nerr
+		}
+		verifyCtx, cancelVerify := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancelVerify()
+		if verr := client.VerifyAPIKey(verifyCtx, normalized); verr != nil {
+			if errors.Is(verr, upstream.ErrCustomKeyRejected) {
+				return "", errors.New(locale.T("login.keyRejected.custom"))
+			}
+			a.log.Warnf("未能联机校验 %s 密钥（仍按提交保存）: %v", name, verr)
+		}
+		if a.store == nil {
+			return "", fmt.Errorf("%s", locale.T("login.saveFailed", "凭据仓库不可用"))
+		}
+		cred := client.CustomCredential(normalized)
+		if serr := a.store.SavePreservingLocalFields(cred); serr != nil {
+			return "", fmt.Errorf("%s", locale.T("login.saveFailed", serr.Error()))
+		}
+	}
+
+	if err := cfg.Save(); err != nil {
+		return "", err
+	}
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+	a.srv.SetConfig(cfg)
+	a.srv.InvalidateAccounts()
+	a.enableProviderIfDisabled(providerID)
+	a.log.Infof("新增自定义服务商: %s（%s，协议 %s）", name, providerID, protocol)
+
+	go func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		a.srv.RefreshModels(refreshCtx)
+		a.pushState()
+	}()
+	return providerID, nil
+}
+
+// deriveCustomProviderID 由自定义服务商显示名派生一个稳定的分组 ID。
+// 同名返回同一 ID，便于重复添加时复用分组而非堆积多组。
+func deriveCustomProviderID(name string) string {
+	sum := sha256Hex(strings.ToLower(strings.TrimSpace(name)))
+	return "custom-" + sum[:12]
+}
+
+// validateBaseURL 校验自定义服务商的接口地址：必须是带主机名的 http/https URL。
+// 早失败比等到首次请求才报错更易排查。
+func validateBaseURL(raw string) error {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return err
+	}
+	switch strings.ToLower(u.Scheme) {
+	case "http", "https":
+	default:
+		return fmt.Errorf("unsupported scheme %q", u.Scheme)
+	}
+	if strings.TrimSpace(u.Host) == "" {
+		return errors.New("missing host")
+	}
+	return nil
+}
+
+// mergeModel 把 model 并入模型名列表（去重、忽略空值）。
+func mergeModel(list []string, model string) []string {
+	model = strings.TrimSpace(model)
+	if model == "" {
+		return list
+	}
+	for _, m := range list {
+		if m == model {
+			return list
+		}
+	}
+	return append(list, model)
+}
+
+// sha256Hex 返回字符串的十六进制 SHA-256 摘要。
+func sha256Hex(value string) string {
+	h := sha256.Sum256([]byte(value))
+	const hexChars = "0123456789abcdef"
+	out := make([]byte, 0, 64)
+	for _, b := range h {
+		out = append(out, hexChars[b>>4], hexChars[b&0x0f])
+	}
+	return string(out)
+}
+
 // GenerateAPIKey 生成并保存一个新的 API Key。
 func (a *App) GenerateAPIKey() (string, error) {
 	key := config.GenerateAPIKey()
@@ -1190,9 +1387,13 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 		// 下方粘贴新密钥覆盖（NeedKey 亦为真），想换钥匙不必先删本机文件。
 		run.message = locale.T("login.importing", session.LocalKeyLabel)
 	case session.NeedKey:
-		// OpenCode 是 API Key 制登录：本机没有现成密钥时，打开官方密钥页，
-		// 等用户在界面上粘贴（SubmitLoginKey 收口）。
-		run.message = locale.T("login.pasteKey")
+		// API Key 制登录：等用户在界面上粘贴（SubmitLoginKey 收口）。
+		// custom 上游没有统一的密钥页，用通用文案；OpenCode 有官方密钥页。
+		if upstream.ProfileKind(profile) == upstream.KindCustom {
+			run.message = locale.T("login.pasteKey.custom")
+		} else {
+			run.message = locale.T("login.pasteKey")
+		}
 	default:
 		run.message = locale.T("login.browserOpened")
 	}
@@ -1203,7 +1404,8 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 	// 内嵌 iframe 授权页会被上游安全策略（X-Frame-Options / CSP frame-ancestors）
 	// 拦截，无法在应用内显示；统一改用系统浏览器完成登录。
 	// 登录结果仍由后端轮询自动感知，不依赖浏览器回调。
-	if !session.SkipBrowser {
+	// AuthURL 为空（custom 的粘贴密钥登录）时不打开浏览器。
+	if !session.SkipBrowser && session.AuthURL != "" {
 		if ctx := a.context(); ctx != nil {
 			wailsrt.BrowserOpenURL(ctx, session.AuthURL)
 			a.log.Infof("[%s] 已在系统浏览器打开登录页", profile.Name)
@@ -1377,6 +1579,13 @@ func (a *App) SubmitLoginKey(provider, key string) error {
 		}
 		key = imported
 	}
+
+	// opencode 与 custom 都是 API Key 制上游，但校验 / 落库方法名不同；
+	// 这里按协议族分发到各自实现，后续逻辑（落盘、刷新、接管登录态）共用。
+	if upstream.ProfileKind(profile) == upstream.KindCustom {
+		return a.submitCustomKey(profile, client, key)
+	}
+
 	normalized, err := client.NormalizeOpenCodeKey(key)
 	if err != nil {
 		if errors.Is(err, upstream.ErrOpenCodeKeyInvalid) {
@@ -1415,6 +1624,60 @@ func (a *App) SubmitLoginKey(provider, key string) error {
 	a.loginMu.Lock()
 	run := a.login
 	takeover := run != nil && run.provider == provider && run.status == "pending" && run.session != nil && run.session.NeedKey
+	if takeover {
+		a.finishLoginLocked(run, "success", locale.T("login.success"), cred.ID)
+	}
+	a.loginMu.Unlock()
+	if !takeover {
+		a.log.Warnf("收到密钥提交，但没有等待中的 %s 登录流程，仅保存凭据", profile.Name)
+	}
+	a.pushLogin()
+	a.pushState()
+
+	go func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		a.srv.RefreshModels(refreshCtx)
+		a.pushState()
+	}()
+	return nil
+}
+
+// submitCustomKey 处理 custom 上游（含 xAI / Claude / ChatGPT / 智谱编程 与
+// 用户自建组）的密钥提交：清洗、校验、落盘、接管登录态，与 opencode 同口径。
+func (a *App) submitCustomKey(profile config.Profile, client *upstream.Client, key string) error {
+	normalized, err := client.NormalizeAPIKey(key)
+	if err != nil {
+		if errors.Is(err, upstream.ErrCustomKeyInvalid) {
+			return errors.New(locale.T("login.keyInvalid.custom"))
+		}
+		return err
+	}
+
+	// 与 opencode 同口径：错键立刻提示，联机类错误放行保存。
+	verifyCtx, cancelVerify := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancelVerify()
+	if err := client.VerifyAPIKey(verifyCtx, normalized); err != nil {
+		if errors.Is(err, upstream.ErrCustomKeyRejected) {
+			return errors.New(locale.T("login.keyRejected.custom"))
+		}
+		a.log.Warnf("未能联机校验 %s 密钥（仍按提交保存）: %v", profile.Name, err)
+	}
+
+	cred := client.CustomCredential(normalized)
+	if a.store == nil {
+		return fmt.Errorf("%s", locale.T("login.saveFailed", "凭据仓库不可用"))
+	}
+	if err := a.store.SavePreservingLocalFields(cred); err != nil {
+		return fmt.Errorf("%s", locale.T("login.saveFailed", err.Error()))
+	}
+	a.enableProviderIfDisabled(cred.Provider)
+	a.srv.InvalidateAccounts()
+	a.log.Infof("登录成功: %s（%s）", cred.DisplayName(), cred.ID)
+
+	a.loginMu.Lock()
+	run := a.login
+	takeover := run != nil && run.provider == cred.Provider && run.status == "pending" && run.session != nil && run.session.NeedKey
 	if takeover {
 		a.finishLoginLocked(run, "success", locale.T("login.success"), cred.ID)
 	}

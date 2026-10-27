@@ -2,7 +2,7 @@
 
 **中文** | [English](README_EN.md)
 
-把 **WorkBuddy**（国际版）、**CodeBuddy**（国内版）、**LobsterAI**、**Trae**（国内/国际版）、**Qoder**（国内/国际版）账号背后的模型，转换成 **OpenAI 兼容 API** 的桌面代理程序。登录一次，任何支持「自定义 OpenAI 接口」的客户端（Cherry Studio、ChatBox、LobeChat、Open WebUI、Cursor、Cline、各种 SDK 与脚本……）都能直接调用。
+把 **WorkBuddy**（国际版）、**CodeBuddy**（国内版）、**LobsterAI**、**Trae**（国内/国际版）、**Qoder**（国内/国际版）、**OpenCode** 账号背后的模型，以及 **xAI / Claude / ChatGPT / 智谱编程** 等任意 OpenAI 或 Anthropic 兼容端点，转换成 **OpenAI 兼容 API** 的桌面代理程序。登录一次，任何支持「自定义 OpenAI 接口」的客户端（Cherry Studio、ChatBox、LobeChat、Open WebUI、Cursor、Cline、各种 SDK 与脚本……）都能直接调用。
 
 - 语言/框架：Go + Wails v2（原生 WebView，安装包小、内存占用低）
 - 平台：Windows / macOS / Linux
@@ -28,12 +28,28 @@
 | `qoder-cn` | Qoder（国内版） | 设备码（PKCE） | COSY 签名对话，须在浏览器批准 |
 | `qoder-global` | Qoder（国际版） | 设备码（PKCE） | 与国内版互不通用 |
 | `opencode` | OpenCode Zen（opencode.ai） | API Key | 导入本机 OpenCode CLI 的密钥后等待确认（可粘贴新密钥覆盖），或直接粘贴密钥；建议配置代理 |
+| `xai` | xAI（Grok） | API Key | OpenAI 线协议，`api.x.ai` |
+| `claude` | Claude（Anthropic） | API Key | Anthropic 线协议，`api.anthropic.com` |
+| `chatgpt` | ChatGPT（OpenAI） | API Key | OpenAI 线协议，`api.openai.com` |
+| `zhipu` | 智谱编程（GLM） | API Key | Anthropic 线协议，走 coding-plan 网关，客户端身份 `opencode` |
+| `zcode` | 智谱编程（ZCode 登录） | 浏览器授权 | ZCode 在线 OAuth（国内站 `zcode.chatglm.site` / 国际站 `zcode.z.ai`），自动换出 coding-plan API Key，同样以编程客户端身份调用 |
+
+### 自定义模型（每个自成一组）
+
+除上面的固定预设外，还可以通过后端方法 `AddCustomProvider(name, baseURL, apiKey, protocol, model)` 添加**任意** OpenAI 或 Anthropic 兼容端点（DeepSeek、Moonshot、Qwen、火山方舟、自建网关……）。**每次调用都会创建一个独立分组**，即「每个自定义模型自成一组」，与其它服务商互不影响；同名重复添加会复用同一组。
+
+- `protocol` 取 `openai`（默认）或 `anthropic`；`baseURL` 可带或不带 `/v1`（自动补全）。
+- 智谱的赠送额度按请求的 **User-Agent**（编程客户端身份）判定，故 `zhipu` / `zcode` 预设默认发送 `opencode`；若某些账号的赠送额度需要别的客户端身份（如 `claude code`、`codex`），在 `config.json` 的对应 profile 里改 `user_agent` 即可。
+- Anthropic 线协议会由代理在边界完成 **OpenAI ⇄ Anthropic** 双向翻译（system、tools/tool_calls、thinking、SSE 流式增量），客户端始终只看到 OpenAI 兼容接口。
+- 也可直接编辑 `config.json`，在 `profiles` 里加入 `{"id":"custom-xxx","kind":"custom","protocol":"anthropic","base_url":"...","extra_models":["..."]}`。
 
 ---
 
 ## 功能特性
 
-- **图形化登录**：内置 WorkBuddy、CodeBuddy、LobsterAI、Trae（国内/国际）、Qoder（国内/国际）七个上游预设，点「登录」打开浏览器完成授权，令牌自动保存并自动刷新。
+- **图形化登录**：内置 WorkBuddy、CodeBuddy、LobsterAI、Trae（国内/国际）、Qoder（国内/国际）、OpenCode、xAI、Claude、ChatGPT、智谱编程（含 ZCode 登录）等上游预设，点「登录」打开浏览器完成授权或粘贴 API Key，令牌/密钥自动保存并自动刷新。
+- **xAI / Claude / ChatGPT / 智谱编程**：既可用固定预设，也可通过 `AddCustomProvider` 添加任意 OpenAI 或 Anthropic 兼容端点；Anthropic 线协议由代理自动完成请求与 SSE 流双向翻译，客户端无感知。
+- **ZCode 登录**：智谱编程支持 ZCode 在线 OAuth（国内站 / 国际站自动兜底），授权后自动换出 coding-plan API Key，并以编程客户端身份（User-Agent）调用，从而使用 ZCode / 编程套餐赠送额度。
 - **OpenAI 兼容服务**：提供 `/v1/models`、`/v1/chat/completions`（及不带 `/v1` 的等价路径）与 `/healthz`，流式与非流式请求都支持（上游仅提供流式接口时，程序在服务端自动聚合）。
 - **多账号负载均衡**：同一上游可登录多个账号，请求按权重轮询；单个账号令牌失效自动刷新，401/403 自动重试。
 - **组内故障自动跳过**：账号出问题即换同组下一个，错误不透传给下游——限流 / 额度耗尽 / 上游不可用会冷却账号后换号；模型未开通、参数不当这类「该账号接不了这单」的错误同样换号（不冷却）；流式请求在上游以 200 + SSE 于流首报错时，也会在写出一个字节前换号重试；错误正文里带额度窗口重置时刻的窗口限流（如 code=6004 的 usage will reset at …），冷却会持续到该时刻，而不是几十秒后就回到轮询。只有整组都试过仍无人能接，才把最后的错误按原状态码带回（可退避的错误汇总为 429 + Retry-After）。
@@ -198,7 +214,7 @@ curl ... -H "X-RapidProxy-Account: <账号ID>" -d '{"model":"glm-5.3", ...}'
 
 一个虚拟模型名聚合多个上游的模型，适合「把不同服务商的模型当成同一个可用池」：
 
-- **建组**：在「虚拟模型」页新建，填一个名字（如 `fast`），再从「已启用且已登录」的上游里挑选模型加入组内，每个成员可单独设权重（默认 1，权重越大分到越多）。
+- **建组**：在「虚拟模型」页新建，填一个名字（如 `fast`），再从「所有已登录账号」的上游里挑选模型加入组内，每个成员可单独设权重（默认 1，权重越大分到越多）。上游在设置里是否启用不影响能否加入虚拟组。
 - **调用**：客户端把 `model` 填成组名即可，与真实模型名用法完全一致：
 
   ```bash
@@ -208,6 +224,7 @@ curl ... -H "X-RapidProxy-Account: <账号ID>" -d '{"model":"glm-5.3", ...}'
 - **分摊与跳过**：组内成员按权重平滑轮询；某个成员整体不可用（上游未启用 / 未登录 / 账号全暂停 / 全部冷却 / 上游不接受该模型）时自动换下一个，错误不透传给客户端。只有组内所有成员都试过仍无人能接，才按原有口径返回错误（客户端错误保留原状态码，可退避的错误汇总为 429 + Retry-After）。
 - **命名规则**：不能含 `:`、`/` 或空格（这两个是强制路由分隔符），也不能与上游 ID 或 `intl` 重名；与真实模型 ID 撞名时虚拟组优先。
 - **优先级**：显式强制路由（`上游ID:模型名`、`X-RapidProxy-Provider`、`?provider=`）优先于虚拟组，便于临时绕过。
+- **与上游开关的关系**：虚拟组是「用哪个上游的哪个模型」的显式选择，优先级高于上游的全局启用开关——上游在设置里停用后，组内成员仍可正常转发。要掐断某个组的流量，停用这个组本身即可，这样不会连带影响该上游裸模型名的调用。
 - **流量统计**：虚拟组有独立的组维度，同时每次请求仍会记到真实上游与真实模型上（用于核对上游额度）；选中虚拟组时统计页额外显示组内成员分摊明细。
 - **改名与删除**：改名时历史流量自动迁移到新名字；删除时历史流量一并清除，避免重建同名组时继承旧数据。
 

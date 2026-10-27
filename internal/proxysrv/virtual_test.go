@@ -1,6 +1,7 @@
 package proxysrv
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -24,6 +25,11 @@ type virtualStub struct {
 	// httptest 的 handler 在独立 goroutine 里跑，并发测试下必须加锁。
 	mu   sync.Mutex
 	hits map[string]int
+	// syncModels 非空时作为 /v3/config 的模型清单返回，
+	// 用于验证「模型同步是否覆盖到该上游」。
+	syncModels []map[string]any
+	// configHits 记录 /config 端点被请求的次数（按账号令牌区分）。
+	configHits map[string]int
 }
 
 // hit 返回某模型被请求的次数。
@@ -31,6 +37,20 @@ func (v *virtualStub) hit(model string) int {
 	v.mu.Lock()
 	defer v.mu.Unlock()
 	return v.hits[model]
+}
+
+// configHit 返回含指定令牌片段的 /config 请求次数。
+// 实际请求头是 "Bearer <token>"，所以按包含匹配而不是精确相等。
+func (v *virtualStub) configHit(tokenPart string) int {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	n := 0
+	for auth, c := range v.configHits {
+		if strings.Contains(auth, tokenPart) {
+			n += c
+		}
+	}
+	return n
 }
 
 // snapshot 返回当前计数副本，便于断言整体分布。
@@ -46,10 +66,19 @@ func (v *virtualStub) snapshot() map[string]int {
 
 func newVirtualStub(t *testing.T, failModels map[string]int, failToken string) *virtualStub {
 	t.Helper()
-	st := &virtualStub{hits: map[string]int{}}
+	st := &virtualStub{hits: map[string]int{}, configHits: map[string]int{}}
 	st.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if strings.HasSuffix(r.URL.Path, "/config") {
-			_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+			st.mu.Lock()
+			st.configHits[r.Header.Get("Authorization")]++
+			models := st.syncModels
+			st.mu.Unlock()
+			if models == nil {
+				_, _ = w.Write([]byte(`{"code":0,"data":{"models":[]}}`))
+				return
+			}
+			raw, _ := json.Marshal(map[string]any{"code": 0, "data": map[string]any{"models": models}})
+			_, _ = w.Write(raw)
 			return
 		}
 		var payload struct {
@@ -1049,4 +1078,243 @@ func TestVirtualEntryDisplayNameIsPlain(t *testing.T) {
 		return
 	}
 	t.Fatal("未找到虚拟组条目")
+}
+
+// 虚拟组允许使用「已登录但全局停用」的上游：组是用户的显式选择，
+// 优先级高于上游的全局开关。想掐断流量应停用组本身。
+func TestVirtualGroupUsesDisabledProvider(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	srv := newVirtualServer(t, up.URL, []config.VirtualModel{{
+		Name:    "fast",
+		Enabled: true,
+		Members: []config.VirtualMember{{Provider: "codebuddy", Model: "glm-5.3"}},
+	}}, []string{"codebuddy"})
+
+	// 把 codebuddy 停用（newVirtualServer 里已设为 enabled）。
+	cfg := srv.Config().Clone()
+	p, _ := cfg.ProfileByID("codebuddy")
+	p.Enabled = false
+	cfg.SetProfile(p)
+	srv.SetConfig(cfg)
+
+	srv.setModels("codebuddy", []upstream.ModelInfo{{ID: "glm-5.3", Name: "GLM"}})
+
+	if n := srv.VirtualAvailableMembers("fast"); n != 1 {
+		t.Fatalf("上游停用但已登录时，成员仍应可用，实际可用 %d", n)
+	}
+
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Stop() }()
+	base := "http://" + srv.Addr()
+
+	status, body := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"fast","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("上游停用不应妨碍虚拟组，实际 %d: %s", status, body)
+	}
+	if up.hit("glm-5.3") == 0 {
+		t.Error("请求应转发到该上游")
+	}
+}
+
+// 全部上游都停用时，虚拟组仍应可用（不能被 resolveRoute 的前置检查挡掉）。
+func TestVirtualGroupWorksWithNoEnabledProviders(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	srv := newVirtualServer(t, up.URL, []config.VirtualModel{{
+		Name:    "fast",
+		Enabled: true,
+		Members: []config.VirtualMember{{Provider: "workbuddy", Model: "a"}},
+	}}, []string{"workbuddy"})
+
+	cfg := srv.Config().Clone()
+	for i := range cfg.Profiles {
+		cfg.Profiles[i].Enabled = false
+	}
+	cfg.Normalize()
+	srv.SetConfig(cfg)
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "a", Name: "A"}})
+
+	if err := srv.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = srv.Stop() }()
+	base := "http://" + srv.Addr()
+
+	status, body := postJSON(t, base+"/v1/chat/completions",
+		`{"model":"fast","messages":[{"role":"user","content":"hi"}]}`, nil)
+	if status != http.StatusOK {
+		t.Fatalf("没有任何启用上游时虚拟组仍应可用，实际 %d: %s", status, body)
+	}
+}
+
+// 上游停用时，其成员所属的模型仍应出现在 /v1/models 的虚拟条目里
+// （否则用户配好的组会从列表里消失）。
+func TestVirtualEntryPresentWithDisabledProvider(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	srv := newVirtualServer(t, up.URL, []config.VirtualModel{{
+		Name:    "fast",
+		Enabled: true,
+		Members: []config.VirtualMember{{Provider: "codebuddy", Model: "glm-5.3"}},
+	}}, []string{"codebuddy"})
+
+	cfg := srv.Config().Clone()
+	p, _ := cfg.ProfileByID("codebuddy")
+	p.Enabled = false
+	cfg.SetProfile(p)
+	srv.SetConfig(cfg)
+	srv.setModels("codebuddy", []upstream.ModelInfo{{ID: "glm-5.3", Name: "GLM"}})
+
+	var found bool
+	for _, m := range srv.AllModels() {
+		if m.ID == "fast" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("上游停用时虚拟组仍应出现在模型列表，实际 %v", srv.ModelIDs())
+	}
+}
+
+// LoggedInModels 返回原始模型 ID，且不受上游启用状态影响。
+func TestLoggedInModelsIgnoresEnabledFlag(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	srv := newVirtualServer(t, up.URL, nil, []string{"codebuddy"})
+
+	cfg := srv.Config().Clone()
+	p, _ := cfg.ProfileByID("codebuddy")
+	p.Enabled = false
+	cfg.SetProfile(p)
+	srv.SetConfig(cfg)
+	srv.setModels("codebuddy", []upstream.ModelInfo{{ID: "glm-5.3", Name: "GLM"}})
+
+	got := srv.LoggedInModels("codebuddy")
+	if len(got) != 1 || got[0] != "glm-5.3" {
+		t.Fatalf("应返回原始模型 ID，实际 %v", got)
+	}
+	// 未登录的上游返回空。
+	if m := srv.LoggedInModels("lobsterai"); len(m) != 0 {
+		t.Errorf("未登录上游应返回空，实际 %v", m)
+	}
+	// 未知上游返回空。
+	if m := srv.LoggedInModels("nope"); len(m) != 0 {
+		t.Errorf("未知上游应返回空，实际 %v", m)
+	}
+}
+
+// LoggedInModels 的边界：空串、未知上游、无账号都不应 panic 或返回脏数据。
+func TestLoggedInModelsEdgeCases(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	srv := newVirtualServer(t, up.URL, nil, []string{"workbuddy"})
+	srv.setModels("workbuddy", []upstream.ModelInfo{{ID: "a", Name: "A"}})
+
+	for _, id := range []string{"", "  ", "nope", "lobsterai"} {
+		if got := srv.LoggedInModels(id); len(got) != 0 {
+			t.Errorf("LoggedInModels(%q) 应为空，实际 %v", id, got)
+		}
+	}
+	// 带前后空格的有效 ID 也应解析（内部做了 TrimSpace）。
+	if got := srv.LoggedInModels("  workbuddy  "); len(got) != 1 {
+		t.Errorf("应容忍前后空格，实际 %v", got)
+	}
+}
+
+// 配置里一个上游都没有时，应给出清晰错误而不是 panic 或落到空 Profile。
+func TestResolveRouteWithNoProfiles(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	srv := newVirtualServer(t, up.URL, nil, nil)
+
+	cfg := srv.Config().Clone()
+	cfg.Profiles = nil
+	srv.SetConfig(cfg)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	_, _, _, err := srv.resolveRoute("anything", req)
+	if err == nil {
+		t.Fatal("没有上游时应报错")
+	}
+	if !strings.Contains(err.Error(), "上游") {
+		t.Errorf("错误应提到上游，实际 %v", err)
+	}
+}
+
+// 未启用但已登录的上游也必须参与模型同步。
+//
+// 虚拟组允许使用这类上游（见 usableVirtualMembers），若不同步，它的模型
+// 只能来自内置白名单——白名单可能缺少上游新上线的模型，也可能残留已下线
+// 的模型。用户在虚拟组编辑器里就会看到一份过时甚至错误的清单。
+func TestRefreshModelsCoversDisabledProviders(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	up.syncModels = []map[string]any{
+		{"id": "only-from-upstream", "name": "OnlyFromUpstream"},
+	}
+	srv := newVirtualServer(t, up.URL, nil, []string{"workbuddy", "codebuddy"})
+
+	cfg := srv.Config().Clone()
+	on := true
+	p, _ := cfg.ProfileByID("codebuddy")
+	p.Enabled = false
+	p.SyncModels = &on // newVirtualServer 默认关掉同步，这里显式打开
+	cfg.SetProfile(p)
+	srv.SetConfig(cfg)
+
+	srv.RefreshModels(context.Background())
+
+	// 该上游的 /config 应被请求过（说明同步覆盖到了它）。
+	if n := up.configHit("token-codebuddy"); n == 0 {
+		t.Errorf("未启用但已登录的上游也应参与模型同步，实际 /config 未被请求")
+	}
+
+	// 同步结果里应包含上游真实返回的模型。
+	var found bool
+	for _, m := range srv.ModelsFor("codebuddy") {
+		if m.ID == "only-from-upstream" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("应包含上游返回的模型，实际 %d 个（含白名单兜底）", len(srv.ModelsFor("codebuddy")))
+	}
+}
+
+// 同步失败时不应把已缓存的真实模型清单覆盖成白名单：
+// 上游临时故障不该让虚拟组的模型凭空消失。
+func TestSyncFailureKeepsPreviousModels(t *testing.T) {
+	up := newVirtualStub(t, nil, "")
+	up.syncModels = []map[string]any{{"id": "real-model", "name": "Real"}}
+	srv := newVirtualServer(t, up.URL, nil, []string{"workbuddy"})
+
+	cfg := srv.Config().Clone()
+	on := true
+	for i := range cfg.Profiles {
+		cfg.Profiles[i].SyncModels = &on
+	}
+	cfg.Normalize()
+	srv.SetConfig(cfg)
+
+	// 第一轮：成功，缓存到 real-model。
+	srv.RefreshModels(context.Background())
+	if !hasModel(srv.ModelsFor("workbuddy"), "real-model") {
+		t.Fatal("首轮同步应包含上游返回的模型")
+	}
+
+	// 第二轮：上游故障（桩返回 429），同步失败。
+	up.mu.Lock()
+	up.syncModels = nil
+	up.mu.Unlock()
+	srv.RefreshModels(context.Background())
+
+	if !hasModel(srv.ModelsFor("workbuddy"), "real-model") {
+		t.Error("同步失败后不应丢掉已缓存的模型")
+	}
+}
+
+func hasModel(list []upstream.ModelInfo, id string) bool {
+	for _, m := range list {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
 }

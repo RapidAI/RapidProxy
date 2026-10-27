@@ -12,8 +12,8 @@
   },
   "info": {
     "companyName": "RapidProxy",
-    "productName": "WorkBuddy Proxy",
-    "productVersion": "1.6.0",
+    "productName": "RapidProxy",
+    "productVersion": "1.7.0",
     "copyright": "MIT License",
     "comments": "把 WorkBuddy / CodeBuddy / LobsterAI / Trae / Qoder 封装成 OpenAI 兼容服务"
   }

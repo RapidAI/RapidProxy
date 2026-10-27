@@ -592,6 +592,11 @@ function renderVirtualModels() {
         const chip = el('span', 'vm-member-chip' + (m.available ? '' : ' down'),
           m.providerName + ' · ' + m.model);
         if (m.weight > 1) chip.appendChild(el('span', 'w', '×' + m.weight));
+        // 上游被全局停用但成员仍可用：标一下，免得用户以为设置没生效。
+        if (m.providerOff) {
+          chip.appendChild(el('span', 'w', t('vm.providerOff')));
+          chip.title = t('vm.providerOffTip');
+        }
         members.appendChild(chip);
       });
       if (total === 0) members.appendChild(el('span', 'hint', t('vm.noMembers')));
@@ -608,13 +613,17 @@ function renderVirtualModels() {
   renderVirtualEditorSelects();
 }
 
-/* 编辑器里的「上游 → 模型」下拉：只列出已启用且已登录的上游，
- * 因为未登录的上游加入组里也永远选不中。 */
+/* 编辑器里的「上游 → 模型」下拉：列出所有已登录账号的上游。
+ *
+ * 不只列已启用的：虚拟组是用户对「用哪个上游的哪个模型」的显式选择，
+ * 优先级高于上游的全局开关。只列已启用的会把「登录了但没启用」的上游
+ * 整个藏起来，用户明明有账号却选不到。
+ * 未启用或未登录的上游仍列出来，但标注原因并禁用，避免用户找不到。 */
 function renderVirtualEditorSelects() {
   const pSel = $('vm-add-provider');
   if (!pSel) return;
-  const providers = ((S.state && S.state.providers) || []).filter((p) => p.enabled);
-  const sig = [I18N.lang, providers.map((p) => p.id + ':' + p.name + ':' + p.accountCount).join(',')].join('|');
+  const providers = (S.state && S.state.providers) || [];
+  const sig = [I18N.lang, providers.map((p) => p.id + ':' + p.name + ':' + p.accountCount + ':' + p.enabled).join(',')].join('|');
   if (pSel._sig !== sig) {
     pSel._sig = sig;
     const prev = pSel.value;
@@ -622,51 +631,85 @@ function renderVirtualEditorSelects() {
     providers.forEach((p) => {
       const o = el('option');
       o.value = p.id;
-      o.textContent = p.name + (p.accountCount ? '' : ' ' + t('vm.notLogged'));
-      o.disabled = !p.accountCount;
+      // 有账号就能选；没账号的保留但禁用，并说明原因。
+      const usable = p.accountCount > 0;
+      let suffix = '';
+      if (!usable) suffix = ' ' + t('vm.notLogged');
+      else if (!p.enabled) suffix = ' ' + t('vm.providerOff');
+      o.textContent = p.name + suffix;
+      o.disabled = !usable;
       pSel.appendChild(o);
     });
-    const firstUsable = providers.find((p) => p.accountCount);
-    pSel.value = (prev && providers.some((p) => p.id === prev && p.accountCount))
+    const firstUsable = providers.find((p) => p.accountCount > 0);
+    pSel.value = (prev && providers.some((p) => p.id === prev && p.accountCount > 0))
       ? prev
       : (firstUsable ? firstUsable.id : '');
   }
   renderVirtualModelOptions();
 }
 
-/* 按当前选中的上游填充模型下拉。 */
-function renderVirtualModelOptions() {
+/* 按当前选中的上游填充模型下拉。
+ *
+ * 走 GetProviderModels 而不是从 state.models 里筛：state.models 只含
+ * 已启用上游的模型，而虚拟组允许用「已登录但未全局启用」的上游，
+ * 那些模型在 state.models 里根本不存在。
+ * 接口返回的就是该上游的原始模型 ID，与成员存储形式一致，无需去前缀。 */
+let _vmModelReq = 0;
+async function renderVirtualModelOptions() {
   const pSel = $('vm-add-provider');
   const mSel = $('vm-add-model');
   if (!pSel || !mSel) return;
   const pid = pSel.value;
-  // 模型名取「该上游的原始模型 ID」：state.models 里的 ID 在多上游场景下
-  // 可能带 "intl:" 或 "上游ID:" 前缀，而成员存的是原始 ID。
-  const models = ((S.state && S.state.models) || [])
-    .filter((m) => m.providerId === pid && !m.virtual)
-    .map((m) => rawModelID(m, pid));
-  const sig = [pid, models.join(',')].join('|');
+  if (!pid) {
+    mSel.innerHTML = '';
+    mSel._sig = '';
+    return;
+  }
+  // 连续切换上游时只认最后一次请求的结果，避免慢响应把新选择覆盖掉。
+  const req = ++_vmModelReq;
+  let models = [];
+  let failed = false;
+  try {
+    models = await call('GetProviderModels', pid);
+  } catch (err) {
+    failed = true;
+    models = [];
+  }
+  if (req !== _vmModelReq || pSel.value !== pid) return;
+
+  // 请求失败不写签名：签名一写就等于把「这次失败」缓存下来，用户切走再切回
+  // 同一个上游也不会重试。而且「没有可用模型」与「读取失败」是两回事，
+  // 前者可以继续操作，后者应当提示去检查登录状态。
+  if (failed) {
+    mSel.innerHTML = '';
+    mSel._sig = '';
+    const o = el('option');
+    o.value = '';
+    o.textContent = t('vm.modelsLoadFailed');
+    o.disabled = true;
+    mSel.appendChild(o);
+    return;
+  }
+
+  const sig = [pid, (models || []).join(',')].join('|');
   if (mSel._sig === sig) return;
   mSel._sig = sig;
   mSel.innerHTML = '';
-  models.forEach((id) => {
+  (models || []).forEach((id) => {
     const o = el('option');
     o.value = id;
     o.textContent = id;
     mSel.appendChild(o);
   });
+  if (!models || !models.length) {
+    const o = el('option');
+    o.value = '';
+    o.textContent = t('vm.noModels');
+    o.disabled = true;
+    mSel.appendChild(o);
+  }
 }
 
-/* 把对外暴露的模型 ID 还原成该上游的原始 ID。
- * 多上游场景下 intl 前缀、上游ID 前缀都会被剥掉；单上游时原样返回。 */
-function rawModelID(m, providerID) {
-  const id = m.id || '';
-  const cut = id.indexOf(':');
-  if (cut <= 0) return id;
-  const prefix = id.slice(0, cut);
-  if (prefix === 'intl' || prefix === providerID) return id.slice(cut + 1);
-  return id;
-}
 
 function openVirtualEditor(name) {
   const vms = (S.state && S.state.virtualModels) || [];

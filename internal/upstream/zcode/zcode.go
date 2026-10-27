@@ -25,6 +25,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // 登录端点，协议与开源 ZCode CLI 一致。国内站优先，国际站兜底。
@@ -592,10 +593,19 @@ func sleepWithContext(ctx context.Context, d time.Duration) error {
 	}
 }
 
+// truncateForError 按字符（rune）截断上游错误正文：智谱的错误多为中文，
+// 按字节切会把 UTF-8 序列切断，界面上显示成乱码。
 func truncateForError(b []byte) string {
-	s := string(b)
-	if len(s) > 200 {
-		return s[:200]
+	s := strings.TrimSpace(string(b))
+	if utf8.RuneCountInString(s) <= 200 {
+		return s
+	}
+	count := 0
+	for i := range s {
+		if count == 200 {
+			return s[:i]
+		}
+		count++
 	}
 	return s
 }

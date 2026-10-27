@@ -147,8 +147,9 @@ var ChatGPTSpecs = []ModelSpec{
 	{"o4-mini", "o4-mini", 200000, 100000},
 }
 
-// ZhipuSpecs 是智谱编程（GLM，bigmodel Anthropic 网关）的内置兜底目录
-// （Anthropic 线协议）。真实目录以远端 /v1/models 为准，同步失败时也不至于列表为空。
+// ZhipuSpecs 是智谱编程（GLM，bigmodel 编程套餐网关 /api/coding/paas/v4）的
+// 内置兜底目录（OpenAI 线协议）。真实目录以远端 /models 为准，同步失败时也
+// 不至于列表为空。
 var ZhipuSpecs = []ModelSpec{
 	{"glm-5.3", "GLM-5.3", 128000, 8192},
 	{"glm-5.3-flash", "GLM-5.3-Flash", 128000, 8192},

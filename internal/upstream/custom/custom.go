@@ -15,6 +15,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -22,6 +23,7 @@ import (
 	"net/http"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/znsoftm/RapidProxy/internal/upstream/anthropicconv"
 )
@@ -194,6 +196,13 @@ func chatAnthropic(ctx context.Context, hc *http.Client, base, apiKey, userAgent
 	// SSE 流：用 io.Pipe 把 Anthropic 流实时翻译成 OpenAI 流。
 	pr, pw := io.Pipe()
 	go func() {
+		// 翻译在独立协程里跑：任何 panic 都必须收口成流错误，否则整个代理
+		// 进程会因一个坏上游而崩溃。
+		defer func() {
+			if r := recover(); r != nil {
+				_ = pw.CloseWithError(fmt.Errorf("翻译 Anthropic 流失败: %v", r))
+			}
+		}()
 		err := anthropicconv.TranslateStream(resp.Body, pw, model)
 		_ = resp.Body.Close()
 		_ = pw.CloseWithError(err)
@@ -458,15 +467,23 @@ func KeyLabel(key string) string {
 
 func shortHash(value string) string {
 	sum := sha256.Sum256([]byte(value))
-	return fmt.Sprintf("%x", sum)[:8]
+	return hex.EncodeToString(sum[:])[:8]
 }
 
+// truncate 按字符数（rune）截断，避免把中文错误文案切在 UTF-8 序列中间。
 func truncate(s string, n int) string {
 	if n <= 0 {
 		return ""
 	}
-	if len(s) <= n {
+	if utf8.RuneCountInString(s) <= n {
 		return s
 	}
-	return s[:n]
+	count := 0
+	for i := range s {
+		if count == n {
+			return s[:i]
+		}
+		count++
+	}
+	return s
 }

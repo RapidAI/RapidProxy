@@ -1178,12 +1178,25 @@ func (s *Server) prepareBody(payload map[string]any, profile config.Profile) ([]
 	// 这里保持客户端原样（仅强制流式）。强制思考档只对 hy3 系列有意义，
 	// 同样限定在 WorkBuddy 协议族——qoder 的签名体多一个未知字段都可能
 	// 被上游拒绝。
-	workBuddyFamily := upstream.ProfileKind(profile) == upstream.KindWorkBuddy
+	kind := upstream.ProfileKind(profile)
+	workBuddyFamily := kind == upstream.KindWorkBuddy
+	// 智谱编程网关有两处硬性要求：developer 角色要写成 system、空的 user
+	// 内容会被拒绝（需补占位符）。只在 OpenAI 线协议的智谱预设上做，避免
+	// 影响其它上游。
+	if kind == upstream.KindCustom && (profile.ID == "zhipu" || profile.ID == "zcode") &&
+		!strings.EqualFold(strings.TrimSpace(profile.Protocol), "anthropic") {
+		normalizeGLMCodingPayload(payload)
+	}
+	// 只有确认支持 stream_options 的 OpenAI 直连预设（xAI / ChatGPT）才显式
+	// 索取 usage：智谱编程网关与用户自建端点可能拒绝该字段（aicoder 也采取
+	// 「上游拒绝后停用」的策略），在关键路径上不冒险。Anthropic 线协议由翻译
+	// 层自产 usage 帧，也不需要它。
+	openAIUsage := profile.ID == "xai" || profile.ID == "chatgpt"
 	body, _, err := openai.PrepareRequestBody(mustJSON(payload), openai.TransformOptions{
 		Sanitize:           workBuddyFamily && s.Config().SanitizeEnabled(),
 		ForceMaxThinking:   workBuddyFamily && s.Config().MaxThinkingEnabled(),
 		EnsureSystemPrompt: workBuddyFamily,
-		AddStreamOptions:   workBuddyFamily,
+		AddStreamOptions:   workBuddyFamily || openAIUsage,
 	})
 	return body, err
 }
@@ -2894,6 +2907,42 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 
 func writeError(w http.ResponseWriter, status int, message, typ string, code any) {
 	writeJSON(w, status, openai.NewError(message, typ, code))
+}
+
+// normalizeGLMCodingPayload 适配智谱编程（GLM coding-plan）网关的两处硬性
+// 要求：developer 角色必须写成 system；空的 user 内容会被拒绝，补一个占位符。
+func normalizeGLMCodingPayload(payload map[string]any) {
+	messages, ok := payload["messages"].([]any)
+	if !ok {
+		return
+	}
+	for _, raw := range messages {
+		msg, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := msg["role"].(string)
+		if strings.EqualFold(role, "developer") {
+			msg["role"] = "system"
+			role = "system"
+		}
+		if strings.EqualFold(role, "user") && contentIsEmpty(msg["content"]) {
+			msg["content"] = "[No user content provided]"
+		}
+	}
+}
+
+// contentIsEmpty 判断消息内容是否为空（nil / 空串 / 空数组）。
+func contentIsEmpty(v any) bool {
+	switch c := v.(type) {
+	case nil:
+		return true
+	case string:
+		return strings.TrimSpace(c) == ""
+	case []any:
+		return len(c) == 0
+	}
+	return false
 }
 
 func mustJSON(v any) []byte {

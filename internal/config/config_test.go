@@ -329,3 +329,68 @@ func TestNormalizeDropsVirtualNameCollidingWithProvider(t *testing.T) {
 		t.Errorf("合法的那条应保留，实际 %+v", cfg.VirtualModels)
 	}
 }
+
+// 旧版本把智谱编程错配成普通 Anthropic 网关 + 小写 opencode 身份，会走按量
+// 付费并返回 [1113]。升级时必须迁移到 /api/coding/paas/v4 + OpenCode。
+func TestZhipuCodingMigratesLegacyEndpoint(t *testing.T) {
+	raw := []byte(`{"profiles":[` +
+		`{"id":"zcode","name":"智谱编程（ZCode 登录）","enabled":true,` +
+		`"kind":"custom","protocol":"anthropic",` +
+		`"base_url":"https://open.bigmodel.cn/api/anthropic/v1",` +
+		`"user_agent":"opencode"}]}`)
+	cfg := DefaultAt(filepath.Join(t.TempDir(), "config.json"))
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Normalize()
+	p, ok := cfg.ProfileByID("zcode")
+	if !ok {
+		t.Fatal("zcode profile missing")
+	}
+	if p.BaseURL != "https://open.bigmodel.cn/api/coding/paas/v4" {
+		t.Fatalf("base_url not migrated: %q", p.BaseURL)
+	}
+	if p.Protocol != "openai" {
+		t.Fatalf("protocol not migrated: %q", p.Protocol)
+	}
+	if p.UserAgent != "OpenCode" {
+		t.Fatalf("user_agent not migrated: %q", p.UserAgent)
+	}
+}
+
+// 用户自定义过的端点不应被迁移覆盖。
+func TestZhipuCodingKeepsCustomEndpoint(t *testing.T) {
+	raw := []byte(`{"profiles":[` +
+		`{"id":"zhipu","name":"我的智谱","enabled":true,` +
+		`"kind":"custom","protocol":"openai",` +
+		`"base_url":"https://my.proxy.example/v1","user_agent":"MyClient"}]}`)
+	cfg := DefaultAt(filepath.Join(t.TempDir(), "config.json"))
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Normalize()
+	p, _ := cfg.ProfileByID("zhipu")
+	if p.BaseURL != "https://my.proxy.example/v1" || p.UserAgent != "MyClient" || p.Protocol != "openai" {
+		t.Fatalf("custom endpoint overwritten: %+v", p)
+	}
+}
+
+// 普通开放平台网关（/api/paas/v4）同样会走按量付费，升级时也要迁到编程套餐网关。
+func TestZhipuCodingMigratesOpenPlatformEndpoint(t *testing.T) {
+	raw := []byte(`{"profiles":[` +
+		`{"id":"zhipu","name":"智谱编程（GLM）","enabled":true,` +
+		`"kind":"custom","protocol":"openai",` +
+		`"base_url":"https://open.bigmodel.cn/api/paas/v4","user_agent":"opencode"}]}`)
+	cfg := DefaultAt(filepath.Join(t.TempDir(), "config.json"))
+	if err := json.Unmarshal(raw, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Normalize()
+	p, _ := cfg.ProfileByID("zhipu")
+	if p.BaseURL != "https://open.bigmodel.cn/api/coding/paas/v4" {
+		t.Fatalf("base_url not migrated: %q", p.BaseURL)
+	}
+	if p.UserAgent != "OpenCode" {
+		t.Fatalf("user_agent not migrated: %q", p.UserAgent)
+	}
+}

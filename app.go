@@ -44,7 +44,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.7.0"
+const Version = "1.7.1"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -1572,18 +1572,18 @@ func (a *App) SubmitLoginKey(provider, key string) error {
 	if err != nil {
 		return err
 	}
+	// opencode 与 custom 都是 API Key 制上游，但校验 / 落库方法名不同；
+	// custom 没有「本机密钥确认」语义，先分发，空密钥由它给出通用提示。
+	if upstream.ProfileKind(profile) == upstream.KindCustom {
+		return a.submitCustomKey(profile, client, key)
+	}
+
 	if strings.TrimSpace(key) == "" {
 		imported := a.pendingImportedKey(provider)
 		if imported == "" {
 			return errors.New(locale.T("login.keyEmpty"))
 		}
 		key = imported
-	}
-
-	// opencode 与 custom 都是 API Key 制上游，但校验 / 落库方法名不同；
-	// 这里按协议族分发到各自实现，后续逻辑（落盘、刷新、接管登录态）共用。
-	if upstream.ProfileKind(profile) == upstream.KindCustom {
-		return a.submitCustomKey(profile, client, key)
 	}
 
 	normalized, err := client.NormalizeOpenCodeKey(key)
@@ -1646,6 +1646,9 @@ func (a *App) SubmitLoginKey(provider, key string) error {
 // submitCustomKey 处理 custom 上游（含 xAI / Claude / ChatGPT / 智谱编程 与
 // 用户自建组）的密钥提交：清洗、校验、落盘、接管登录态，与 opencode 同口径。
 func (a *App) submitCustomKey(profile config.Profile, client *upstream.Client, key string) error {
+	if strings.TrimSpace(key) == "" {
+		return errors.New(locale.T("login.keyEmpty.custom"))
+	}
 	normalized, err := client.NormalizeAPIKey(key)
 	if err != nil {
 		if errors.Is(err, upstream.ErrCustomKeyInvalid) {

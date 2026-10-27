@@ -113,6 +113,7 @@ var catalog = map[string]entry{
 	"login.pasteKey.custom":    {"请粘贴该服务商的 API Key 完成登录", "Paste the provider's API key to sign in"},
 	"login.keyInvalid":         {"OpenCode 密钥无效，请检查后重试", "That OpenCode key looks invalid — please check it and try again"},
 	"login.keyEmpty":           {"请输入 OpenCode 密钥，或直接确认使用本机已保存的密钥", "Enter an OpenCode key, or confirm the one saved on this device"},
+	"login.keyEmpty.custom":    {"请输入该服务商的 API Key", "Enter the provider's API key"},
 	"login.keyRejected":        {"OpenCode 密钥被上游拒绝，请确认密钥是否正确、未过期", "The OpenCode key was rejected by the server — make sure it is correct and still valid"},
 	"login.keyInvalid.custom":  {"密钥无效，请检查后重试", "That key looks invalid — please check it and try again"},
 	"login.keyRejected.custom": {"密钥被上游拒绝，请确认密钥是否正确、未过期", "The key was rejected by the server — make sure it is correct and still valid"},

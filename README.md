@@ -31,12 +31,14 @@
 | `xai` | xAI（Grok） | API Key | OpenAI 线协议，`api.x.ai` |
 | `claude` | Claude（Anthropic） | API Key | Anthropic 线协议，`api.anthropic.com` |
 | `chatgpt` | ChatGPT（OpenAI） | API Key | OpenAI 线协议，`api.openai.com` |
-| `zhipu` | 智谱编程（GLM） | API Key | Anthropic 线协议，走 coding-plan 网关，客户端身份 `opencode` |
-| `zcode` | 智谱编程（ZCode 登录） | 浏览器授权 | ZCode 在线 OAuth（国内站 `zcode.chatglm.site` / 国际站 `zcode.z.ai`），自动换出 coding-plan API Key，同样以编程客户端身份调用 |
+| `zhipu` | 智谱编程（GLM） | API Key | OpenAI 线协议，编程套餐网关 `open.bigmodel.cn/api/coding/paas/v4`，客户端身份 `OpenCode` |
+| `zcode` | 智谱编程（ZCode 登录） | 浏览器授权 | ZCode 在线 OAuth（国内站 `zcode.chatglm.site` / 国际站 `zcode.z.ai`），自动换出编程套餐 API Key，同样走 `/api/coding/paas/v4` + `OpenCode` 身份 |
+
+> **智谱编程为什么必须用 `/api/coding/paas/v4` + `OpenCode` 身份？** 智谱的赠送额度绑定「编程套餐」通道：只有编程客户端身份（User-Agent `OpenCode`）访问编程专用网关时才会计入套餐。若误用普通开放平台网关（`/api/paas/v4`）或普通 Anthropic 网关（`/api/anthropic`），请求会走按量付费，在未充值的账号上返回 `[1113] 余额不足或无可用资源包`。`user_agent` 可在 `config.json` 中按需调整。
 
 ### 自定义模型（每个自成一组）
 
-除上面的固定预设外，还可以通过后端方法 `AddCustomProvider(name, baseURL, apiKey, protocol, model)` 添加**任意** OpenAI 或 Anthropic 兼容端点（DeepSeek、Moonshot、Qwen、火山方舟、自建网关……）。**每次调用都会创建一个独立分组**，即「每个自定义模型自成一组」，与其它服务商互不影响；同名重复添加会复用同一组。
+除上面的固定预设外，还可以通过后端方法 `AddCustomProvider({name, baseUrl, apiKey, protocol, model})` 添加**任意** OpenAI 或 Anthropic 兼容端点（DeepSeek、Moonshot、Qwen、火山方舟、自建网关……）。**每次调用都会创建一个独立分组**，即「每个自定义模型自成一组」，与其它服务商互不影响；同名重复添加会复用同一组（合并模型、保留已有账号）。`baseUrl` 必须是 `http(s)://` 开头的完整地址。
 
 - `protocol` 取 `openai`（默认）或 `anthropic`；`baseURL` 可带或不带 `/v1`（自动补全）。
 - 智谱的赠送额度按请求的 **User-Agent**（编程客户端身份）判定，故 `zhipu` / `zcode` 预设默认发送 `opencode`；若某些账号的赠送额度需要别的客户端身份（如 `claude code`、`codex`），在 `config.json` 的对应 profile 里改 `user_agent` 即可。

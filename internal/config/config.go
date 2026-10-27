@@ -126,9 +126,34 @@ func setIfEmpty(p *Profile, preset Profile) {
 	if p.Protocol == "" {
 		p.Protocol = preset.Protocol
 	}
-	// 智谱编程（zhipu / zcode）预设带「编程客户端」身份 opencode：智谱据此
+	// 智谱编程（zhipu / zcode）预设带「编程客户端」身份 OpenCode：智谱据此
 	// 把请求计入 ZCode / 编程套餐赠送额度。其它预设该字段为空，不覆盖。
 	if p.UserAgent == "" {
+		p.UserAgent = preset.UserAgent
+	}
+}
+
+// migrateZhipuCoding 让智谱编程预设从旧配置升级到正确的编程套餐组合。
+//
+// 早期版本把智谱编程错配成「普通 Anthropic 网关 + 小写 opencode 身份」，请求
+// 会命中按量付费通道，在无余额账号上返回 [1113] 余额不足。编程套餐的正确
+// 组合是「/api/coding/paas/v4 网关 + OpenCode 客户端身份」。这里仅在值仍为
+// 旧默认（Anthropic 网关或普通开放平台网关）时迁移，用户自定义过的端点 /
+// 身份保持不动。
+func migrateZhipuCoding(p *Profile, preset Profile) {
+	base := strings.TrimSpace(p.BaseURL)
+	// 旧默认：普通 Anthropic 网关，或普通开放平台网关（缺少 "coding/" 段）。
+	legacyAnthropic := strings.Contains(base, "open.bigmodel.cn/api/anthropic")
+	legacyOpenPlatform := strings.Contains(base, "open.bigmodel.cn/api/paas/v4")
+	if base == "" || legacyAnthropic || legacyOpenPlatform {
+		p.BaseURL = preset.BaseURL
+		p.Protocol = preset.Protocol
+		p.UserAgent = preset.UserAgent
+		return
+	}
+	setIfEmpty(p, preset)
+	// 身份大小写归一到 "OpenCode"：与 aicoder 中已验证的编程套餐客户端一致。
+	if strings.EqualFold(strings.TrimSpace(p.UserAgent), "opencode") {
 		p.UserAgent = preset.UserAgent
 	}
 }
@@ -371,26 +396,29 @@ func ChatGPTPreset() Profile {
 	}
 }
 
-// ZhipuPreset 返回智谱编程（bigmodel，GLM 系列）预设，Anthropic 线协议、
-// API Key 制。BaseURL 指向智谱的 coding-plan Anthropic 网关，且 UserAgent 用
-// 一个「编程客户端」身份（opencode）——只有这样智谱才会把请求计入 ZCode /
-// 编程套餐赠送的额度，否则会走付费通道。
+// ZhipuPreset 返回智谱编程（bigmodel，GLM 系列）预设，OpenAI 线协议、
+// API Key 制。
+//
+// BaseURL 必须指向智谱的 **编程套餐专用** OpenAI 网关 `/api/coding/paas/v4`
+// （不是普通开放平台的 `/api/paas/v4`），并以编程客户端身份（User-Agent
+// "OpenCode"）调用——两者缺一都会命中「按量付费」通道，在无余额的账号上
+// 返回 [1113] 余额不足。这是 aicoder 中 OpenCode+GLM 的已验证组合。
 func ZhipuPreset() Profile {
 	return Profile{
 		ID:        "zhipu",
 		Name:      "智谱编程（GLM）",
 		Enabled:   false,
 		Kind:      KindCustom,
-		Protocol:  "anthropic",
-		BaseURL:   "https://open.bigmodel.cn/api/anthropic/v1",
+		Protocol:  "openai",
+		BaseURL:   "https://open.bigmodel.cn/api/coding/paas/v4",
 		Origin:    "https://open.bigmodel.cn",
-		UserAgent: "opencode",
+		UserAgent: "OpenCode",
 	}
 }
 
-// ZCodePreset 返回智谱 ZCode 登录的智谱编程预设，Anthropic 线协议、ZCode 在线
+// ZCodePreset 返回智谱 ZCode 登录的智谱编程预设，OpenAI 线协议、ZCode 在线
 // OAuth 登录（浏览器授权 → 换 coding-plan API Key）。与 ZhipuPreset 共用同一
-// 套 coding-plan 网关与客户端身份，区别仅在于登录方式：ZCode 走浏览器授权、
+// 套编程套餐网关与客户端身份，区别仅在于登录方式：ZCode 走浏览器授权、
 // 不用手动粘贴 Key。
 func ZCodePreset() Profile {
 	return Profile{
@@ -398,10 +426,10 @@ func ZCodePreset() Profile {
 		Name:      "智谱编程（ZCode 登录）",
 		Enabled:   false,
 		Kind:      KindCustom,
-		Protocol:  "anthropic",
-		BaseURL:   "https://open.bigmodel.cn/api/anthropic/v1",
+		Protocol:  "openai",
+		BaseURL:   "https://open.bigmodel.cn/api/coding/paas/v4",
 		Origin:    "https://open.bigmodel.cn",
-		UserAgent: "opencode",
+		UserAgent: "OpenCode",
 	}
 }
 
@@ -679,11 +707,11 @@ func (c *Config) normalize() {
 			case "chatgpt":
 				setIfEmpty(p, ChatGPTPreset())
 			case "zhipu":
-				setIfEmpty(p, ZhipuPreset())
+				migrateZhipuCoding(p, ZhipuPreset())
 			case "zcode":
-				// zcode 与 zhipu 共用同一套 coding-plan 网关与客户端身份，
+				// zcode 与 zhipu 共用同一套编程套餐网关与客户端身份，
 				// 区别仅在于登录方式（ZCode 浏览器 OAuth）与显示名。
-				setIfEmpty(p, ZCodePreset())
+				migrateZhipuCoding(p, ZCodePreset())
 			}
 		}
 		// 所有 Kind=custom 的上游（命名预设与用户自建组）统一校正线协议：

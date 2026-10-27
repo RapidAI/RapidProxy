@@ -32,12 +32,14 @@ Each signable provider is one **group**: accounts inside a group are served with
 | `xai` | xAI (Grok) | API key | OpenAI wire protocol, `api.x.ai` |
 | `claude` | Claude (Anthropic) | API key | Anthropic wire protocol, `api.anthropic.com` |
 | `chatgpt` | ChatGPT (OpenAI) | API key | OpenAI wire protocol, `api.openai.com` |
-| `zhipu` | Zhipu Coding (GLM) | API key | Anthropic wire protocol via the coding-plan gateway, client identity `opencode` |
-| `zcode` | Zhipu Coding (ZCode sign-in) | Browser authorization | ZCode online OAuth (China `zcode.chatglm.site` / international `zcode.z.ai`) resolves a coding-plan API key and calls it as a coding client |
+| `zhipu` | Zhipu Coding (GLM) | API key | OpenAI wire protocol, coding-plan gateway `open.bigmodel.cn/api/coding/paas/v4`, client identity `OpenCode` |
+| `zcode` | Zhipu Coding (ZCode sign-in) | Browser authorization | ZCode online OAuth (China `zcode.chatglm.site` / international `zcode.z.ai`) resolves a coding-plan API key and calls it via `/api/coding/paas/v4` as `OpenCode` |
+
+> **Why `/api/coding/paas/v4` + `OpenCode`?** Zhipu's gifted quota belongs to the "coding plan" channel: it only applies when a recognized coding client (User-Agent `OpenCode`) calls the coding-specific gateway. Using the regular open-platform gateway (`/api/paas/v4`) or the plain Anthropic gateway (`/api/anthropic`) is billed as pay-as-you-go and returns `[1113] insufficient balance or no available resource pack` on an uncharged account. `user_agent` can be adjusted in `config.json` if needed.
 
 ### Custom models (each is its own group)
 
-Beyond the fixed presets, the backend method `AddCustomProvider(name, baseURL, apiKey, protocol, model)` adds **any** OpenAI- or Anthropic-compatible endpoint (DeepSeek, Moonshot, Qwen, Volcengine Ark, self-hosted gateways, …). **Every call creates an independent group**, so each custom model is its own group and never mixes with the other providers; adding the same name again reuses that group.
+Beyond the fixed presets, the backend method `AddCustomProvider({name, baseUrl, apiKey, protocol, model})` adds **any** OpenAI- or Anthropic-compatible endpoint (DeepSeek, Moonshot, Qwen, Volcengine Ark, self-hosted gateways, …). **Every call creates an independent group**, so each custom model is its own group and never mixes with the other providers; adding the same name again reuses that group (merging models, keeping existing accounts). `baseUrl` must be a full `http(s)://` URL.
 
 - `protocol` is `openai` (default) or `anthropic`; `baseURL` may include `/v1` or not (it is completed automatically).
 - Zhipu's gifted quota is decided by the request **User-Agent** (coding-client identity), so the `zhipu` / `zcode` presets send `opencode` by default; if an account's quota requires a different client identity (e.g. `claude code`, `codex`), change `user_agent` in that profile in `config.json`.

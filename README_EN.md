@@ -29,11 +29,13 @@ Each signable provider is one **group**: accounts inside a group are served with
 | `qoder-cn` | Qoder (China) | Device code (PKCE) | COSY-signed chat, approve in the browser |
 | `qoder-global` | Qoder (International) | Device code (PKCE) | Separate from the China edition |
 | `opencode` | OpenCode Zen (opencode.ai) | API key | Imports the key saved by the local OpenCode CLI and waits for confirmation (paste a new key to override), or paste a key directly; a proxy is recommended |
-| `xai` | xAI (Grok) | API key | OpenAI wire protocol, `api.x.ai` |
-| `claude` | Claude (Anthropic) | API key | Anthropic wire protocol, `api.anthropic.com` |
-| `chatgpt` | ChatGPT (OpenAI) | API key | OpenAI wire protocol, `api.openai.com` |
-| `zhipu` | Zhipu Coding (GLM) | API key | OpenAI wire protocol, coding-plan gateway `open.bigmodel.cn/api/coding/paas/v4`, client identity `OpenCode` |
-| `zcode` | Zhipu Coding (ZCode sign-in) | Browser authorization | ZCode online OAuth (China `zcode.chatglm.site` / international `zcode.z.ai`) resolves a coding-plan API key and calls it via `/api/coding/paas/v4` as `OpenCode` |
+| `xai` | xAI (Grok) | Browser OAuth | Grok Build identity (the OAuth token carries `X-XAI-Token-Auth`); chat uses the Responses API at `api.x.ai/v1` and is translated to OpenAI Chat by the proxy; set `auth: apikey` to paste a key instead |
+| `claude` | Claude (Anthropic) | Browser OAuth | Claude Pro/Max subscription (PKCE); the authorize page is on `claude.ai` and its callback page is hosted by Anthropic, so you paste the code back; chat uses the Anthropic Messages API |
+| `chatgpt` | ChatGPT (OpenAI) | Browser OAuth | Codex subscription line (callback on `localhost:1455`); chat goes to the Responses API at `chatgpt.com/backend-api/codex` and is translated to OpenAI Chat by the proxy |
+| `zhipu` | Zhipu Coding (GLM) | Browser OAuth | ZCode online authorization resolves a coding-plan API key, then calls `/api/coding/paas/v4` as `OpenCode`; set `auth: apikey` to paste a key instead |
+| `zcode` | Zhipu Coding (ZCode sign-in) | Browser authorization | Same ZCode online OAuth chain as `zhipu` (China `zcode.chatglm.site` / international `zcode.z.ai`), different display name |
+
+> **All four now sign in through OAuth.** `xai` / `claude` / `chatgpt` use each vendor's own OAuth (Claude via Claude Code's public client, ChatGPT via the Codex CLI client and subscription line, xAI via Grok Build's OIDC + PKCE); `zhipu` / `zcode` use Zhipu's ZCode online authorization and resolve a normal coding-plan API key. To paste a key by hand instead, set that profile's `auth` to `apikey` (`zhipu` / `zcode` / `xai` support this; `claude` / `chatgpt` OAuth tokens are not interchangeable with platform API keys).
 
 > **Why `/api/coding/paas/v4` + `OpenCode`?** Zhipu's gifted quota belongs to the "coding plan" channel: it only applies when a recognized coding client (User-Agent `OpenCode`) calls the coding-specific gateway. Using the regular open-platform gateway (`/api/paas/v4`) or the plain Anthropic gateway (`/api/anthropic`) is billed as pay-as-you-go and returns `[1113] insufficient balance or no available resource pack` on an uncharged account. `user_agent` can be adjusted in `config.json` if needed.
 

@@ -356,6 +356,11 @@ func TestZhipuCodingMigratesLegacyEndpoint(t *testing.T) {
 	if p.UserAgent != "OpenCode" {
 		t.Fatalf("user_agent not migrated: %q", p.UserAgent)
 	}
+	// 端点迁移走的是独立分支（直接 return，不走 setIfEmpty）：auth 必须在那里
+	// 一起补齐，否则老用户升级后仍是 apikey，界面上没有浏览器登录入口。
+	if !p.UsesOAuth() {
+		t.Fatalf("旧配置迁移后应升级为 OAuth，实际 auth=%q", p.Auth)
+	}
 }
 
 // 用户自定义过的端点不应被迁移覆盖。
@@ -392,5 +397,117 @@ func TestZhipuCodingMigratesOpenPlatformEndpoint(t *testing.T) {
 	}
 	if p.UserAgent != "OpenCode" {
 		t.Fatalf("user_agent not migrated: %q", p.UserAgent)
+	}
+}
+
+// 四家服务商改成 OAuth 登录后，预设必须带上 auth=oauth；用户显式写
+// auth=apikey 时保持粘贴密钥（两条路都支持，默认走浏览器授权）。
+func TestOAuthPresets(t *testing.T) {
+	cases := []struct {
+		id     string
+		oauth  string
+		baseUI string
+	}{
+		{"xai", OAuthXAI, "https://api.x.ai/v1"},
+		{"claude", OAuthClaude, "https://api.anthropic.com/v1"},
+		// ChatGPT 的 OAuth 令牌只能走 Codex 订阅线路，不是 api.openai.com。
+		{"chatgpt", OAuthChatGPT, "https://chatgpt.com/backend-api/codex"},
+		{"zhipu", OAuthZCode, "https://open.bigmodel.cn/api/coding/paas/v4"},
+		{"zcode", OAuthZCode, "https://open.bigmodel.cn/api/coding/paas/v4"},
+	}
+	cfg := Default()
+	for _, tc := range cases {
+		p, ok := cfg.ProfileByID(tc.id)
+		if !ok {
+			t.Fatalf("%s 预设缺失", tc.id)
+		}
+		if !p.UsesOAuth() {
+			t.Errorf("%s 默认应走 OAuth 登录，实际 auth=%q", tc.id, p.Auth)
+		}
+		if got := p.OAuthKind(); got != tc.oauth {
+			t.Errorf("%s OAuthKind = %q, want %q", tc.id, got, tc.oauth)
+		}
+		if p.BaseURL != tc.baseUI {
+			t.Errorf("%s BaseURL = %q, want %q", tc.id, p.BaseURL, tc.baseUI)
+		}
+	}
+}
+
+// 用户自建组没有 OAuth 实现：即便写了 auth=oauth 也要退回粘贴密钥，
+// 否则会卡在「要求 OAuth 但没有实现」的死角。
+func TestOAuthFallsBackForCustomGroups(t *testing.T) {
+	cfg := &Config{
+		Profiles: []Profile{
+			{ID: "custom-abc123", Name: "自建", Kind: KindCustom, Auth: AuthOAuth},
+		},
+	}
+	cfg.Normalize()
+	p := cfg.Profiles[0]
+	if p.Auth != AuthAPIKey {
+		t.Errorf("自建组应退回 apikey，实际 %q", p.Auth)
+	}
+	if p.OAuthProvider != "" {
+		t.Errorf("退回 apikey 后不应残留 OAuthProvider，实际 %q", p.OAuthProvider)
+	}
+}
+
+// 用户把预设的 auth 显式改回 apikey 时，必须尊重用户选择（粘贴密钥仍可用）。
+func TestExplicitAPIKeyAuthIsRespected(t *testing.T) {
+	cfg := &Config{
+		Profiles: []Profile{
+			{ID: "claude", Kind: KindCustom, Auth: AuthAPIKey},
+		},
+	}
+	cfg.Normalize()
+	p := cfg.Profiles[0]
+	if p.UsesOAuth() {
+		t.Error("显式 apikey 不应被改回 OAuth")
+	}
+	if p.OAuthKind() != "" {
+		t.Errorf("非 OAuth 时 OAuthKind 应为空，实际 %q", p.OAuthKind())
+	}
+}
+
+// 非 custom 协议族不参与 Auth 字段（它们各自有登录实现）。
+func TestAuthFieldClearedForNonCustomKinds(t *testing.T) {
+	cfg := &Config{
+		Profiles: []Profile{
+			{ID: "workbuddy", Kind: KindWorkBuddy, Auth: AuthOAuth, OAuthProvider: OAuthClaude},
+		},
+	}
+	cfg.Normalize()
+	p := cfg.Profiles[0]
+	if p.Auth != "" || p.OAuthProvider != "" {
+		t.Errorf("非 custom 上游应清空 auth 字段，实际 auth=%q oauth=%q", p.Auth, p.OAuthProvider)
+	}
+}
+
+// 旧配置文件（auth 字段缺失）升级后必须变成 OAuth，否则老用户看不到新的
+// 浏览器登录入口。
+func TestLegacyConfigMigratesToOAuth(t *testing.T) {
+	cfg := &Config{
+		Profiles: []Profile{
+			{ID: "xai", Name: "xAI（Grok）", Kind: KindCustom, Protocol: "openai", BaseURL: "https://api.x.ai/v1"},
+			{ID: "claude", Name: "Claude（Anthropic）", Kind: KindCustom, Protocol: "anthropic", BaseURL: "https://api.anthropic.com/v1"},
+			{ID: "chatgpt", Name: "ChatGPT（OpenAI）", Kind: KindCustom, Protocol: "openai", BaseURL: "https://api.openai.com/v1"},
+			{ID: "zhipu", Name: "智谱编程（GLM）", Kind: KindCustom, Protocol: "openai", BaseURL: "https://open.bigmodel.cn/api/coding/paas/v4"},
+		},
+	}
+	cfg.Normalize()
+	for _, id := range []string{"xai", "claude", "chatgpt", "zhipu"} {
+		p, ok := cfg.ProfileByID(id)
+		if !ok {
+			t.Fatalf("%s 缺失", id)
+		}
+		if !p.UsesOAuth() {
+			t.Errorf("%s 旧配置应升级为 OAuth，实际 auth=%q", id, p.Auth)
+		}
+		if p.OAuthKind() == "" {
+			t.Errorf("%s 缺少 OAuth 实现标识", id)
+		}
+	}
+	// ChatGPT 的旧端点（api.openai.com）不能用于 OAuth 订阅线路：必须迁移。
+	if p, _ := cfg.ProfileByID("chatgpt"); p.BaseURL != "https://chatgpt.com/backend-api/codex" {
+		t.Errorf("chatgpt BaseURL 未迁移，实际 %q", p.BaseURL)
 	}
 }

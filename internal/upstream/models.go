@@ -110,39 +110,47 @@ var OpenCodeSpecs = []ModelSpec{
 	{"big-pickle", "Big Pickle", 128000, 0},
 }
 
-// XAISpecs 是 xAI（Grok）的内置兜底目录（OpenAI 线协议）。
-// 真实目录以远端 /models 为准，同步失败时也不至于列表为空。
+// XAISpecs 是 xAI（Grok）的内置兜底目录。
+//
+// OAuth 登录走的是 Grok Build 的 Responses 线路，模型名与公开 API 一致，
+// 但新模型（如 grok-4.6）只在该线路开放。真实目录以远端 /models 为准。
 var XAISpecs = []ModelSpec{
+	{"grok-4.6", "Grok 4.6", 400000, 32000},
 	{"grok-4", "Grok 4", 256000, 8096},
 	{"grok-4-fast", "Grok 4 Fast", 256000, 8096},
 	{"grok-3", "Grok 3", 131072, 8096},
 	{"grok-3-mini", "Grok 3 Mini", 131072, 8096},
-	{"grok-2", "Grok 2", 131072, 8096},
-	{"grok-2-mini", "Grok 2 Mini", 131072, 8096},
 }
 
 // ClaudeSpecs 是 Anthropic Claude 的内置兜底目录（Anthropic 线协议）。
 // 真实目录以远端 /v1/models 为准，同步失败时也不至于列表为空。
+//
+// 注意：Anthropic 没有 "*-thinking" 这类模型名——extended thinking 是请求
+// 参数（thinking 字段），不是独立模型。列一个不存在的模型名只会让用户选中
+// 后收到 404。
 var ClaudeSpecs = []ModelSpec{
 	{"claude-opus-4-5", "Claude Opus 4.5", 200000, 32000},
 	{"claude-sonnet-4-5", "Claude Sonnet 4.5", 200000, 64000},
-	{"claude-sonnet-4-5-thinking", "Claude Sonnet 4.5 (Thinking)", 200000, 64000},
 	{"claude-haiku-4-5", "Claude Haiku 4.5", 200000, 32000},
 	{"claude-3-5-sonnet", "Claude 3.5 Sonnet", 200000, 8192},
 	{"claude-3-5-haiku", "Claude 3.5 Haiku", 200000, 8192},
 	{"claude-3-opus", "Claude 3 Opus", 200000, 4096},
 }
 
-// ChatGPTSpecs 是 OpenAI ChatGPT 的内置兜底目录（OpenAI 线协议）。
+// ChatGPTSpecs 是 ChatGPT（Codex 订阅线路）的内置兜底目录。
+//
+// 订阅线路的模型名与开放平台 API 不同（如 gpt-5.6-luna 只存在于 Codex 侧），
+// 因此这里列的是订阅可用的一批，而非 api.openai.com 的目录。真实目录以
+// GET {base}/codex/models 为准，同步失败时才用这份兜底。
 var ChatGPTSpecs = []ModelSpec{
+	{"gpt-5.6-luna", "GPT-5.6-Luna", 1000000, 128000},
+	{"gpt-5.6-terra", "GPT-5.6-Terra", 1000000, 128000},
+	{"gpt-5.5", "GPT-5.5", 1000000, 72000},
+	{"gpt-5.4", "GPT-5.4", 272000, 128000},
+	{"gpt-5.3-codex", "GPT-5.3-Codex", 272000, 128000},
 	{"gpt-5", "GPT-5", 272000, 128000},
 	{"gpt-5-mini", "GPT-5 Mini", 272000, 128000},
 	{"gpt-5-nano", "GPT-5 Nano", 272000, 128000},
-	{"gpt-4.1", "GPT-4.1", 1047576, 32768},
-	{"gpt-4.1-mini", "GPT-4.1 Mini", 1047576, 32768},
-	{"gpt-4.1-nano", "GPT-4.1 Nano", 1047576, 32768},
-	{"gpt-4o", "GPT-4o", 128000, 16384},
-	{"gpt-4o-mini", "GPT-4o Mini", 128000, 16384},
 	{"o3", "o3", 200000, 100000},
 	{"o4-mini", "o4-mini", 200000, 100000},
 }

@@ -44,7 +44,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.7.1"
+const Version = "1.8.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -213,6 +213,9 @@ type LoginView struct {
 	AccountID string `json:"accountId"`
 	// NeedKey 表示这次登录等待用户在界面上粘贴密钥（OpenCode 的 API Key 制登录）。
 	NeedKey bool `json:"needKey"`
+	// NeedCode 表示这次登录等待用户粘贴 OAuth 授权码（Claude 的远程回调页
+	// 无法被本机接收，只能在页面上复制授权码）。
+	NeedCode bool `json:"needCode"`
 }
 
 // UpdateView 是在线更新的检查结果与安装进度。
@@ -1386,14 +1389,22 @@ func (a *App) StartLogin(provider, parentOrigin string) (LoginView, error) {
 		// 流程停在等待确认的状态——用户提交空密钥即用它登录，或直接在
 		// 下方粘贴新密钥覆盖（NeedKey 亦为真），想换钥匙不必先删本机文件。
 		run.message = locale.T("login.importing", session.LocalKeyLabel)
+	case session.NeedCode:
+		// OAuth 但回调页由上游托管（Claude）：浏览器完成授权后，用户把页面上
+		// 的授权码粘贴回来（SubmitLoginCode 收口）。
+		run.message = locale.T("login.pasteCode", profile.Name)
 	case session.NeedKey:
 		// API Key 制登录：等用户在界面上粘贴（SubmitLoginKey 收口）。
-		// custom 上游没有统一的密钥页，用通用文案；OpenCode 有官方密钥页。
+		// custom 上游（用户自建组等）各有自己的控制台，文案带上服务商名；
+		// OpenCode 有官方密钥页，用它的专属文案。
 		if upstream.ProfileKind(profile) == upstream.KindCustom {
-			run.message = locale.T("login.pasteKey.custom")
+			run.message = locale.T("login.pasteKey.custom", profile.Name)
 		} else {
 			run.message = locale.T("login.pasteKey")
 		}
+	case profile.UsesOAuth():
+		// 浏览器 OAuth（chatgpt / xai / zcode）：本地回调或后台轮询自动收口。
+		run.message = locale.T("login.browserOAuth", profile.Name)
 	default:
 		run.message = locale.T("login.browserOpened")
 	}
@@ -1433,6 +1444,13 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 				if errors.Is(err, upstream.ErrLoginTimeout) {
 					a.finishLogin(run, "failed", locale.T("login.expired"), "")
 					return
+				}
+				// 粘贴授权码时输错（复制漏字符、贴了整页内容）很常见：
+				// 一次换 token 失败不该终结登录流程，提示后继续等待下一次
+				// 粘贴——否则用户得重新走一遍浏览器授权。
+				if errors.Is(err, upstream.ErrLoginCodeRejected) {
+					a.setLoginMessage(run, err.Error())
+					continue
 				}
 				a.finishLogin(run, "failed", err.Error(), "")
 				return
@@ -1524,6 +1542,21 @@ func (a *App) finishLogin(run *loginRun, status, message, accountID string) {
 	a.pushState()
 }
 
+// setLoginMessage 更新进行中登录流程的提示文案（不改变状态）。
+//
+// 用于「可重试」的中间失败：把原因显示出来，但流程继续等待用户重试。
+func (a *App) setLoginMessage(run *loginRun, message string) {
+	a.loginMu.Lock()
+	if a.login != run || run.status != "pending" {
+		a.loginMu.Unlock()
+		return
+	}
+	run.message = message
+	a.loginMu.Unlock()
+	a.log.Warnf("登录提示: %s", message)
+	a.pushLogin()
+}
+
 // finishLoginLocked 是 finishLogin 的持锁版本，供已拿到 loginMu 的调用方
 // 使用。返回 false 表示这次终态被粘滞守卫挡下（状态未变）。
 func (a *App) finishLoginLocked(run *loginRun, status, message, accountID string) bool {
@@ -1534,6 +1567,12 @@ func (a *App) finishLoginLocked(run *loginRun, status, message, accountID string
 	run.message = message
 	run.accountID = accountID
 	if status != "pending" {
+		// 先停掉协议族侧的资源再取消轮询上下文：OAuth 的本地回调监听器
+		// （chatgpt 的 1455、xai 的临时端口）不关就会一直占着端口和协程，
+		// 下次登录还得顺延端口。Cancel 内部幂等，重复调用安全。
+		if run.session != nil {
+			run.session.Cancel()
+		}
 		run.cancel()
 	}
 	return true
@@ -1551,6 +1590,29 @@ func (a *App) pendingImportedKey(provider string) string {
 		return ""
 	}
 	return strings.TrimSpace(run.session.LocalKey)
+}
+
+// SubmitLoginCode 提交用户粘贴的 OAuth 授权码（Claude 专用：Anthropic 的
+// 回调页由它自己托管，本机收不到重定向，只能复制授权码粘贴回来）。
+//
+// 授权码交给进行中的登录会话，由轮询协程完成 token 交换与落库——这样成功/
+// 失败的收口只有一条路径，不会出现「提交时成功、轮询又失败」的两套状态。
+func (a *App) SubmitLoginCode(provider, code string) error {
+	code = strings.TrimSpace(code)
+	if code == "" {
+		return errors.New(locale.T("login.codeEmpty"))
+	}
+	a.loginMu.Lock()
+	run := a.login
+	a.loginMu.Unlock()
+	if run == nil || run.provider != provider || run.status != "pending" || run.session == nil {
+		return errors.New(locale.T("login.codeNoFlow"))
+	}
+	if !run.session.SubmitOAuthCode(code) {
+		return errors.New(locale.T("login.codeNoFlow"))
+	}
+	a.log.Infof("[%s] 已收到授权码，正在换取登录凭证", provider)
+	return nil
 }
 
 // SubmitLoginKey 提交用户粘贴的上游密钥（目前用于 OpenCode：Zen 是 API Key
@@ -1575,6 +1637,12 @@ func (a *App) SubmitLoginKey(provider, key string) error {
 	// opencode 与 custom 都是 API Key 制上游，但校验 / 落库方法名不同；
 	// custom 没有「本机密钥确认」语义，先分发，空密钥由它给出通用提示。
 	if upstream.ProfileKind(profile) == upstream.KindCustom {
+		// OAuth 上游不接受粘贴密钥：它走浏览器授权（claude 还要粘贴授权码），
+		// 密钥落库会把凭据存成「没有 refresh_token 的 OAuth 账号」，之后
+		// 过期无法续期。直接拒绝比存一份坏凭据好。
+		if profile.UsesOAuth() {
+			return errors.New(locale.T("login.oauthNoKey", profile.Name))
+		}
 		return a.submitCustomKey(profile, client, key)
 	}
 
@@ -1647,7 +1715,7 @@ func (a *App) SubmitLoginKey(provider, key string) error {
 // 用户自建组）的密钥提交：清洗、校验、落盘、接管登录态，与 opencode 同口径。
 func (a *App) submitCustomKey(profile config.Profile, client *upstream.Client, key string) error {
 	if strings.TrimSpace(key) == "" {
-		return errors.New(locale.T("login.keyEmpty.custom"))
+		return errors.New(locale.T("login.keyEmpty.custom", profile.Name))
 	}
 	normalized, err := client.NormalizeAPIKey(key)
 	if err != nil {
@@ -1742,6 +1810,7 @@ func (a *App) loginState() LoginView {
 		ExpiresAt: run.session.ExpiresAt.Format("15:04:05"),
 		AccountID: run.accountID,
 		NeedKey:   run.session.NeedKey,
+		NeedCode:  run.session.NeedCode,
 	}
 	return view
 }

@@ -198,46 +198,89 @@ function renderLogin() {
   const spinner = $('login-spinner');
   spinner.className = 'spinner' + (login.status === 'success' ? ' done' : login.status === 'failed' ? ' fail' : '');
 
-  // API Key 制登录（OpenCode）走「粘贴密钥」分支：显示输入行、隐藏浏览器提示。
-  // 本机导入（state === 'local'）是同一分支的变体：不自动登录，等用户确认
-  // （空提交 = 使用本机密钥）或粘贴新密钥覆盖。
-  const needKey = !!login.needKey && login.status === 'pending';
+  // 登录有三种输入形态：
+  //   needCode —— OAuth 但回调页由上游托管（Claude），用户把页面上的授权码
+  //               粘贴回来；
+  //   needKey  —— API Key 制（OpenCode / 用户自建组），粘贴密钥；
+  //   其余      —— 浏览器授权，本地回调或后台轮询自动收口。
+  // 本机导入（state === 'local'）是 OpenCode 分支的变体：不自动登录，等用户
+  // 确认（空提交 = 使用本机密钥）或粘贴新密钥覆盖。
+  const pending = login.status === 'pending';
+  const needCode = !!login.needCode && pending;
+  const needKey = !!login.needKey && pending && !needCode;
+  const wantsInput = needCode || needKey;
   const localImport = needKey && login.state === 'local';
+  const providerName = loginProviderName(login.provider);
+  const openCode = login.provider === 'opencode';
+  const pasteTitle = openCode
+    ? t('login.pasteTitle')
+    : t('login.pasteTitle.custom', { name: providerName });
   $('login-title').textContent =
     login.status === 'success' ? t('login.success') :
     login.status === 'failed' ? t('login.failed') :
     localImport ? t('login.localTitle') :
-    needKey ? t('login.pasteTitle') : t('login.pending');
+    needCode ? t('login.codeTitle', { name: providerName }) :
+    needKey ? pasteTitle : t('login.pending');
   $('login-message').textContent = login.message || '';
-  $('login-expires').textContent = login.status === 'pending' ? t('login.expiresFmt', { time: login.expiresAt }) : '';
-  $('login-browser-tip').classList.toggle('hidden', needKey);
-  $('login-key-tip').classList.toggle('hidden', !needKey);
-  $('login-key-tip-text').textContent = localImport ? t('login.localTip') : t('login.keyTip');
-  $('login-key-row').classList.toggle('hidden', !needKey);
-  $('login-key').placeholder = localImport ? t('login.localPlaceholder') : t('login.keyPlaceholder');
-  $('btn-submit-key').textContent = localImport ? t('btn.confirmLogin') : t('btn.submitKey');
+  $('login-expires').textContent = pending ? t('login.expiresFmt', { time: login.expiresAt }) : '';
+  $('login-browser-tip').classList.toggle('hidden', wantsInput);
+  $('login-key-tip').classList.toggle('hidden', !wantsInput);
+  $('login-key-tip-text').textContent = needCode
+    ? t('login.codeTip', { name: providerName })
+    : localImport ? t('login.localTip')
+    : openCode ? t('login.keyTip') : t('login.keyTip.custom', { name: providerName });
+  $('login-key-row').classList.toggle('hidden', !wantsInput);
+  $('login-key').placeholder = needCode
+    ? t('login.codePlaceholder')
+    : localImport ? t('login.localPlaceholder')
+    : openCode ? t('login.keyPlaceholder') : t('login.keyPlaceholder.custom', { name: providerName });
+  $('btn-submit-key').textContent = needCode
+    ? t('btn.submitCode')
+    : localImport ? t('btn.confirmLogin') : t('btn.submitKey');
   // 提交过程中后端要联机校验密钥，轮询刷新不能把按钮又放开导致重复提交。
-  $('btn-submit-key').disabled = !needKey || submittingKey;
-  if (!needKey && !submittingKey) $('login-key').value = '';
+  $('btn-submit-key').disabled = !wantsInput || submittingKey;
+  if (!wantsInput && !submittingKey) $('login-key').value = '';
 
+  // 没有授权链接时（粘贴密钥 / 粘贴授权码）整行隐藏，别让用户对着一个只有
+  // 「-」和「复制链接」的空行发呆；「重新打开登录页」改用服务商控制台地址。
   const urlNode = $('login-url');
   urlNode.textContent = login.url || '-';
-  $('btn-open-login').disabled = login.status !== 'pending';
-  $('btn-cancel-login').disabled = login.status !== 'pending';
+  $('login-url-row').classList.toggle('hidden', !login.url);
+  const consoleURL = login.url ? '' : providerConsoleURL(login.provider);
+  $('btn-open-login').classList.toggle('hidden', !login.url && !consoleURL);
+  $('btn-open-login').textContent = login.url ? t('btn.reopenLogin') : t('btn.openConsole');
+  $('btn-open-login').disabled = !pending;
+  $('btn-cancel-login').disabled = !pending;
+}
+
+/* 按上游 ID 取显示名（登录面板的提示文案要用它）。 */
+function loginProviderName(id) {
+  const p = (S.state.providers || []).find((x) => x.id === id);
+  return (p && p.name) || id || '';
+}
+
+/* custom 上游（API Key 制）没有授权链接，退而求其次给出服务商控制台地址。 */
+function providerConsoleURL(id) {
+  const p = (S.state.providers || []).find((x) => x.id === id);
+  return (p && p.origin) || '';
 }
 
 function renderLoginProviders() {
   const wrap = $('login-providers');
   wrap.innerHTML = '';
   (S.state.providers || []).forEach((p) => {
-    const btn = el('button', 'btn');
-    btn.textContent = t('btn.loginFmt', { name: p.name });
+    const btn = el('button', 'btn login-btn');
+    btn.appendChild(el('span', null, t('btn.loginFmt', { name: p.name })));
+    // 登录状态只用按钮末尾的小圆点表示：绿色 = 已登录，灰色 = 未登录。
+    // 未启用的说明移进圆点的 title，免得每个按钮后面都拖一行文字。
+    const logged = p.accountCount > 0;
+    const dot = el('i', 'login-dot' + (logged ? ' on' : ''));
+    dot.title = logged ? t('tag.logged', { n: p.accountCount }) : t('tag.notLogged');
+    if (!p.enabled) dot.title += ' ' + t('acc.loginDisabled');
+    btn.title = dot.title;
+    btn.appendChild(dot);
     btn.onclick = () => startLogin(p.id);
     wrap.appendChild(btn);
-    if (!p.enabled) {
-      const note = el('span', 'hint', t('acc.loginDisabled'));
-      wrap.appendChild(note);
-    }
   });
 }
 
@@ -1522,29 +1565,43 @@ function bindUI() {
   $('btn-clear-log').onclick = () => call('ClearLogs').then(refresh).catch(() => {});
   $('btn-cancel-login').onclick = () => call('CancelLogin').then(refresh).catch(() => {});
   $('btn-open-login').onclick = () => {
-    if (S.login.url) call('OpenURL', S.login.url).catch(() => {});
+    // 授权类上游打开登录页；API Key 制上游没有授权链接，改为打开控制台。
+    const target = S.login.url || providerConsoleURL(S.login.provider);
+    if (target) call('OpenURL', target).catch(() => {});
   };
-  // OpenCode 密钥提交：Enter 与按钮等价。失败时保留输入框内容便于重试，
-  // 刷新后仍处于 pending 会重新放开按钮。提交期间后端会联机校验密钥，
-  // 用 submittingKey 挡住轮询刷新与重复点击。
+  // 登录输入提交（粘贴授权码 / 粘贴密钥）：Enter 与按钮等价。失败时保留
+  // 输入框内容便于重试，刷新后仍处于 pending 会重新放开按钮。提交期间后端
+  // 要联机校验，用 submittingKey 挡住轮询刷新与重复点击。
   //
-  // 本机导入会话（state === 'local'）允许空提交：空提交 = 确认使用本机
-  // 已保存的密钥——导入不再自动登录，用户有机会先粘贴新密钥。
+  // 授权码（needCode）交给 SubmitLoginCode，由后台轮询完成 token 交换；
+  // 密钥交给 SubmitLoginKey。本机导入会话（state === 'local'）允许空提交：
+  // 空提交 = 确认使用本机已保存的密钥——导入不再自动登录，用户有机会先粘贴
+  // 新密钥。
   $('btn-submit-key').onclick = async () => {
     if (submittingKey) return;
     const provider = S.login.provider;
-    const localImport = S.login.state === 'local';
+    const needCode = !!S.login.needCode;
+    const localImport = !needCode && S.login.state === 'local';
     const value = $('login-key').value.trim();
     if (!value && !localImport) return toast(t('toast.keyEmpty'));
     submittingKey = true;
     $('btn-submit-key').disabled = true;
+    let ok = false;
     try {
-      await call('SubmitLoginKey', provider, value);
-      $('login-key').value = '';
+      if (needCode) {
+        await call('SubmitLoginCode', provider, value);
+      } else {
+        await call('SubmitLoginKey', provider, value);
+      }
+      ok = true;
     } catch (err) {
       toast(t('toast.opFailedFmt', { err: String(err) }));
     }
     submittingKey = false;
+    // 授权码只是「交给后台换 token」，成功与否由轮询定论：这里不清空输入框，
+    // 万一后台换 token 失败（复制漏字符很常见），用户还能改一两个字符重试。
+    // 密钥提交是同步校验的，成功即可清空。
+    if (ok && !needCode) $('login-key').value = '';
     await refresh();
   };
   $('login-key').addEventListener('keydown', (e) => {

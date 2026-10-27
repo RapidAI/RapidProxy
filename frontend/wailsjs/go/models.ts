@@ -72,6 +72,8 @@ export namespace main {
 	    message: string;
 	    expiresAt: string;
 	    accountId: string;
+	    needKey: boolean;
+	    needCode: boolean;
 	
 	    static createFrom(source: any = {}) {
 	        return new LoginView(source);
@@ -88,6 +90,8 @@ export namespace main {
 	        this.message = source["message"];
 	        this.expiresAt = source["expiresAt"];
 	        this.accountId = source["accountId"];
+	        this.needKey = source["needKey"];
+	        this.needCode = source["needCode"];
 	    }
 	}
 	export class ModelView {

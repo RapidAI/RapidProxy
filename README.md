@@ -28,11 +28,13 @@
 | `qoder-cn` | Qoder（国内版） | 设备码（PKCE） | COSY 签名对话，须在浏览器批准 |
 | `qoder-global` | Qoder（国际版） | 设备码（PKCE） | 与国内版互不通用 |
 | `opencode` | OpenCode Zen（opencode.ai） | API Key | 导入本机 OpenCode CLI 的密钥后等待确认（可粘贴新密钥覆盖），或直接粘贴密钥；建议配置代理 |
-| `xai` | xAI（Grok） | API Key | OpenAI 线协议，`api.x.ai` |
-| `claude` | Claude（Anthropic） | API Key | Anthropic 线协议，`api.anthropic.com` |
-| `chatgpt` | ChatGPT（OpenAI） | API Key | OpenAI 线协议，`api.openai.com` |
-| `zhipu` | 智谱编程（GLM） | API Key | OpenAI 线协议，编程套餐网关 `open.bigmodel.cn/api/coding/paas/v4`，客户端身份 `OpenCode` |
-| `zcode` | 智谱编程（ZCode 登录） | 浏览器授权 | ZCode 在线 OAuth（国内站 `zcode.chatglm.site` / 国际站 `zcode.z.ai`），自动换出编程套餐 API Key，同样走 `/api/coding/paas/v4` + `OpenCode` 身份 |
+| `xai` | xAI（Grok） | 浏览器 OAuth | Grok Build 身份（OAuth 令牌带 `X-XAI-Token-Auth`），对话走 `api.x.ai/v1` 的 Responses API，由代理翻译成 OpenAI Chat；也可改 `auth: apikey` 手动填 Key |
+| `claude` | Claude（Anthropic） | 浏览器 OAuth | Claude Pro/Max 订阅（PKCE），授权页在 `claude.ai`；回调页由 Anthropic 托管，需把页面上的授权码粘贴回来；对话走 Anthropic Messages |
+| `chatgpt` | ChatGPT（OpenAI） | 浏览器 OAuth | Codex 订阅线路（`localhost:1455` 回调），对话走 `chatgpt.com/backend-api/codex` 的 Responses API，由代理翻译成 OpenAI Chat |
+| `zhipu` | 智谱编程（GLM） | 浏览器 OAuth | ZCode 在线授权后自动换出编程套餐 API Key，走 `/api/coding/paas/v4` + `OpenCode` 身份；也可改 `auth: apikey` 手动填 Key |
+| `zcode` | 智谱编程（ZCode 登录） | 浏览器授权 | 与 `zhipu` 同一条 ZCode 在线 OAuth 链路（国内站 `zcode.chatglm.site` / 国际站 `zcode.z.ai`），显示名不同 |
+
+> **这四家的登录方式已统一为 OAuth。** `xai` / `claude` / `chatgpt` 走各家官方 OAuth（Claude 用 Claude Code 的公开 client，ChatGPT 用 Codex CLI 的 client 与订阅线路，xAI 用 Grok Build 的 OIDC + PKCE）；`zhipu` / `zcode` 走智谱 ZCode 在线授权并换出普通 coding-plan API Key。若更习惯手动填 Key，把对应 profile 的 `auth` 改成 `apikey`（`zhipu` / `zcode` / `xai` 支持；`claude` / `chatgpt` 的 OAuth 令牌与平台 API Key 不通用）。
 
 > **智谱编程为什么必须用 `/api/coding/paas/v4` + `OpenCode` 身份？** 智谱的赠送额度绑定「编程套餐」通道：只有编程客户端身份（User-Agent `OpenCode`）访问编程专用网关时才会计入套餐。若误用普通开放平台网关（`/api/paas/v4`）或普通 Anthropic 网关（`/api/anthropic`），请求会走按量付费，在未充值的账号上返回 `[1113] 余额不足或无可用资源包`。`user_agent` 可在 `config.json` 中按需调整。
 

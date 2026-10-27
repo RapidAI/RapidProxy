@@ -290,6 +290,57 @@ func TestLoginStateMapsNeedKey(t *testing.T) {
 	}
 }
 
+// 四家服务商都改成 OAuth 登录后，登录面板必须显示各自的授权文案（带服务商
+// 名），而不是 OpenCode 的粘贴密钥界面。Claude 的回调页由 Anthropic 托管，
+// 因此它额外要求「粘贴授权码」；其余三家走浏览器自动收口。
+func TestStartLoginOAuthPerProvider(t *testing.T) {
+	cases := []struct {
+		id       string
+		want     string
+		wantCode bool
+	}{
+		{"xai", "xAI", false},
+		{"claude", "Claude", true},
+		{"chatgpt", "ChatGPT", false},
+		{"zhipu", "智谱编程", false},
+	}
+	for _, tc := range cases {
+		dir := t.TempDir()
+		cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+		logger := applog.New(filepath.Join(dir, "logs"), 3)
+		t.Cleanup(func() { _ = logger.Close() }) // Windows 上不关句柄会卡住 TempDir 清理
+		a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, nil, logger)}
+
+		view, err := a.StartLogin(tc.id, "")
+		if err != nil {
+			a.CancelLogin()
+			// 智谱要联网创建登录流；断网环境下跳过它的联网断言，但配置侧
+			// （auth=oauth）仍由 config 包的测试覆盖。
+			if tc.id == "zhipu" {
+				continue
+			}
+			t.Fatalf("%s: 发起登录失败: %v", tc.id, err)
+		}
+		a.CancelLogin()
+
+		if view.NeedKey {
+			t.Errorf("%s: OAuth 上游不应走粘贴密钥分支", tc.id)
+		}
+		if view.NeedCode != tc.wantCode {
+			t.Errorf("%s: needCode = %v, want %v", tc.id, view.NeedCode, tc.wantCode)
+		}
+		if view.URL == "" {
+			t.Errorf("%s: OAuth 上游应返回授权链接", tc.id)
+		}
+		if !strings.Contains(view.Message, tc.want) {
+			t.Errorf("%s: 提示应包含服务商名 %q，实际 %q", tc.id, tc.want, view.Message)
+		}
+		if strings.Contains(view.Message, "OpenCode") {
+			t.Errorf("%s: 提示不应出现 OpenCode 字样，实际 %q", tc.id, view.Message)
+		}
+	}
+}
+
 func TestSameListenAddr(t *testing.T) {
 	cases := []struct {
 		a, b string
@@ -344,4 +395,48 @@ func TestEnableProviderIfDisabled(t *testing.T) {
 
 	// 未知 provider 静默返回，不 panic。
 	a.enableProviderIfDisabled("no-such-provider")
+}
+
+// 粘贴授权码输错是中间失败：流程保持 pending，用户能重新粘贴，
+// 不该被判成「登录失败」从头再来。
+//
+// 用桩会话（pollFn 直接返回可重试错误）而不是真实上游：这条逻辑属于
+// 轮询循环的分支处理，不该依赖外网。
+func TestPollLoginKeepsFlowOnRetryableCodeError(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, nil, logger)}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	polls := 0
+	session := &upstream.LoginSession{
+		AuthURL:  "https://claude.ai/oauth/authorize",
+		State:    "claude",
+		NeedCode: true,
+	}
+	session.SetPollFunc(func(context.Context) (*upstream.Credential, error) {
+		polls++
+		if polls <= 2 {
+			return nil, upstream.ErrLoginCodeRejected
+		}
+		// 第 3 次起结束测试：取消上下文，轮询循环会走超时分支。
+		cancel()
+		return nil, context.Canceled
+	})
+	session.SetExpiry(time.Now().Add(time.Minute))
+
+	run := &loginRun{provider: "claude", session: session, cancel: cancel, status: "pending", message: "等待授权码"}
+	a.loginMu.Lock()
+	a.login = run
+	a.loginMu.Unlock()
+
+	a.pollLogin(ctx, run)
+
+	if polls < 3 {
+		t.Errorf("可重试错误应继续轮询，实际只轮询 %d 次", polls)
+	}
 }

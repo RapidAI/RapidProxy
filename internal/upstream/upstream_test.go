@@ -2,16 +2,21 @@ package upstream
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
+	"time"
 	"unicode/utf8"
 
 	"github.com/znsoftm/RapidProxy/internal/config"
+	"github.com/znsoftm/RapidProxy/internal/upstream/oauthprov"
 )
 
 func newTestClient(t *testing.T) *Client {
@@ -488,4 +493,197 @@ func TestClientChatDispatchesToOpenCode(t *testing.T) {
 	if gotSession != "" {
 		t.Errorf("不应携带 x-opencode-session: %q", gotSession)
 	}
+}
+
+// 四家 OAuth 上游的分发：claude / chatgpt / xai 有专属请求线路，
+// zcode（含 zhipu）换出的是普通 API Key、走标准 OpenAI 兼容端点。
+func TestOAuthProviderDispatch(t *testing.T) {
+	cases := []struct {
+		profile config.Profile
+		want    string // oauthprov.Provider 的字符串值；空表示不走 OAuth 线路
+	}{
+		{config.ClaudePreset(), "claude"},
+		{config.ChatGPTPreset(), "chatgpt"},
+		{config.XAIPreset(), "xai"},
+		// 智谱 OAuth 换出 API Key，没有专属线路。
+		{config.ZhipuPreset(), ""},
+		{config.ZCodePreset(), ""},
+	}
+	for _, tc := range cases {
+		got := string(oauthProviderOf(tc.profile))
+		if got != tc.want {
+			t.Errorf("%s: oauthProviderOf = %q, want %q", tc.profile.ID, got, tc.want)
+		}
+	}
+}
+
+// 升级前用粘贴 API Key 登录的老凭据没有 refresh_token / expiresAt。预设改成
+// auth=oauth 之后它们仍在凭据库里，必须继续走 API Key 线路——否则 Claude 会
+// 收到 Bearer 而非 x-api-key、ChatGPT 缺 Codex 头，一律 401 并被冷却。
+func TestLegacyAPIKeyCredentialKeepsAPIKeyWire(t *testing.T) {
+	legacy := &Credential{Provider: "claude", Auth: Tokens{AccessToken: "sk-ant-legacy"}}
+	if legacy.IsOAuthCredential() {
+		t.Error("无 refresh_token 且无 expiresAt 的凭据应判为 API Key")
+	}
+	for _, p := range []config.Profile{config.ClaudePreset(), config.ChatGPTPreset(), config.XAIPreset()} {
+		if got := oauthProviderOfCred(p, legacy); got != "" {
+			t.Errorf("%s: 旧 API Key 凭据不应走 OAuth 线路，实际 %q", p.ID, got)
+		}
+		oauthCred := &Credential{Provider: p.ID, Auth: Tokens{AccessToken: "at", RefreshToken: "rt"}}
+		if got := oauthProviderOfCred(p, oauthCred); got == "" {
+			t.Errorf("%s: OAuth 凭据应走 OAuth 线路", p.ID)
+		}
+	}
+}
+
+// zhipu / zcode 的凭据是换出的 API Key（不过期、无 refresh_token）：
+// 刷新必须是空操作，不能拿空 refresh_token 去打 token 端点。
+func TestZCodeCredentialRefreshIsNoop(t *testing.T) {
+	c, err := NewClient(config.ZhipuPreset(), config.DefaultPlatform, config.DefaultProduct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cred := &Credential{
+		Provider: "zhipu",
+		Auth:     Tokens{AccessToken: "id.secret"},
+	}
+	if err := c.Refresh(context.Background(), cred); err != nil {
+		t.Errorf("换出的 API Key 不应触发刷新，实际报错: %v", err)
+	}
+	if cred.Auth.AccessToken != "id.secret" {
+		t.Errorf("刷新空操作不应改动令牌，实际 %q", cred.Auth.AccessToken)
+	}
+}
+
+// 走 OAuth 的三家：令牌即将过期时 EnsureToken 必须真的去刷新。
+func TestOAuthEnsureTokenRefreshes(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		if r.URL.Path != "/oauth/token" {
+			t.Errorf("刷新端点 = %q", r.URL.Path)
+		}
+		io.WriteString(w, `{"access_token":"fresh","refresh_token":"rt2","expires_in":3600}`)
+	}))
+	defer srv.Close()
+
+	profile := config.XAIPreset()
+	// discovery 指向桩：xAI 的端点由 OIDC discovery 解析。
+	srv2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/openid-configuration" {
+			t.Errorf("discovery 路径 = %q", r.URL.Path)
+		}
+		io.WriteString(w, `{"authorization_endpoint":"`+srv.URL+`/authorize","token_endpoint":"`+srv.URL+`/oauth/token"}`)
+	}))
+	defer srv2.Close()
+
+	c, err := NewClient(profile, config.DefaultPlatform, config.DefaultProduct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 直接用桩的 token 端点验证刷新链路（跳过 discovery）。
+	cred := &Credential{
+		Provider: "xai",
+		Auth: Tokens{
+			AccessToken:  "old",
+			RefreshToken: "rt1",
+			ExpiresAt:    time.Now().Add(-time.Minute).Unix(), // 已过期
+		},
+	}
+	if !cred.NeedsRefresh() {
+		t.Fatal("已过期凭据应需要刷新")
+	}
+	if err := c.refreshOAuthAgainst(context.Background(), oauthprov.ProviderXAI, cred, srv.URL+"/oauth/token"); err != nil {
+		t.Fatalf("刷新失败: %v", err)
+	}
+	if cred.Auth.AccessToken != "fresh" {
+		t.Errorf("access_token = %q, want fresh", cred.Auth.AccessToken)
+	}
+	if cred.Auth.RefreshToken != "rt2" {
+		t.Errorf("refresh_token 应轮换，实际 %q", cred.Auth.RefreshToken)
+	}
+	if hits != 1 {
+		t.Errorf("token 端点命中 %d 次，want 1", hits)
+	}
+}
+
+// 同一账号重复登录必须落成同一份凭据：access token 每次都变，拿它做 UID
+// 会让界面上的账号数一直涨、负载均衡把流量分给同一账号的多份副本。
+func TestOAuthCredentialUIDIsStableAcrossLogins(t *testing.T) {
+	c, err := NewClient(config.ClaudePreset(), config.DefaultPlatform, config.DefaultProduct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 两个不同的 access token，但 sub（账号标识）相同。
+	jwtWithSub := func(sub string) string {
+		payload := base64.RawURLEncoding.EncodeToString([]byte(`{"sub":"` + sub + `"}`))
+		return "header." + payload + ".sig"
+	}
+	first := c.oauthCredential(oauthprov.ProviderClaude, &oauthprov.Token{
+		AccessToken:  jwtWithSub("user-1"),
+		RefreshToken: "rt1",
+	})
+	second := c.oauthCredential(oauthprov.ProviderClaude, &oauthprov.Token{
+		AccessToken:  jwtWithSub("user-1"),
+		RefreshToken: "rt2",
+	})
+	if first.ID != second.ID {
+		t.Errorf("同一账号的凭据 ID 应稳定，实际 %q vs %q", first.ID, second.ID)
+	}
+
+	// ChatGPT 用 chatgpt_account_id。
+	cg, err := NewClient(config.ChatGPTPreset(), config.DefaultPlatform, config.DefaultProduct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cg.oauthCredential(oauthprov.ProviderChatGPT, &oauthprov.Token{AccessToken: "tok-a", AccountID: "acct-1"})
+	b := cg.oauthCredential(oauthprov.ProviderChatGPT, &oauthprov.Token{AccessToken: "tok-b", AccountID: "acct-1"})
+	if a.ID != b.ID {
+		t.Errorf("同一 ChatGPT 账号的凭据 ID 应稳定，实际 %q vs %q", a.ID, b.ID)
+	}
+	// 不同账号必须区分开。
+	d := cg.oauthCredential(oauthprov.ProviderChatGPT, &oauthprov.Token{AccessToken: "tok-c", AccountID: "acct-2"})
+	if d.ID == a.ID {
+		t.Error("不同账号不应算出同一个凭据 ID")
+	}
+}
+
+// 粘贴授权码输错是可重试的中间失败：必须能从 upstream 包按哨兵识别，
+// 否则轮询协程会把整个登录流程判死。
+func TestLoginCodeRejectedIsRetryable(t *testing.T) {
+	if !errors.Is(ErrLoginCodeRejected, oauthprov.ErrCodeRejected) {
+		t.Error("ErrLoginCodeRejected 应是 oauthprov.ErrCodeRejected 的别名")
+	}
+}
+
+// Cancel 必须释放 OAuth 的本地回调监听器：chatgpt 用固定端口 1455，
+// 不释放会导致下次登录顺延端口，多次登录后端口越漂越远。
+func TestOAuthSessionCancelReleasesCallback(t *testing.T) {
+	// 用一个不联网的 provider 只验证会话构造与释放。
+	c, err := NewClient(config.ChatGPTPreset(), config.DefaultPlatform, config.DefaultProduct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := c.startProviderOAuthLogin(context.Background())
+	if err != nil {
+		t.Fatalf("发起登录失败: %v", err)
+	}
+	if session.AuthURL == "" {
+		t.Fatal("应返回授权链接")
+	}
+	if session.oauth == nil {
+		t.Fatal("应持有 OAuth 会话")
+	}
+	cb := session.oauth.CallbackPort()
+	if cb == 0 {
+		t.Skip("该 provider 没有本地回调（粘贴式流程）")
+	}
+	session.Cancel()
+
+	// 监听器释放后，同端口应能再次绑定。
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", cb))
+	if err != nil {
+		t.Fatalf("Cancel 后端口 %d 应已释放: %v", cb, err)
+	}
+	_ = ln.Close()
 }

@@ -1187,16 +1187,18 @@ func (s *Server) prepareBody(payload map[string]any, profile config.Profile) ([]
 		!strings.EqualFold(strings.TrimSpace(profile.Protocol), "anthropic") {
 		normalizeGLMCodingPayload(payload)
 	}
-	// 只有确认支持 stream_options 的 OpenAI 直连预设（xAI / ChatGPT）才显式
-	// 索取 usage：智谱编程网关与用户自建端点可能拒绝该字段（aicoder 也采取
-	// 「上游拒绝后停用」的策略），在关键路径上不冒险。Anthropic 线协议由翻译
-	// 层自产 usage 帧，也不需要它。
-	openAIUsage := profile.ID == "xai" || profile.ID == "chatgpt"
+	// 只有确认支持 stream_options 的 OpenAI 直连预设才显式索取 usage。
+	//
+	// 现在 xai / chatgpt 都走 Responses API（请求体经 oauthprov 翻译，
+	// stream_options 属于被丢弃的字段，用量由 response.completed 自带），
+	// claude 走 Anthropic Messages（翻译层自产 usage 帧），因此这里只剩
+	// 用户自建的 OpenAI 兼容端点可受益——但它们可能拒绝该字段，不冒险。
+	// 换句话说：没有任何预设需要它了，保持关闭。
 	body, _, err := openai.PrepareRequestBody(mustJSON(payload), openai.TransformOptions{
 		Sanitize:           workBuddyFamily && s.Config().SanitizeEnabled(),
 		ForceMaxThinking:   workBuddyFamily && s.Config().MaxThinkingEnabled(),
 		EnsureSystemPrompt: workBuddyFamily,
-		AddStreamOptions:   workBuddyFamily || openAIUsage,
+		AddStreamOptions:   workBuddyFamily,
 	})
 	return body, err
 }

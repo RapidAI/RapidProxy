@@ -65,6 +65,22 @@ const (
 	EditionGlobal = "global"
 )
 
+// 登录方式（Profile.Auth）。
+const (
+	// AuthAPIKey 是粘贴 API Key 登录（默认）。
+	AuthAPIKey = "apikey"
+	// AuthOAuth 是浏览器 OAuth 授权登录。
+	AuthOAuth = "oauth"
+)
+
+// OAuth 实现标识（Profile.OAuthProvider）。
+const (
+	OAuthClaude  = "claude"
+	OAuthChatGPT = "chatgpt"
+	OAuthXAI     = "xai"
+	OAuthZCode   = "zcode"
+)
+
 // Profile 描述一个上游服务（一个可登录的分组）。
 //
 // 同一服务商分国内/国际版时是两个独立的 Profile（两个分组），各自维护
@@ -81,6 +97,14 @@ type Profile struct {
 	// Protocol 仅对 KindCustom 有效，表示上游线协议："openai"（默认）或
 	// "anthropic"。其它协议族忽略此字段。空值按 "openai" 处理。
 	Protocol string `json:"protocol,omitempty"`
+	// Auth 是登录方式："apikey"（默认，粘贴密钥）或 "oauth"（浏览器授权）。
+	// 仅对 KindCustom 有效；OAuth 上游的请求线路由 OAuthProvider 决定，
+	// 与线协议字段无关。
+	Auth string `json:"auth,omitempty"`
+	// OAuthProvider 指明走哪套 OAuth 实现：claude / chatgpt / xai / zcode。
+	// 空值时按 ID 推断（claude→claude、chatgpt→chatgpt、xai→xai、
+	// zhipu/zcode→zcode）。
+	OAuthProvider string `json:"oauth_provider,omitempty"`
 	// Edition 区分国内/国际版（trae、qoder 使用）：cn / global。
 	Edition string `json:"edition,omitempty"`
 	// Proxy 为空时跟随系统环境变量；显式设置则强制走该代理。
@@ -101,6 +125,36 @@ func (p Profile) ProxyRecommended() bool {
 		return true
 	}
 	return strings.Contains(p.BaseURL, "workbuddy.ai")
+}
+
+// UsesOAuth 报告该上游是否走浏览器 OAuth 登录（而不是粘贴 API Key）。
+func (p Profile) UsesOAuth() bool {
+	return p.Kind == KindCustom && strings.EqualFold(strings.TrimSpace(p.Auth), AuthOAuth)
+}
+
+// OAuthKind 返回该上游使用的 OAuth 实现标识；不走 OAuth 时返回空串。
+//
+// 未显式配置 oauth_provider 时按 ID 推断，兼容旧配置文件与用户手写的
+// profiles（只写 auth=oauth 也能跑）。
+func (p Profile) OAuthKind() string {
+	if !p.UsesOAuth() {
+		return ""
+	}
+	if kind := strings.ToLower(strings.TrimSpace(p.OAuthProvider)); kind != "" {
+		return kind
+	}
+	switch p.ID {
+	case "claude":
+		return OAuthClaude
+	case "chatgpt":
+		return OAuthChatGPT
+	case "xai":
+		return OAuthXAI
+	case "zhipu", "zcode":
+		return OAuthZCode
+	default:
+		return ""
+	}
 }
 
 // isValidProtocol 报告线协议名是否被 custom 上游接受。
@@ -126,6 +180,12 @@ func setIfEmpty(p *Profile, preset Profile) {
 	if p.Protocol == "" {
 		p.Protocol = preset.Protocol
 	}
+	if p.Auth == "" {
+		p.Auth = preset.Auth
+	}
+	if p.OAuthProvider == "" {
+		p.OAuthProvider = preset.OAuthProvider
+	}
 	// 智谱编程（zhipu / zcode）预设带「编程客户端」身份 OpenCode：智谱据此
 	// 把请求计入 ZCode / 编程套餐赠送额度。其它预设该字段为空，不覆盖。
 	if p.UserAgent == "" {
@@ -149,6 +209,14 @@ func migrateZhipuCoding(p *Profile, preset Profile) {
 		p.BaseURL = preset.BaseURL
 		p.Protocol = preset.Protocol
 		p.UserAgent = preset.UserAgent
+		// 迁移分支同样要补齐 auth：旧配置里没有这个字段，直接 return 会让
+		// 老用户永远停在 apikey，界面上看不到 ZCode 浏览器登录入口。
+		if p.Auth == "" {
+			p.Auth = preset.Auth
+		}
+		if p.OAuthProvider == "" {
+			p.OAuthProvider = preset.OAuthProvider
+		}
 		return
 	}
 	setIfEmpty(p, preset)
@@ -156,6 +224,23 @@ func migrateZhipuCoding(p *Profile, preset Profile) {
 	if strings.EqualFold(strings.TrimSpace(p.UserAgent), "opencode") {
 		p.UserAgent = preset.UserAgent
 	}
+}
+
+// migrateChatGPTCodex 让 ChatGPT 预设从旧的「平台 API 端点」升级到 Codex
+// 订阅线路。
+//
+// 早期版本把 chatgpt 当普通 API Key 上游（`api.openai.com/v1`）。改成 OAuth
+// 登录后，OpenAI 的 OAuth 令牌只能在 Codex 订阅线路
+// （`chatgpt.com/backend-api/codex`）使用，指向平台端点会一律 401。这里只在
+// 值仍是旧默认（api.openai.com）时迁移，用户自定义过的反代端点保持不动。
+func migrateChatGPTCodex(p *Profile, preset Profile) {
+	base := strings.ToLower(strings.TrimSpace(p.BaseURL))
+	legacyPlatform := strings.Contains(base, "api.openai.com") || base == ""
+	if legacyPlatform {
+		p.BaseURL = preset.BaseURL
+		p.Origin = preset.Origin
+	}
+	setIfEmpty(p, preset)
 }
 
 // VirtualMember 是虚拟模型组的一个成员：指向某个上游的具体模型。
@@ -356,7 +441,11 @@ func OpenCodePreset() Profile {
 	}
 }
 
-// XAIPreset 返回 xAI（api.x.ai，Grok 系列）预设，OpenAI 线协议、API Key 制。
+// XAIPreset 返回 xAI（api.x.ai，Grok 系列）预设，OAuth 登录（Grok Build
+// 客户端身份：OAuth 令牌必须带 X-XAI-Token-Auth 头）。
+//
+// 用户仍可在 config.json 里把 auth 改成 apikey 并填 xAI 的 API Key——
+// 两条路都支持，只是默认走浏览器授权（订阅额度无需手建 Key）。
 func XAIPreset() Profile {
 	return Profile{
 		ID:       "xai",
@@ -364,13 +453,15 @@ func XAIPreset() Profile {
 		Enabled:  false,
 		Kind:     KindCustom,
 		Protocol: "openai",
+		Auth:     AuthOAuth,
 		// 与 upstream/custom 的默认 OpenAI 端点构造一致：base 已是 /v1 形态。
 		BaseURL: "https://api.x.ai/v1",
 		Origin:  "https://x.ai",
 	}
 }
 
-// ClaudePreset 返回 Anthropic Claude 预设，Anthropic 线协议、API Key 制。
+// ClaudePreset 返回 Anthropic Claude 预设，OAuth 登录（Claude Pro/Max 订阅）。
+// 授权页由 Anthropic 托管、无本地回调，用户在页面上复制授权码粘贴回来。
 func ClaudePreset() Profile {
 	return Profile{
 		ID:       "claude",
@@ -378,12 +469,16 @@ func ClaudePreset() Profile {
 		Enabled:  false,
 		Kind:     KindCustom,
 		Protocol: "anthropic",
+		Auth:     AuthOAuth,
 		BaseURL:  "https://api.anthropic.com/v1",
 		Origin:   "https://www.anthropic.com",
 	}
 }
 
-// ChatGPTPreset 返回 OpenAI ChatGPT 预设，OpenAI 线协议、API Key 制。
+// ChatGPTPreset 返回 OpenAI ChatGPT 预设，OAuth 登录（Codex 订阅线路）。
+//
+// OAuth 令牌只能走 Codex 的 Responses 接口（chatgpt.com/backend-api/codex），
+// 不是 api.openai.com 的 Chat Completions；协议翻译在 upstream/oauthprov。
 func ChatGPTPreset() Profile {
 	return Profile{
 		ID:       "chatgpt",
@@ -391,45 +486,52 @@ func ChatGPTPreset() Profile {
 		Enabled:  false,
 		Kind:     KindCustom,
 		Protocol: "openai",
-		BaseURL:  "https://api.openai.com/v1",
+		Auth:     AuthOAuth,
+		BaseURL:  "https://chatgpt.com/backend-api/codex",
 		Origin:   "https://chat.openai.com",
 	}
 }
 
 // ZhipuPreset 返回智谱编程（bigmodel，GLM 系列）预设，OpenAI 线协议、
-// API Key 制。
+// ZCode 在线 OAuth 登录（浏览器授权 → 换出 coding-plan API Key）。
 //
 // BaseURL 必须指向智谱的 **编程套餐专用** OpenAI 网关 `/api/coding/paas/v4`
 // （不是普通开放平台的 `/api/paas/v4`），并以编程客户端身份（User-Agent
 // "OpenCode"）调用——两者缺一都会命中「按量付费」通道，在无余额的账号上
 // 返回 [1113] 余额不足。这是 aicoder 中 OpenCode+GLM 的已验证组合。
+//
+// 登录方式：浏览器授权后换出一把普通 coding-plan API Key 落库，因此对话
+// 线路与「粘贴 API Key」完全一致；把 auth 改回 apikey 仍可手动粘 Key。
 func ZhipuPreset() Profile {
 	return Profile{
-		ID:        "zhipu",
-		Name:      "智谱编程（GLM）",
-		Enabled:   false,
-		Kind:      KindCustom,
-		Protocol:  "openai",
-		BaseURL:   "https://open.bigmodel.cn/api/coding/paas/v4",
-		Origin:    "https://open.bigmodel.cn",
-		UserAgent: "OpenCode",
+		ID:            "zhipu",
+		Name:          "智谱编程（GLM）",
+		Enabled:       false,
+		Kind:          KindCustom,
+		Protocol:      "openai",
+		Auth:          AuthOAuth,
+		OAuthProvider: OAuthZCode,
+		BaseURL:       "https://open.bigmodel.cn/api/coding/paas/v4",
+		Origin:        "https://open.bigmodel.cn",
+		UserAgent:     "OpenCode",
 	}
 }
 
 // ZCodePreset 返回智谱 ZCode 登录的智谱编程预设，OpenAI 线协议、ZCode 在线
 // OAuth 登录（浏览器授权 → 换 coding-plan API Key）。与 ZhipuPreset 共用同一
-// 套编程套餐网关与客户端身份，区别仅在于登录方式：ZCode 走浏览器授权、
-// 不用手动粘贴 Key。
+// 套编程套餐网关与客户端身份，区别仅在于显示名（两者都是 OAuth 登录）。
 func ZCodePreset() Profile {
 	return Profile{
-		ID:        "zcode",
-		Name:      "智谱编程（ZCode 登录）",
-		Enabled:   false,
-		Kind:      KindCustom,
-		Protocol:  "openai",
-		BaseURL:   "https://open.bigmodel.cn/api/coding/paas/v4",
-		Origin:    "https://open.bigmodel.cn",
-		UserAgent: "OpenCode",
+		ID:            "zcode",
+		Name:          "智谱编程（ZCode 登录）",
+		Enabled:       false,
+		Kind:          KindCustom,
+		Protocol:      "openai",
+		Auth:          AuthOAuth,
+		OAuthProvider: OAuthZCode,
+		BaseURL:       "https://open.bigmodel.cn/api/coding/paas/v4",
+		Origin:        "https://open.bigmodel.cn",
+		UserAgent:     "OpenCode",
 	}
 }
 
@@ -705,7 +807,7 @@ func (c *Config) normalize() {
 			case "claude":
 				setIfEmpty(p, ClaudePreset())
 			case "chatgpt":
-				setIfEmpty(p, ChatGPTPreset())
+				migrateChatGPTCodex(p, ChatGPTPreset())
 			case "zhipu":
 				migrateZhipuCoding(p, ZhipuPreset())
 			case "zcode":
@@ -721,6 +823,26 @@ func (c *Config) normalize() {
 			if !isValidProtocol(p.Protocol) {
 				p.Protocol = "openai"
 			}
+			// 登录方式只认 apikey / oauth；空值与未知值按 apikey 处理
+			// （用户自建组没有 OAuth 实现，粘贴密钥是唯一可行的路）。
+			auth := strings.ToLower(strings.TrimSpace(p.Auth))
+			if auth != AuthOAuth {
+				p.Auth = AuthAPIKey
+			} else {
+				p.Auth = AuthOAuth
+			}
+			// OAuth 实现标识：空值按 ID 推断，推断不出来就退回粘贴密钥——
+			// 否则会出现「要求 OAuth 但没有任何实现」的死角。
+			p.OAuthProvider = p.OAuthKind()
+			if p.Auth == AuthOAuth && p.OAuthProvider == "" {
+				p.Auth = AuthAPIKey
+			}
+			if p.Auth != AuthOAuth {
+				p.OAuthProvider = ""
+			}
+		} else {
+			p.Auth = ""
+			p.OAuthProvider = ""
 		}
 		if p.UserAgent == "" && (p.Kind == "" || p.Kind == KindWorkBuddy) {
 			// WorkBuddy 协议族要求伪装官方 CLI；其它协议族的请求头由

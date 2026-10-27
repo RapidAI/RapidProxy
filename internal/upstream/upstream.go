@@ -44,6 +44,8 @@ import (
 	"github.com/znsoftm/RapidProxy/internal/config"
 	"github.com/znsoftm/RapidProxy/internal/upstream/custom"
 	"github.com/znsoftm/RapidProxy/internal/upstream/lobsterai"
+	"github.com/znsoftm/RapidProxy/internal/upstream/oauthflow"
+	"github.com/znsoftm/RapidProxy/internal/upstream/oauthprov"
 	"github.com/znsoftm/RapidProxy/internal/upstream/opencode"
 	"github.com/znsoftm/RapidProxy/internal/upstream/qoder"
 	"github.com/znsoftm/RapidProxy/internal/upstream/trae"
@@ -55,6 +57,10 @@ var ErrNoAccessToken = errors.New("凭据缺少 accessToken，请重新登录")
 
 // ErrLoginTimeout 表示登录会话已过期。
 var ErrLoginTimeout = errors.New("登录会话已过期，请重新发起登录")
+
+// ErrLoginCodeRejected 表示粘贴的授权码换取令牌失败，但登录流程仍可继续
+// （用户可能只是复制漏了字符）。界面据此提示并保留粘贴框。
+var ErrLoginCodeRejected = oauthprov.ErrCodeRejected
 
 // refreshLeeway 是提前刷新的安全余量。
 const refreshLeeway = 5 * time.Minute
@@ -79,6 +85,8 @@ type Tokens struct {
 	// 永不轮换）；MachineID 同时是 Qoder 的每安装设备 id。
 	MachineID string `json:"machineId,omitempty"`
 	DeviceID  string `json:"deviceId,omitempty"`
+	// OAuthAccountID 是 ChatGPT OAuth 的 chatgpt-account-id（请求头要用）。
+	OAuthAccountID string `json:"oauthAccountId,omitempty"`
 }
 
 // Account 是账号信息。
@@ -135,6 +143,22 @@ func (c *Credential) ExpiresAtTime() time.Time {
 func (c *Credential) Expired() bool {
 	t := c.ExpiresAtTime()
 	return !t.IsZero() && time.Now().After(t)
+}
+
+// IsOAuthCredential 报告这份凭据是否是 OAuth 登录换来的（而非粘贴的 API Key）。
+//
+// 升级前的 xai / claude / chatgpt 是 API Key 制，老用户凭据库里躺着的是
+// 平台 Key（无 refresh_token、无 expiresAt）。这些预设改成 auth=oauth 后，
+// 光看 profile 会把老 Key 当 OAuth 令牌发出去——Claude 只认 x-api-key、
+// ChatGPT 要 Codex 头，结果一律 401，账号还会被冷却成不可用。
+//
+// 凭据自身的形态才是可靠依据：OAuth 令牌一定带 refresh_token（或至少带
+// 过期时间），平台 API Key 两者皆无。
+func (c *Credential) IsOAuthCredential() bool {
+	if c == nil {
+		return false
+	}
+	return strings.TrimSpace(c.Auth.RefreshToken) != "" || c.Auth.ExpiresAt > 0
 }
 
 // NeedsRefresh 表示访问令牌即将过期，应提前刷新。
@@ -451,6 +475,12 @@ type LoginSession struct {
 	LocalKey string
 	// LocalKeyLabel 是 LocalKey 的脱敏展示名（如 sk-…abcd），供界面提示。
 	LocalKeyLabel string
+
+	// NeedCode 表示这次登录等待用户粘贴 OAuth 授权码（Claude 的远程回调
+	// 页无法被本机接收，只能复制粘贴），而非密钥或浏览器回调。
+	NeedCode bool
+	// oauth 是进行中的 OAuth 会话（claude / chatgpt / xai）。
+	oauth *oauthprov.Session
 }
 
 // StartLogin 发起登录，返回需要用户在浏览器打开的授权链接。
@@ -465,9 +495,13 @@ func (c *Client) StartLogin(ctx context.Context) (*LoginSession, error) {
 	case KindOpenCode:
 		return c.startOpenCodeLogin(ctx)
 	case KindCustom:
-		// zcode 是智谱 ZCode 在线 OAuth（浏览器授权 → 换 coding-plan Key）；
-		// 其余 custom 上游是 API Key 制。
-		if c.profile.ID == "zcode" {
+		// custom 上游有三种登录形态：
+		//   OAuth（claude / chatgpt / xai / zcode）——浏览器授权；
+		//   其余是 API Key 制（粘贴密钥）。
+		switch c.profile.OAuthKind() {
+		case config.OAuthClaude, config.OAuthChatGPT, config.OAuthXAI:
+			return c.startProviderOAuthLogin(ctx)
+		case config.OAuthZCode:
 			return c.startZCodeLogin(ctx)
 		}
 		return c.startCustomLogin(ctx)
@@ -820,6 +854,131 @@ func (c *Client) VerifyAPIKey(ctx context.Context, key string) error {
 	return custom.VerifyAPIKey(ctx, c.http, c.profile.BaseURL, c.protocol(), c.profile.UserAgent, normalized)
 }
 
+// startProviderOAuthLogin 发起 claude / chatgpt / xai 的浏览器 OAuth 登录。
+//
+// 三家共用一套流程骨架（见 upstream/oauthprov），差异在回调方式：
+//   - chatgpt / xai：本地回调自动收口，Poll 等待重定向；
+//   - claude：Anthropic 托管回调页，用户在页面上复制授权码粘贴回来
+//     （NeedCode=true，由 App.SubmitLoginCode 收口）。
+func (c *Client) startProviderOAuthLogin(ctx context.Context) (*LoginSession, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	provider := oauthprov.Provider(c.profile.OAuthKind())
+	hc := c.isolatedClient(0)
+	oauthSession, err := oauthprov.StartSession(ctx, provider, hc)
+	if err != nil {
+		return nil, err
+	}
+	session := &LoginSession{
+		State:     string(provider),
+		AuthURL:   oauthSession.AuthURL,
+		ExpiresAt: oauthSession.ExpiresAt,
+		NeedCode:  oauthSession.PasteCode,
+		oauth:     oauthSession,
+		cancelFn:  oauthSession.Cancel,
+	}
+	session.pollFn = func(pollCtx context.Context) (*Credential, error) {
+		token, err := oauthSession.Poll(pollCtx)
+		if err != nil {
+			if errors.Is(err, oauthprov.ErrLoginExpired) {
+				return nil, ErrLoginTimeout
+			}
+			// 粘贴授权码时输错（复制漏字符、贴了整页内容）是最常见的失败：
+			// 一次换 token 失败不该终结整个登录流程，否则用户得重新走一遍
+			// 浏览器授权。把错误当作「继续等待下一次粘贴」返回给调用方。
+			if session.NeedCode && errors.Is(err, oauthprov.ErrCodeRejected) {
+				return nil, err
+			}
+			return nil, err
+		}
+		if token == nil {
+			return nil, nil
+		}
+		return c.oauthCredential(provider, token), nil
+	}
+	return session, nil
+}
+
+// SubmitOAuthCode 把用户粘贴的授权码交给进行中的 OAuth 会话（Claude 专用）。
+func (s *LoginSession) SubmitOAuthCode(code string) bool {
+	if s == nil || s.oauth == nil || !s.NeedCode {
+		return false
+	}
+	s.oauth.SubmitCode(code)
+	return true
+}
+
+// SetPollFunc 替换本次登录的轮询实现（测试用）。
+func (s *LoginSession) SetPollFunc(fn func(context.Context) (*Credential, error)) {
+	if s != nil {
+		s.pollFn = fn
+	}
+}
+
+// SetExpiry 设置会话过期时刻（测试用）。
+func (s *LoginSession) SetExpiry(at time.Time) {
+	if s != nil {
+		s.ExpiresAt = at
+	}
+}
+
+// oauthCredential 用 OAuth token 构造凭据。
+//
+// ExpiresAt 落库后由 EnsureToken 触发刷新；AccountID 是 ChatGPT 的
+// chatgpt-account-id（其它家为空）。
+//
+// UID 必须稳定：access token 每次登录都会变，拿它做 UID 会让同一个账号在
+// 每次重新登录后都变成一份新凭据（界面上的账号数一直涨，负载均衡把流量
+// 分给同一账号的多份副本）。优先用上游给的账号标识，取不到才退回令牌哈希。
+func (c *Client) oauthCredential(provider oauthprov.Provider, token *oauthprov.Token) *Credential {
+	uid := oauthAccountUID(provider, token)
+	nickname := strings.TrimSpace(token.Nickname)
+	if nickname == "" {
+		// 从令牌里取可读标识（邮箱/名字）：同一上游登录多个账号时，
+		// 界面全靠它区分，否则全是「Claude（Anthropic）」。
+		nickname = oauthflow.JWTDisplayName(token.AccessToken)
+	}
+	if nickname == "" {
+		nickname = c.profile.Name
+	}
+	cred := &Credential{
+		Provider: c.profile.ID,
+		Auth: Tokens{
+			AccessToken:  token.AccessToken,
+			RefreshToken: token.RefreshToken,
+			ExpiresAt:    token.ExpiresAt,
+			// ChatGPT 的账号头随凭据持久化：刷新后 JWT 可能变，但账号不变。
+			OAuthAccountID: token.AccountID,
+		},
+		Account: Account{UID: uid, Nickname: nickname},
+	}
+	c.Finalize(cred)
+	return cred
+}
+
+// oauthAccountUID 返回能跨登录保持稳定的账号标识。
+//
+//	chatgpt：JWT 里的 chatgpt_account_id（同一 ChatGPT 账号恒定）
+//	claude ：JWT 的 sub（同一 Anthropic 账号恒定）
+//	xai    ：JWT 的 sub
+//
+// 都取不到时才退回 access token 哈希——这种情况下重复登录确实会多出账号，
+// 但总比登录失败好。
+func oauthAccountUID(provider oauthprov.Provider, token *oauthprov.Token) string {
+	switch provider {
+	case oauthprov.ProviderChatGPT:
+		if id := strings.TrimSpace(token.AccountID); id != "" {
+			return id
+		}
+	case oauthprov.ProviderClaude, oauthprov.ProviderXAI:
+		if sub := oauthflow.JWTSubject(token.AccessToken); sub != "" {
+			return sub
+		}
+	}
+	return shortHash(token.AccessToken)
+}
+
 // startZCodeLogin 发起智谱 ZCode 在线登录：在浏览器打开智谱授权页，后台轮询
 // 审批结果，落地后用 OAuth 访问令牌换出 coding-plan API Key 作为凭据。
 //
@@ -892,8 +1051,66 @@ func (c *Client) fetchCustomModels(ctx context.Context, cred *Credential) ([]Ups
 	return out, nil
 }
 
-// EmbeddedAuthURL 返回可嵌入应用内 iframe 的授权链接。
+// fetchOAuthModels 拉取 OAuth 上游的模型目录。
 //
+// claude 与 xai 都有标准 {base}/models；chatgpt 的订阅线路用
+// {base}/codex/models（带 Codex 头），取不到时由内置白名单兜底——目录失败
+// 不该让整个上游在界面上变成「没有模型」。
+func (c *Client) fetchOAuthModels(ctx context.Context, provider oauthprov.Provider, cred *Credential) ([]UpstreamModel, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	models, err := oauthprov.ListModels(ctx, c.http, provider, c.profile.BaseURL,
+		cred.Auth.AccessToken, cred.Auth.OAuthAccountID, c.profile.UserAgent)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]UpstreamModel, 0, len(models))
+	for _, m := range models {
+		if m.ID == "" {
+			continue
+		}
+		out = append(out, UpstreamModel{ID: m.ID, Name: m.Name})
+	}
+	return out, nil
+}
+
+// oauthProviderOf 返回该上游的 OAuth 实现；不走 OAuth 时返回空串。
+//
+// zcode 不在其中：智谱 ZCode 登录换出的是普通 coding-plan API Key，
+// 对话与目录都走标准 OpenAI 兼容端点（与粘贴 Key 完全一致），没有专属
+// 请求线路。
+func oauthProviderOf(p config.Profile) oauthprov.Provider {
+	switch p.OAuthKind() {
+	case config.OAuthClaude:
+		return oauthprov.ProviderClaude
+	case config.OAuthChatGPT:
+		return oauthprov.ProviderChatGPT
+	case config.OAuthXAI:
+		return oauthprov.ProviderXAI
+	default:
+		return ""
+	}
+}
+
+// oauthProviderOfCred 在 oauthProviderOf 的基础上再核对凭据形态。
+//
+// 升级前的 xai / claude / chatgpt 用粘贴 API Key 登录，老用户凭据库里因此
+// 留着平台 Key（无 refresh_token、无 expiresAt）。预设改成 auth=oauth 后，
+// 只看 profile 会把这些 Key 当 OAuth 令牌发出去：Claude 只认 x-api-key、
+// ChatGPT 要 Codex 头，结果一律 401，账号还会被冷却成不可用。凭据是 API Key
+// 时继续走原来的 API Key 线路，用户重新登录一次就换成 OAuth 凭据。
+func oauthProviderOfCred(p config.Profile, cred *Credential) oauthprov.Provider {
+	provider := oauthProviderOf(p)
+	if provider == "" {
+		return ""
+	}
+	if cred != nil && !cred.IsOAuthCredential() {
+		return ""
+	}
+	return provider
+}
+
 // 官方登录页原生支持 embed=iframe 模式：登录完成后会向 parent_origin
 // postMessage 通知结果（login_success / login_fail）。token 本身仍由
 // Poll 轮询获取，postMessage 只用于应用内及时感知并关闭授权窗口。
@@ -1016,8 +1233,15 @@ func (c *Client) Refresh(ctx context.Context, cred *Credential) error {
 		// ExpiresAt 为零值而不会走到这里，保留分支只为语义完整。
 		return nil
 	case KindCustom:
-		// 通用 API Key 制、不过期：无刷新端点。
-		return nil
+		// 通用 API Key 制、不过期：无刷新端点。OAuth 上游（claude /
+		// chatgpt / xai）有过期与 refresh_token，需要真正刷新；zcode 虽然
+		// 也走 OAuth 登录，但换出的是普通 API Key（不过期、无 refresh_token），
+		// 同样不需要刷新。
+		provider := oauthProviderOfCred(c.profile, cred)
+		if provider == "" {
+			return nil
+		}
+		return c.refreshOAuth(ctx, provider, cred)
 	default:
 		return c.refreshWorkBuddy(ctx, cred)
 	}
@@ -1112,6 +1336,36 @@ func (c *Client) refreshTrae(ctx context.Context, cred *Credential) error {
 	return nil
 }
 
+// refreshOAuth 刷新 OAuth 上游（claude / chatgpt / xai）的访问令牌。
+//
+// refresh_token 轮换：上游回了新的就用新的，没回则保留旧的（部分实现
+// 只在首次授权时下发 refresh_token）。
+func (c *Client) refreshOAuth(ctx context.Context, provider oauthprov.Provider, cred *Credential) error {
+	return c.refreshOAuthAgainst(ctx, provider, cred, "")
+}
+
+// refreshOAuthAgainst 是可指定 token 端点的刷新实现（测试用；空串表示
+// 按 provider 用官方端点）。
+func (c *Client) refreshOAuthAgainst(ctx context.Context, provider oauthprov.Provider, cred *Credential, endpoint string) error {
+	token, err := oauthprov.RefreshAt(ctx, provider, c.http, endpoint, cred.Auth.RefreshToken)
+	if err != nil {
+		return err
+	}
+	cred.Auth.AccessToken = token.AccessToken
+	if token.RefreshToken != "" {
+		cred.Auth.RefreshToken = token.RefreshToken
+	}
+	if token.ExpiresAt > 0 {
+		cred.Auth.ExpiresAt = token.ExpiresAt
+	}
+	// 账号 id 随新 JWT 可能变化；取不到时保留旧值。
+	if token.AccountID != "" {
+		cred.Auth.OAuthAccountID = token.AccountID
+	}
+	cred.UpdatedAt = time.Now()
+	return nil
+}
+
 // refreshQoder 刷新 Qoder 设备令牌。machine_id 使用本机稳定 id。
 func (c *Client) refreshQoder(ctx context.Context, cred *Credential) error {
 	token, err := qoder.Refresh(ctx, c.http, c.qoderp, cred.Auth.RefreshToken, qoder.MachineID())
@@ -1163,6 +1417,9 @@ func (c *Client) FetchUpstreamModels(ctx context.Context, cred *Credential) ([]U
 	case KindOpenCode:
 		return c.fetchOpenCodeModels(ctx, cred)
 	case KindCustom:
+		if provider := oauthProviderOfCred(c.profile, cred); provider != "" {
+			return c.fetchOAuthModels(ctx, provider, cred)
+		}
 		return c.fetchCustomModels(ctx, cred)
 	default:
 		return c.fetchWorkBuddyModels(ctx, cred)
@@ -1361,6 +1618,17 @@ func (c *Client) Chat(ctx context.Context, cred *Credential, body []byte) (*http
 		// 通用 API Key 制上游：按 Profile.Protocol 区分 OpenAI / Anthropic。
 		// Anthropic 线协议时，适配层会把上游的 Anthropic SSE 实时翻译成
 		// OpenAI SSE（见 upstream/custom），服务层对协议差异无感知。
+		// OAuth 上游（claude / chatgpt / xai）的线路差异更大：Claude 走
+		// Anthropic Messages、ChatGPT 走 Codex Responses、xAI 要专用头，
+		// 一律由 upstream/oauthprov 收口成 OpenAI SSE。
+		//
+		// 判断要结合凭据形态：老用户凭据库里是平台 API Key，profile 改成
+		// auth=oauth 之后它们仍在，必须继续走 API Key 线路，否则请求会被
+		// 当成 OAuth 令牌发出去并一律 401。
+		if provider := oauthProviderOfCred(c.profile, cred); provider != "" {
+			return oauthprov.Chat(ctx, c.http, provider, c.profile.BaseURL,
+				cred.Auth.AccessToken, cred.Auth.OAuthAccountID, c.profile.UserAgent, body)
+		}
 		return custom.Chat(ctx, c.http, c.profile.BaseURL, cred.Auth.AccessToken, c.protocol(), c.profile.UserAgent, body)
 	default:
 		return c.chatWorkBuddy(ctx, cred, body)

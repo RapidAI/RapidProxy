@@ -106,6 +106,10 @@ export function StopService() {
   return window['go']['main']['App']['StopService']();
 }
 
+export function SubmitLoginCode(arg1, arg2) {
+  return window['go']['main']['App']['SubmitLoginCode'](arg1, arg2);
+}
+
 export function SubmitLoginKey(arg1, arg2) {
   return window['go']['main']['App']['SubmitLoginKey'](arg1, arg2);
 }

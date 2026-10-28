@@ -284,6 +284,111 @@ function renderLoginProviders() {
   });
 }
 
+/* 自定义服务商分组列表：只列用户自建的分组（内置预设不可删，不在这里管）。
+ *
+ * 每个分组是「类型 + 地址 + API Key」的独立组合，删除会连带清掉该组的凭据。
+ * 用签名跳过无变化重建：20 秒一次的轮询刷新会重跑 renderAll，没必要为了
+ * 一份没变的列表反复重建 DOM（也让删除按钮不会在用户按下前被换掉）。 */
+let _customGroupsSig = '';
+
+function renderCustomGroups() {
+  const wrap = $('custom-groups');
+  if (!wrap) return;
+  const groups = (S.state.providers || []).filter((p) => p.custom);
+  const sig = [I18N.lang, JSON.stringify(groups)].join('|');
+  if (sig === _customGroupsSig) return;
+  _customGroupsSig = sig;
+  wrap.innerHTML = '';
+  if (!groups.length) {
+    wrap.appendChild(el('div', 'empty', t('custom.empty')));
+    return;
+  }
+  groups.forEach((p) => {
+    const item = el('div', 'provider-item');
+    const meta = el('div', 'meta');
+    meta.appendChild(el('strong', null, p.name));
+    meta.appendChild(el('span', null, p.baseUrl));
+    item.appendChild(meta);
+
+    const ops = el('div', 'ops');
+    // 线协议标签：区分同域名的 OpenAI / Anthropic 两种端点。
+    if (p.protocol) {
+      ops.appendChild(el('span', 'tag on',
+        p.protocol === 'anthropic' ? t('custom.tag.anthropic') : t('custom.tag.openai')));
+    }
+    const logged = p.accountCount > 0;
+    ops.appendChild(el('span', 'tag' + (logged ? ' on' : ' warn'),
+      logged ? t('tag.logged', { n: p.accountCount }) : t('tag.notLogged')));
+    // 停用状态必须显式标出来：停用的上游不进 /v1/models，模型页看不到它的模型，
+    // 而这里如果只显示「已登录 · N 账号」，用户会以为它正在工作。
+    if (!p.enabled) {
+      const off = el('span', 'tag warn', t('tag.disabled'));
+      off.title = t('custom.disabledTip');
+      ops.appendChild(off);
+    }
+    ops.appendChild(el('span', 'tag', t('tag.models', { n: p.modelCount })));
+
+    const del = el('button', 'btn btn-mini btn-danger', t('btn.delete'));
+    del.onclick = () => removeCustomGroup(p);
+    ops.appendChild(del);
+    item.appendChild(ops);
+    wrap.appendChild(item);
+  });
+}
+
+/* 添加分组进行中：后端要联机校验密钥（最长 15 秒），期间必须挡住重复提交。
+ * 只靠按钮 disabled 不够——Enter 键的处理函数不经过按钮状态，连按回车
+ * 会并发发出多次请求，重复的那次会撞上「分组已存在」或凭空并出第二组。 */
+let addingCustomGroup = false;
+
+async function addCustomGroup() {
+  if (addingCustomGroup) return;
+  const protocol = $('custom-protocol').value;
+  const name = $('custom-name').value.trim();
+  const baseUrl = $('custom-url').value.trim();
+  const apiKey = $('custom-key').value.trim();
+  const model = $('custom-model').value.trim();
+  if (!baseUrl) return toast(t('custom.urlRequired'));
+  if (!apiKey) return toast(t('custom.keyRequired'));
+
+  const btn = $('btn-custom-add');
+  const msg = $('custom-msg');
+  addingCustomGroup = true;
+  btn.disabled = true;
+  msg.textContent = t('custom.adding');
+  try {
+    await call('AddCustomProvider', { name: name, baseUrl: baseUrl, apiKey: apiKey, protocol: protocol, model: model });
+    msg.textContent = '';
+    // 只清掉密钥与模型：地址与类型往往要连续添加多组，留着省得重敲。
+    $('custom-key').value = '';
+    $('custom-model').value = '';
+    $('custom-name').value = '';
+    toast(t('custom.added'));
+    await refresh();
+  } catch (err) {
+    const text = t('toast.opFailedFmt', { err: String(err) });
+    msg.textContent = text;
+    toast(text);
+  } finally {
+    addingCustomGroup = false;
+    btn.disabled = false;
+  }
+}
+
+async function removeCustomGroup(p) {
+  if (!confirm(t('custom.confirmDeleteFmt', { name: p.name }))) return;
+  try {
+    await call('DeleteCustomProvider', p.id);
+    // 强制重建：删掉的正是列表里的一项，签名比对若命中旧值会跳过重绘，
+    // 用户会看到一个已经删除的分组还留在界面上。
+    _customGroupsSig = '';
+    toast(t('custom.deleted'));
+    await refresh();
+  } catch (err) {
+    toast(t('toast.opFailedFmt', { err: String(err) }));
+  }
+}
+
 /* 重建列表会把正在编辑的输入框一起丢掉——20 秒一次的轮询刷新就会触发，
  * 用户刚敲进去的权重会被清空。这里记下焦点所在的输入框和光标位置，
  * 重建后再放回去。 */
@@ -691,66 +796,48 @@ function renderVirtualEditorSelects() {
   renderVirtualModelOptions();
 }
 
-/* 按当前选中的上游填充模型下拉。
+/* 按当前选中的上游填充模型候选（datalist 建议项）。
  *
  * 走 GetProviderModels 而不是从 state.models 里筛：state.models 只含
  * 已启用上游的模型，而虚拟组允许用「已登录但未全局启用」的上游，
  * 那些模型在 state.models 里根本不存在。
- * 接口返回的就是该上游的原始模型 ID，与成员存储形式一致，无需去前缀。 */
+ * 接口返回的就是该上游的原始模型 ID，与成员存储形式一致，无需去前缀。
+ *
+ * 这里是「建议」而不是「唯一选项」：自定义上游可能没有 /models 端点
+ * （不少 Anthropic 兼容中转如此），同步不到任何模型时用户仍要能填模型名，
+ * 所以控件是可输入的 input + datalist，候选为空只影响提示不影响提交。 */
 let _vmModelReq = 0;
 async function renderVirtualModelOptions() {
   const pSel = $('vm-add-provider');
-  const mSel = $('vm-add-model');
-  if (!pSel || !mSel) return;
+  const list = $('vm-model-options');
+  if (!pSel || !list) return;
   const pid = pSel.value;
   if (!pid) {
-    mSel.innerHTML = '';
-    mSel._sig = '';
+    list.innerHTML = '';
+    list._sig = '';
     return;
   }
-  // 连续切换上游时只认最后一次请求的结果，避免慢响应把新选择覆盖掉。
+  // 连续切换上游时只认最后一次请求的结果，避免慢响应把新候选覆盖掉。
   const req = ++_vmModelReq;
   let models = [];
-  let failed = false;
   try {
     models = await call('GetProviderModels', pid);
   } catch (err) {
-    failed = true;
     models = [];
   }
   if (req !== _vmModelReq || pSel.value !== pid) return;
 
-  // 请求失败不写签名：签名一写就等于把「这次失败」缓存下来，用户切走再切回
-  // 同一个上游也不会重试。而且「没有可用模型」与「读取失败」是两回事，
-  // 前者可以继续操作，后者应当提示去检查登录状态。
-  if (failed) {
-    mSel.innerHTML = '';
-    mSel._sig = '';
-    const o = el('option');
-    o.value = '';
-    o.textContent = t('vm.modelsLoadFailed');
-    o.disabled = true;
-    mSel.appendChild(o);
-    return;
-  }
-
+  // 请求失败与「没有模型」都只是没有候选：不缓存空结果，用户切走再切回
+  // 同一个上游时会重新请求（上游刚同步完就能看到新模型）。
   const sig = [pid, (models || []).join(',')].join('|');
-  if (mSel._sig === sig) return;
-  mSel._sig = sig;
-  mSel.innerHTML = '';
+  if (list._sig === sig) return;
+  list._sig = sig;
+  list.innerHTML = '';
   (models || []).forEach((id) => {
     const o = el('option');
     o.value = id;
-    o.textContent = id;
-    mSel.appendChild(o);
+    list.appendChild(o);
   });
-  if (!models || !models.length) {
-    const o = el('option');
-    o.value = '';
-    o.textContent = t('vm.noModels');
-    o.disabled = true;
-    mSel.appendChild(o);
-  }
 }
 
 
@@ -766,6 +853,9 @@ function openVirtualEditor(name) {
   $('vm-editor-hint').textContent = vm ? t('vm.editor.editHint') : '';
   $('vm-name').value = vm ? vm.name : '';
   $('vm-enabled').checked = vm ? vm.enabled : true;
+  // 模型输入框每次打开都清空：它不像 <select> 那样自带「空选项」，上次
+  // 编辑残留的模型名会一直挂在那里，看起来像是「已经选好了这个模型」。
+  $('vm-add-model').value = '';
   $('vm-editor-msg').textContent = '';
   renderVirtualMembers();
   renderVirtualEditorSelects();
@@ -816,7 +906,7 @@ function renderVirtualMembers() {
 function addVirtualMember() {
   const pSel = $('vm-add-provider');
   const pid = pSel.value;
-  const model = $('vm-add-model').value;
+  const model = $('vm-add-model').value.trim();
   // 区分「还没选」和「压根没有可选上游」：后者是登录/启用状态问题，
   // 提示「请先选择」会让用户在下拉里反复找不存在的选项。
   if (!pSel.options.length) return toast(t('vm.editor.noProvider'));
@@ -833,6 +923,8 @@ function addVirtualMember() {
     model: model,
     weight: Math.max(1, parseInt($('vm-add-weight').value, 10) || 1),
   });
+  // 加完清空模型框：下一笔多半是另一个模型，留着旧值容易连点加重复。
+  $('vm-add-model').value = '';
   renderVirtualMembers();
 }
 
@@ -1354,6 +1446,7 @@ function renderAll() {
   renderLogs();
   renderLogin();
   renderLoginProviders();
+  renderCustomGroups();
   renderAccounts();
   renderModels();
   renderVirtualModels();
@@ -1609,6 +1702,12 @@ function bindUI() {
   });
   $('model-search').oninput = (e) => { S.modelFilter = e.target.value; renderModels(); };
 
+  // 自定义服务商：添加 / 删除分组
+  $('btn-custom-add').onclick = () => addCustomGroup();
+  $('custom-key').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') addCustomGroup();
+  });
+
   // 语言切换即时生效；其余设置项保持「编辑后点保存」的节奏
   $('set-language').onchange = (e) => changeLanguage(e.target.value);
   document.querySelectorAll('#tab-settings input, #tab-settings select').forEach((node) => {
@@ -1624,9 +1723,13 @@ function bindUI() {
   $('btn-vm-save').onclick = () => saveVirtualModel();
   $('btn-vm-add-member').onclick = () => addVirtualMember();
   $('vm-add-provider').onchange = () => {
-    // 换上游后模型列表整批变化，强制重建（清掉签名）。
-    const mSel = $('vm-add-model');
-    if (mSel) mSel._sig = '';
+    // 换上游后候选整批变化，强制重建（清掉签名）。模型输入框里的内容
+    // 一并清空：上一个上游的模型名对新上游几乎一定无效，留着只会让人
+    // 以为「这个模型选好了」。
+    const list = $('vm-model-options');
+    if (list) list._sig = '';
+    const model = $('vm-add-model');
+    if (model) model.value = '';
     renderVirtualModelOptions();
   };
 

@@ -1027,6 +1027,40 @@ func (c *Config) SetProfile(p Profile) {
 	c.normalize()
 }
 
+// IsUserCustomProfile 报告该上游是否是用户自建的自定义分组。
+//
+// 判定只认 ID 前缀 custom-：命名预设（xai / claude / chatgpt / zhipu / zcode）
+// 同属 KindCustom，但它们由程序内置、不该被用户删除，也不会在界面上出现
+// 「删除分组」入口。旧配置里可能残留 ID 恰为 "custom" 的条目，同样视作用户组。
+func (p Profile) IsUserCustomProfile() bool {
+	id := strings.TrimSpace(p.ID)
+	return strings.HasPrefix(id, "custom-") || id == "custom"
+}
+
+// RemoveProfile 删除指定 ID 的上游分组。返回是否真的删掉了。
+//
+// 只允许删用户自建分组（见 IsUserCustomProfile）：内置预设被删掉后，
+// 下一次 normalize 又会按「缺失补齐」把它加回来，删了等于没删，反而让
+// 用户以为操作失败。虚拟组里引用了该上游的成员由 normalizeVirtualModels 清理。
+func (c *Config) RemoveProfile(id string) bool {
+	id = strings.TrimSpace(id)
+	kept := make([]Profile, 0, len(c.Profiles))
+	removed := false
+	for _, p := range c.Profiles {
+		if p.ID == id && p.IsUserCustomProfile() {
+			removed = true
+			continue
+		}
+		kept = append(kept, p)
+	}
+	if !removed {
+		return false
+	}
+	c.Profiles = kept
+	c.normalize()
+	return true
+}
+
 // -----------------------------------------------------------------------------
 // 虚拟模型组
 // -----------------------------------------------------------------------------

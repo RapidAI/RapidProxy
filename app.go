@@ -44,7 +44,7 @@ const (
 )
 
 // Version 是程序版本号。
-const Version = "1.8.0"
+const Version = "1.9.0"
 
 // 窗口尺寸（逻辑像素，与 Wails 的屏幕尺寸单位一致）。
 //
@@ -103,6 +103,11 @@ type ProviderView struct {
 	AccountCount int    `json:"accountCount"`
 	ModelCount   int    `json:"modelCount"`
 	NeedsProxy   bool   `json:"needsProxy"`
+	// Protocol 是 custom 上游的线协议（openai / anthropic），其它上游为空。
+	// 界面据此在自定义分组上标注「OpenAI」或「Anthropic」。
+	Protocol string `json:"protocol,omitempty"`
+	// Custom 为 true 表示这是用户自建的分组（可删除），内置预设为 false。
+	Custom bool `json:"custom,omitempty"`
 }
 
 // ModelView 是模型列表项。
@@ -238,17 +243,19 @@ type ProfileInput struct {
 	Proxy   string `json:"proxy"`
 }
 
-// CustomProviderInput 是新增一个自定义服务商（每组一个自定义模型）的入参。
+// CustomProviderInput 是新增一个自定义服务商（每组一个自定义端点）的入参。
 //
-// 每个调用都会创建一个独立的上游分组（Profile，Kind=custom），彼此互不干扰——
-// 这正是「自定义模型自成一组」的语义：xAI / Claude / ChatGPT / 智谱编程 四个
-// 命名预设是预先建好的分组，而用户自建的每一个自定义端点也是各自一组。
+// 每个「协议 + 地址 + 密钥」组合都会创建一个独立的上游分组（Profile，
+// Kind=custom），彼此互不干扰——这正是「自定义模型自成一组」的语义：
+// xAI / Claude / ChatGPT / 智谱编程 四个命名预设是预先建好的分组，而用户
+// 自建的每一个自定义端点也是各自一组。Name 与 Model 可留空：名称按域名
+// 自动生成，模型由上游 /models 同步得到。
 type CustomProviderInput struct {
-	Name     string `json:"name"`     // 显示名，如「我的 DeepSeek」
+	Name     string `json:"name"`     // 显示名，留空时按「域名 · 协议」生成
 	BaseURL  string `json:"baseUrl"`  // 兼容 OpenAI / Anthropic 的 base_url（含 /v1 与否皆可）
 	APIKey   string `json:"apiKey"`   // 上游 API Key
 	Protocol string `json:"protocol"` // "openai"（默认）或 "anthropic"
-	Model    string `json:"model"`    // 该组默认模型 ID（也是对外暴露的模型名）
+	Model    string `json:"model"`    // 可选：该组默认模型 ID（额外并入对外暴露的模型名）
 }
 
 // SettingsInput 是保存设置的入参。
@@ -290,6 +297,12 @@ type App struct {
 
 	cfgMu sync.RWMutex
 	cfg   *config.Config
+	// cfgWriteMu 串行化「读配置 → 改副本 → 落盘 → 换指针」这一整段。
+	//
+	// cfgMu 只保护指针本身的读写，挡不住两个并发写者各自克隆同一份旧配置、
+	// 再依次覆盖回去——后写者会把先写者的改动整个抹掉（实测并发添加 6 个
+	// 自定义分组，落盘只剩 1 个）。改配置的操作都必须先拿这把锁。
+	cfgWriteMu sync.Mutex
 
 	quitting    atomic.Bool
 	headless    atomic.Bool
@@ -763,6 +776,11 @@ func (a *App) providerViews(creds []*upstream.Credential) []ProviderView {
 	}
 	out := make([]ProviderView, 0, len(cfg.Profiles))
 	for _, p := range cfg.Profiles {
+		protocol := ""
+		if p.Kind == config.KindCustom && !p.UsesOAuth() {
+			// OAuth 上游的线路由 OAuthProvider 决定，标出线协议反而误导。
+			protocol = normalizeCustomProtocol(p.Protocol)
+		}
 		out = append(out, ProviderView{
 			ID:           p.ID,
 			Name:         p.Name,
@@ -773,6 +791,8 @@ func (a *App) providerViews(creds []*upstream.Credential) []ProviderView {
 			AccountCount: counts[p.ID],
 			ModelCount:   len(a.srv.ModelsFor(p.ID)),
 			NeedsProxy:   p.ProxyRecommended(),
+			Protocol:     protocol,
+			Custom:       p.IsUserCustomProfile(),
 		})
 	}
 	return out
@@ -1128,52 +1148,95 @@ func (a *App) GetProviderModels(providerID string) []string {
 // AddCustomProvider 新增一个自定义服务商：每个调用创建一个独立的上游分组
 // （Profile，Kind=custom），并立即用传入的 API Key 登录一份凭据。
 //
-// 这就是「自定义模型自成一组」的落地方式——与 xAI / Claude / ChatGPT / 智谱
-// 编程 四个命名预设一样，用户自建的每一个自定义端点都是各自独立的一组，互不
-// 干扰。返回的 providerID 可后续用于登录、设置与统计。
+// 分组身份由「线协议 + 接口地址 + API Key」三者共同决定（见
+// deriveCustomProviderID）：换了地址或换了密钥就是另一个分组，各自独立
+// 维护模型、账号与统计；三项都相同才复用同一组（重复提交是幂等的，不会
+// 堆出多份同名分组）。显示名与模型都可以留空——名称缺省按域名生成，模型
+// 缺省由上游 /models 同步得到。
 func (a *App) AddCustomProvider(input CustomProviderInput) (string, error) {
 	name := strings.TrimSpace(input.Name)
-	baseURL := strings.TrimSpace(input.BaseURL)
-	if name == "" {
-		return "", errors.New(locale.T("provider.nameEmpty"))
-	}
-	if baseURL == "" {
+	rawBase := strings.TrimSpace(input.BaseURL)
+	if rawBase == "" {
 		return "", errors.New(locale.T("provider.urlEmpty"))
 	}
-	if err := validateBaseURL(baseURL); err != nil {
+	if err := validateBaseURL(rawBase); err != nil {
 		return "", errors.New(locale.T("provider.urlInvalid"))
 	}
-	protocol := strings.ToLower(strings.TrimSpace(input.Protocol))
-	if protocol != "anthropic" {
-		protocol = "openai"
+	// 收敛成干净的 base_url：剥掉误粘贴的对话端点尾巴、fragment 与 query。
+	// base_url 的语义是「前缀」，程序会自己在后面拼 /chat/completions。
+	baseURL := normalizeBaseURLInput(rawBase)
+	protocol := normalizeCustomProtocol(input.Protocol)
+	// 模型可以留空（靠上游 /models 同步），也可以一次填多个（逗号 / 空格分隔）：
+	// 上游没有模型目录时，这里是用户登记可用模型的唯一途径。
+	models := splitModels(input.Model)
+	// 密钥必须先归一化再参与身份计算：落库的凭据存的是归一化后的值，
+	// 用原始输入算 ID 会让 "Bearer sk-x" 与 "sk-x" 变成两个分组。
+	rawKey, keyErr := upstream.NormalizeCustomAPIKey(input.APIKey)
+	if keyErr != nil {
+		if strings.TrimSpace(input.APIKey) == "" {
+			// 空密钥：允许先建组、稍后再登录（界面上密钥是必填，这里是兜底）。
+			rawKey = ""
+		} else {
+			return "", errors.New(locale.T("login.keyInvalid.custom"))
+		}
 	}
-	model := strings.TrimSpace(input.Model)
-	if model == "" {
-		return "", errors.New(locale.T("provider.modelEmpty"))
-	}
+
+	// 整段「读配置 → 改副本 → 落盘 → 换指针」必须串行：并发写者各自克隆
+	// 同一份旧配置再依次覆盖，后写者会把先写者的分组整个抹掉。
+	//
+	// 网络校验（最长 15 秒）刻意留在锁外——它只依赖已算好的 profile，
+	// 拿锁做 I/O 会把其它配置操作（保存设置、登录）全部堵住。
+	a.cfgWriteMu.Lock()
+	defer a.cfgWriteMu.Unlock()
 
 	cfg := a.settings().Clone()
 
-	// 由显示名派生一个稳定的分组 ID（custom-<hash>），避免名称里出现空格 /
-	// 中文 / 特殊字符作为配置文件主键；同名重复添加会复用同一组。
-	providerID := deriveCustomProviderID(name)
-	if existing, ok := cfg.ProfileByID(providerID); ok {
-		// 同名组重复添加：更新端点/协议，模型并入 ExtraModels，保留已有账号。
-		existing.Name = name
+	// 分组 ID 由「协议 + 地址 + 密钥」派生（custom-<hash>）：换地址或换密钥
+	// 就是另一个分组，各自独立维护模型、账号与统计；三项完全相同才复用同一
+	// 组，重复提交因此是幂等的。ID 是摘要，密钥明文不会进配置文件。
+	providerID := deriveCustomProviderID(protocol, baseURL, rawKey)
+	existing, found := cfg.ProfileByID(providerID)
+	if !found && rawKey != "" {
+		// 升级兼容：旧版本按显示名派生 ID，同一个端点会算出另一个 ID。
+		// 找到同协议、同地址、同密钥的旧组就继续用它，避免升级后出现
+		// 两份指向同一端点的分组。找不到时保留按新规则算出的 ID。
+		//
+		// 只在不带密钥时跳过这段：无密钥的提交无法确认「是不是同一个组」，
+		// 硬匹配同地址的组会把别人的模型并进来。
+		if legacyID, legacy, ok := a.findCustomGroup(cfg, protocol, baseURL, rawKey); ok {
+			providerID, existing, found = legacyID, legacy, true
+		}
+	}
+	if found {
+		// 同一组重复提交：补齐名称 / 协议 / 端点，模型并入 ExtraModels，
+		// 保留已有账号与凭据。启停状态由下面的 enableProviderIfDisabled
+		// 统一拉起——用户重新提交这个分组，本身就是「要用它」的意思。
+		if name != "" {
+			existing.Name = name
+		}
+		existing.Kind = config.KindCustom
 		existing.Protocol = protocol
-		existing.BaseURL = strings.TrimRight(baseURL, "/")
-		existing.ExtraModels = mergeModel(existing.ExtraModels, model)
-		existing.Enabled = true
+		existing.BaseURL = baseURL
+		existing.Auth = config.AuthAPIKey
+		for _, m := range models {
+			existing.ExtraModels = mergeModel(existing.ExtraModels, m)
+		}
 		cfg.SetProfile(existing)
 	} else {
+		displayName := customProviderName(name, protocol, baseURL)
+		if name == "" {
+			// 只有自动生成的名称才去重：用户手填的名字可能有意重复。
+			displayName = uniqueProviderName(cfg, displayName, rawKey)
+		}
 		profile := config.Profile{
 			ID:          providerID,
-			Name:        name,
+			Name:        displayName,
 			Enabled:     true,
 			Kind:        config.KindCustom,
 			Protocol:    protocol,
-			BaseURL:     strings.TrimRight(baseURL, "/"),
-			ExtraModels: []string{model},
+			Auth:        config.AuthAPIKey,
+			BaseURL:     baseURL,
+			ExtraModels: models,
 		}
 		cfg.SetProfile(profile)
 	}
@@ -1190,8 +1253,8 @@ func (a *App) AddCustomProvider(input CustomProviderInput) (string, error) {
 		return "", err
 	}
 	// 若提供了 API Key，则校验并落库一份凭据（密钥制登录）。
-	if raw := strings.TrimSpace(input.APIKey); raw != "" {
-		normalized, nerr := client.NormalizeAPIKey(raw)
+	if rawKey != "" {
+		normalized, nerr := client.NormalizeAPIKey(rawKey)
 		if nerr != nil {
 			if errors.Is(nerr, upstream.ErrCustomKeyInvalid) {
 				return "", errors.New(locale.T("login.keyInvalid.custom"))
@@ -1204,7 +1267,7 @@ func (a *App) AddCustomProvider(input CustomProviderInput) (string, error) {
 			if errors.Is(verr, upstream.ErrCustomKeyRejected) {
 				return "", errors.New(locale.T("login.keyRejected.custom"))
 			}
-			a.log.Warnf("未能联机校验 %s 密钥（仍按提交保存）: %v", name, verr)
+			a.log.Warnf("未能联机校验 %s 密钥（仍按提交保存）: %v", profile.Name, verr)
 		}
 		if a.store == nil {
 			return "", fmt.Errorf("%s", locale.T("login.saveFailed", "凭据仓库不可用"))
@@ -1223,9 +1286,13 @@ func (a *App) AddCustomProvider(input CustomProviderInput) (string, error) {
 	a.cfgMu.Unlock()
 	a.srv.SetConfig(cfg)
 	a.srv.InvalidateAccounts()
-	a.enableProviderIfDisabled(providerID)
-	a.log.Infof("新增自定义服务商: %s（%s，协议 %s）", name, providerID, protocol)
+	// 已持 cfgWriteMu：用不加锁版本，否则这把非重入锁会自锁死。
+	a.enableProviderIfDisabledLocked(providerID)
+	a.log.Infof("新增自定义服务商: %s（%s，协议 %s，%s）", profile.Name, providerID, protocol, baseURL)
 
+	// 先推一次状态：新分组此刻已在配置里，不该等下面的模型同步（最长 60 秒）
+	// 才出现在界面上。同步完成后再推一次，把模型数补齐。
+	a.pushState()
 	go func() {
 		refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 		defer cancel()
@@ -1235,11 +1302,229 @@ func (a *App) AddCustomProvider(input CustomProviderInput) (string, error) {
 	return providerID, nil
 }
 
-// deriveCustomProviderID 由自定义服务商显示名派生一个稳定的分组 ID。
-// 同名返回同一 ID，便于重复添加时复用分组而非堆积多组。
-func deriveCustomProviderID(name string) string {
-	sum := sha256Hex(strings.ToLower(strings.TrimSpace(name)))
+// DeleteCustomProvider 删除一个用户自建的自定义分组：先删该组全部凭据，
+// 再从配置里移除 profile。内置预设不可删（见 config.RemoveProfile）。
+func (a *App) DeleteCustomProvider(providerID string) error {
+	providerID = strings.TrimSpace(providerID)
+	// 与 AddCustomProvider 同一把锁：并发的增删各自克隆旧配置再覆盖，
+	// 后写者会把对方的结果抹掉（见 cfgWriteMu 的注释）。
+	a.cfgWriteMu.Lock()
+	defer a.cfgWriteMu.Unlock()
+
+	cfg := a.settings().Clone()
+	profile, ok := cfg.ProfileByID(providerID)
+	if !ok {
+		return fmt.Errorf("%s", locale.T("login.unknownProvider", providerID))
+	}
+	if !profile.IsUserCustomProfile() {
+		return errors.New(locale.T("provider.notRemovable", profile.Name))
+	}
+	// 顺序很重要：先改配置并落盘，成功了再删凭据。
+	//
+	// 反过来（先删凭据再写配置）时，配置写失败会留下一个「配置里还在、
+	// 凭据已没了」的空分组：用户看到分组还在却显示未登录，且再也找不回
+	// 那把密钥。现在最坏情况只是「分组已从配置消失、凭据文件残留」，残留
+	// 文件不影响任何行为，下次用同一把密钥重新添加时会复用同一 ID。
+	if !cfg.RemoveProfile(providerID) {
+		return fmt.Errorf("%s", locale.T("login.unknownProvider", providerID))
+	}
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+	a.srv.SetConfig(cfg)
+
+	// 配置已生效，凭据删除失败只记日志：分组已经不可见，残留凭据不会
+	// 参与转发（路由只认配置里的 profile），报错反而让用户以为删除没成功。
+	if a.store != nil {
+		if creds, err := a.store.List(providerID); err != nil {
+			a.log.Warnf("读取 %s 凭据失败，残留文件未清理: %v", providerID, err)
+		} else {
+			for _, cred := range creds {
+				if derr := a.store.Delete(providerID, cred.ID); derr != nil {
+					a.log.Warnf("删除 %s 凭据 %s 失败: %v", providerID, cred.ID, derr)
+				}
+			}
+		}
+	}
+	a.srv.InvalidateAccounts()
+	a.log.Infof("已删除自定义服务商: %s（%s）", profile.Name, providerID)
+
+	go func() {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+		defer cancel()
+		a.srv.RefreshModels(refreshCtx)
+		a.pushState()
+	}()
+	a.pushState()
+	return nil
+}
+
+// normalizeCustomProtocol 归一自定义上游的线协议：只认 openai / anthropic，
+// 其它值（含空值）一律按 openai。
+func normalizeCustomProtocol(protocol string) string {
+	if strings.EqualFold(strings.TrimSpace(protocol), "anthropic") {
+		return "anthropic"
+	}
+	return "openai"
+}
+
+// normalizeBaseURL 归一化接口地址，用于比较与派生分组 ID。
+//
+// 只把 scheme 与 host 转小写：路径是大小写敏感的，把整条 URL 都小写会让
+// "https://host/API/v1" 与 "https://host/api/v1" 这两个不同端点撞成一组。
+// 尾斜杠一并去掉，"https://a.com/v1/" 与 "https://a.com/v1" 是同一个端点。
+func normalizeBaseURL(raw string) string {
+	trimmed := strings.TrimRight(strings.TrimSpace(raw), "/")
+	u, err := url.Parse(trimmed)
+	if err != nil || u.Host == "" {
+		return trimmed
+	}
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
+	return u.String()
+}
+
+// deriveCustomProviderID 由「线协议 + 接口地址 + API Key」派生分组 ID。
+//
+// 三项共同构成分组身份：换地址或换密钥都是独立的一组，互不干扰；三项完全
+// 相同则复用同一组，重复提交是幂等的。地址先经 normalizeBaseURL 归一，
+// 免得大小写或尾斜杠差异被当成两个端点。
+func deriveCustomProviderID(protocol, baseURL, apiKey string) string {
+	sum := sha256Hex(strings.Join([]string{
+		normalizeCustomProtocol(protocol),
+		normalizeBaseURL(baseURL),
+		strings.TrimSpace(apiKey),
+	}, "\x00"))
 	return "custom-" + sum[:12]
+}
+
+// findCustomGroup 在配置里找一个与「协议 + 地址 + 密钥」对应的自定义分组。
+//
+// 用于兼容升级前按显示名派生 ID 的老分组：新规则算出的 ID 查不到时，再看
+// 有没有同协议、同地址、且组内恰好存着同一把密钥的旧组。密钥比对要读凭据
+// 仓库，代价只在新增分组时付一次。
+//
+// 密钥必须非空且真的在该组的凭据里：只按地址匹配会把「同一端点、另一把密钥」
+// 的分组误判成同一个——那恰恰是用户要求各自独立的场景。
+func (a *App) findCustomGroup(cfg *config.Config, protocol, baseURL, apiKey string) (string, config.Profile, bool) {
+	key := strings.TrimSpace(apiKey)
+	if key == "" {
+		return "", config.Profile{}, false
+	}
+	for _, p := range cfg.Profiles {
+		if !p.IsUserCustomProfile() || normalizeCustomProtocol(p.Protocol) != protocol {
+			continue
+		}
+		// 两边都按「用户输入」口径归一：旧配置里可能躺着带端点尾巴的地址
+		// （老版本不剥），不归一就永远匹配不上，会为同一端点再建一组。
+		if normalizeBaseURLInput(p.BaseURL) != normalizeBaseURLInput(baseURL) {
+			continue
+		}
+		if a.profileHasKey(p.ID, key) {
+			return p.ID, p, true
+		}
+	}
+	return "", config.Profile{}, false
+}
+
+// profileHasKey 报告某分组的凭据里是否存着这把密钥。
+func (a *App) profileHasKey(providerID, key string) bool {
+	if a.store == nil {
+		return false
+	}
+	creds, err := a.store.List(providerID)
+	if err != nil {
+		return false
+	}
+	for _, cred := range creds {
+		if strings.TrimSpace(cred.Auth.AccessToken) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// customProviderName 生成自定义分组的显示名：用户给了就用它，否则按域名
+// 加协议后缀，保证列表里能一眼分清两个自定义 OpenAI / Anthropic 端点。
+//
+// 路径有意义时（不是空、也不是单纯的 /v1）一并带上：同一个域名下常挂多个
+// 端点（如 https://relay.com/openai 与 https://relay.com/anthropic），只写
+// 域名会让两个分组看起来一模一样。
+// displayPath 返回地址里值得写进显示名的路径部分。
+//
+// 末尾的 /v1 一律剥掉：上游客户端会自动补 /v1（见 custom.appendVersionedPath），
+// 所以 https://host/anthropic 与 https://host/anthropic/v1 是同一个端点，
+// 显示名不该因此不同。剥完为空表示这是个「裸域名」端点，只显示域名。
+func displayPath(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	p := strings.Trim(u.Path, "/")
+	// 反复剥掉末尾的版本段：/v1、/anthropic/v1 都归到 /anthropic。
+	for {
+		idx := strings.LastIndex(p, "/")
+		last := p
+		if idx >= 0 {
+			last = p[idx+1:]
+		}
+		if !strings.EqualFold(last, "v1") {
+			break
+		}
+		if idx < 0 {
+			return ""
+		}
+		p = p[:idx]
+	}
+	return p
+}
+
+func customProviderName(name, protocol, baseURL string) string {
+	if name != "" {
+		return name
+	}
+	host := baseURL
+	if u, err := url.Parse(baseURL); err == nil && strings.TrimSpace(u.Host) != "" {
+		host = u.Host
+	}
+	if p := displayPath(baseURL); p != "" {
+		host += "/" + p
+	}
+	suffix := " · OpenAI"
+	if protocol == "anthropic" {
+		suffix = " · Anthropic"
+	}
+	return host + suffix
+}
+
+// uniqueProviderName 让自动生成的名称在已有分组里不重名。
+//
+// 同域名、同路径、不同密钥是最常见的「看起来一样」来源：地址完全相同，
+// 只有密钥不同。此时补一段密钥指纹（首 4 + 末 4 位，与账号昵称同口径）
+// 作为区分；用户自己填了名字就原样返回，不做任何改写。
+func uniqueProviderName(cfg *config.Config, base, apiKey string) string {
+	taken := make(map[string]bool, len(cfg.Profiles))
+	for _, p := range cfg.Profiles {
+		taken[p.Name] = true
+	}
+	if !taken[base] {
+		return base
+	}
+	if label := upstream.KeyLabelFor(apiKey); label != "" && label != "key" {
+		if cand := base + " (" + label + ")"; !taken[cand] {
+			return cand
+		}
+	}
+	// 指纹也撞（同一把密钥重复添加，理论上已被 ID 复用挡住）：退回序号，
+	// 保证名称始终唯一，界面不会出现两行完全相同的条目。
+	for i := 2; ; i++ {
+		if cand := fmt.Sprintf("%s #%d", base, i); !taken[cand] {
+			return cand
+		}
+	}
 }
 
 // validateBaseURL 校验自定义服务商的接口地址：必须是带主机名的 http/https URL。
@@ -1258,6 +1543,76 @@ func validateBaseURL(raw string) error {
 		return errors.New("missing host")
 	}
 	return nil
+}
+
+// chatEndpointSuffixes 是用户可能整条粘贴过来的「对话端点尾巴」。
+//
+// 很多人从文档或代码里直接复制完整 URL（https://host/v1/chat/completions），
+// 而这里的 base_url 语义是「前缀」，程序会在后面自己拼 /chat/completions。
+// 不剥掉这段就会得到 .../chat/completions/v1/chat/completions，请求全部 404，
+// 而用户只会看到一句费解的「密钥被拒绝」或空响应。
+//
+// 只列明确是「端点」而非「前缀」的路径：/completions 单独出现时可能真的是
+// 某个自建网关的 base（如 https://host/api/completions），剥掉反而弄坏它。
+var chatEndpointSuffixes = []string{
+	"/chat/completions",
+	"/messages",
+	"/responses",
+}
+
+// normalizeBaseURLInput 把用户粘贴的接口地址收敛成「干净的 base_url」。
+//
+// 做三件事：
+//   - 去掉 fragment：URL 里带 #xxx 时，后续拼出的 /v1/models 会被当成
+//     fragment 的一部分，请求实际打到不带路径的地址。
+//   - 去掉 query：?api-version=2 这类参数只属于某一条具体请求，拼上
+//     子路径后 query 会把路径吞掉（...?api-version=2/v1/models）。
+//   - 剥掉误粘贴的对话端点尾巴，见 chatEndpointSuffixes。
+//
+// 返回归一化后的地址；调用方应先用 validateBaseURL 校验原始输入。
+func normalizeBaseURLInput(raw string) string {
+	trimmed := strings.TrimSpace(raw)
+	u, err := url.Parse(trimmed)
+	if err != nil {
+		return trimmed
+	}
+	u.Fragment = ""
+	u.RawQuery = ""
+	path := strings.TrimRight(u.Path, "/")
+	// 反复剥：有人会连 /v1 一起粘成 /v1/chat/completions。
+	for _, suffix := range chatEndpointSuffixes {
+		if strings.HasSuffix(strings.ToLower(path), suffix) {
+			path = strings.TrimSuffix(path[:len(path)-len(suffix)], "/")
+			break
+		}
+	}
+	u.Path = path
+	u.RawPath = ""
+	return strings.TrimRight(u.String(), "/")
+}
+
+// splitModels 把用户填写的模型串拆成列表：逗号（中英文）、分号、空白都算分隔。
+//
+// 一次填多个模型的场景是「上游没有 /models 目录」：用户只能手动登记自己
+// 会用到的那几个模型名，逐个提交太啰嗦。
+func splitModels(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		switch r {
+		case ',', '，', ';', '；', ' ', '\t', '\r', '\n':
+			return true
+		}
+		return false
+	})
+	out := make([]string, 0, len(fields))
+	for _, f := range fields {
+		if m := strings.TrimSpace(f); m != "" {
+			out = append(out, m)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // mergeModel 把 model 并入模型名列表（去重、忽略空值）。
@@ -1505,7 +1860,9 @@ func (a *App) pollLogin(ctx context.Context, run *loginRun) {
 // 但模型页、/v1/models 与转发都只认「已启用 ∧ 已登录」的上游，
 // 用户看到的现象就是「登录成功了却什么都没有」。登录成功本身已经
 // 表达了使用意图，这里顺手把开关打开；已启用时是空操作。
-func (a *App) enableProviderIfDisabled(providerID string) {
+// enableProviderIfDisabledLocked 是 enableProviderIfDisabled 的不加锁版本，
+// 供已持有 cfgWriteMu 的调用方使用（见 AddCustomProvider）。
+func (a *App) enableProviderIfDisabledLocked(providerID string) {
 	cfg := a.settings().Clone()
 	profile, ok := cfg.ProfileByID(providerID)
 	if !ok || profile.Enabled {
@@ -1523,6 +1880,12 @@ func (a *App) enableProviderIfDisabled(providerID string) {
 	a.cfgMu.Unlock()
 	a.srv.SetConfig(cfg)
 	a.log.Infof("上游 %s 已随登录自动启用", profile.Name)
+}
+
+func (a *App) enableProviderIfDisabled(providerID string) {
+	a.cfgWriteMu.Lock()
+	defer a.cfgWriteMu.Unlock()
+	a.enableProviderIfDisabledLocked(providerID)
 }
 
 // finishLogin 结束登录流程。终态（success / failed）具有粘滞性：先到达的

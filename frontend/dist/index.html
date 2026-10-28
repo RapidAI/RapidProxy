@@ -157,6 +157,49 @@
 
           <div class="card">
             <div class="card-head">
+              <h2 data-i18n="custom.title">添加自定义服务商</h2>
+              <span class="hint" data-i18n="custom.hint">每套「类型 + 接口地址 + API Key」各自成为一个独立分组，互不影响</span>
+            </div>
+            <div class="form-grid">
+              <label class="form-item">
+                <span data-i18n="custom.protocol">类型</span>
+                <select class="input" id="custom-protocol">
+                  <option value="openai" data-i18n="custom.protocol.openai">自定义 OpenAI（OpenAI 兼容）</option>
+                  <option value="anthropic" data-i18n="custom.protocol.anthropic">自定义 Anthropic（Anthropic 兼容）</option>
+                </select>
+                <em data-i18n="custom.protocolHint">Anthropic 兼容端点由代理自动完成请求与流式翻译</em>
+              </label>
+              <label class="form-item">
+                <span data-i18n="custom.name">显示名（可选）</span>
+                <input class="input" id="custom-name" data-i18n-ph="custom.namePh" placeholder="留空则按域名自动生成" />
+              </label>
+              <label class="form-item">
+                <span data-i18n="custom.url">接口地址</span>
+                <input class="input" id="custom-url" data-i18n-ph="custom.urlPh" placeholder="https://api.example.com/v1" />
+                <em data-i18n="custom.urlHint">可带或不带 /v1，程序会自动补全</em>
+              </label>
+              <label class="form-item">
+                <span data-i18n="custom.key">API Key</span>
+                <input class="input" id="custom-key" type="password" autocomplete="off" data-i18n-ph="custom.keyPh" placeholder="粘贴上游 API Key" />
+              </label>
+              <label class="form-item">
+                <span data-i18n="custom.model">可用模型（可选）</span>
+                <input class="input" id="custom-model" data-i18n-ph="custom.modelPh" placeholder="留空则从上游同步模型列表" />
+                <em data-i18n="custom.modelHint">上游没有模型目录接口时，在这里填写模型 ID（多个用逗号分隔）</em>
+              </label>
+            </div>
+            <div class="row-actions">
+              <button class="btn btn-primary btn-mini" id="btn-custom-add" data-i18n="custom.add">添加分组</button>
+              <span class="hint" id="custom-msg"></span>
+            </div>
+            <div class="custom-groups-head">
+              <strong data-i18n="custom.groups">已添加的自定义分组</strong>
+            </div>
+            <div class="provider-config" id="custom-groups"></div>
+          </div>
+
+          <div class="card">
+            <div class="card-head">
               <h2 data-i18n="acc.list.title">已登录账号</h2>
               <span class="hint" id="accounts-count"></span>
             </div>
@@ -234,7 +277,10 @@
             <div class="vm-members" id="vm-members"></div>
             <div class="vm-add-row">
               <select class="input" id="vm-add-provider"></select>
-              <select class="input" id="vm-add-model"></select>
+              <!-- 模型用可输入的下拉：上游没有 /models 端点（不少 Anthropic
+                   兼容中转如此）时同步不到清单，用户仍能直接敲模型名。 -->
+              <input class="input" id="vm-add-model" list="vm-model-options" data-i18n-ph="vm.modelPh" placeholder="选择或输入模型 ID" />
+              <datalist id="vm-model-options"></datalist>
               <input class="input vm-weight" id="vm-add-weight" type="number" min="1" value="1" data-i18n-title="vm.weight" title="权重" />
               <button class="btn btn-mini" id="btn-vm-add-member" data-i18n="vm.addMember">添加成员</button>
             </div>

@@ -41,7 +41,16 @@ Each signable provider is one **group**: accounts inside a group are served with
 
 ### Custom models (each is its own group)
 
-Beyond the fixed presets, the backend method `AddCustomProvider({name, baseUrl, apiKey, protocol, model})` adds **any** OpenAI- or Anthropic-compatible endpoint (DeepSeek, Moonshot, Qwen, Volcengine Ark, self-hosted gateways, …). **Every call creates an independent group**, so each custom model is its own group and never mixes with the other providers; adding the same name again reuses that group (merging models, keeping existing accounts). `baseUrl` must be a full `http(s)://` URL.
+Beyond the fixed presets, the **Accounts** tab has an "Add a Custom Provider" form that adds **any** OpenAI- or Anthropic-compatible endpoint (DeepSeek, Moonshot, Qwen, Volcengine Ark, self-hosted gateways, …). Pick a type (Custom OpenAI / Custom Anthropic), fill in the base URL and API key, and you are done; the display name and available models are both optional (the name is derived from the host plus protocol and de-duplicated automatically, models are synced from the upstream's `/models`). The groups you added are listed right below the form and can be deleted individually.
+
+A group's identity is the **type + base URL + API key** triple: changing the URL or the key produces a separate, independent group with its own models, accounts, weights and traffic stats, while an identical triple reuses the same group — so resubmitting is idempotent and never piles up duplicate groups. The API key is normalized first (stripping the `Bearer ` prefix, quotes and JSON wrapping) before it feeds the identity, so different pastes of the same key still land in the same group. The group ID is a digest of that triple, so the plaintext API key never lands in the config file. Deleting a group also removes all of its account credentials and prunes any virtual-group members that referenced it.
+
+The same capability is available from the backend: `AddCustomProvider({name, baseUrl, apiKey, protocol, model})` returns the group ID, and `DeleteCustomProvider(id)` removes it. `baseUrl` must be a full `http(s)://` URL.
+
+**Models from a custom group can be added to virtual groups.** As long as the group has a signed-in account, it appears in the virtual-group editor's provider dropdown, and you can pick its models as members. Models come from one of two places:
+
+- **The upstream has a model catalog** (`GET {base}/models`): after syncing, models show up as suggestions automatically — nothing to fill in.
+- **The upstream has no model catalog** (common for Anthropic-compatible relays): nothing can be synced, so put the model IDs into the "Available models" field when adding the group (comma / semicolon / space separated, several at once). They join that group's model list and become selectable in virtual groups. The virtual-group editor's model box also accepts a typed model name, so an empty suggestion list never blocks you.
 
 - `protocol` is `openai` (default) or `anthropic`; `baseURL` may include `/v1` or not (it is completed automatically).
 - Zhipu's gifted quota is decided by the request **User-Agent** (coding-client identity), so the `zhipu` / `zcode` presets send `opencode` by default; if an account's quota requires a different client identity (e.g. `claude code`, `codex`), change `user_agent` in that profile in `config.json`.

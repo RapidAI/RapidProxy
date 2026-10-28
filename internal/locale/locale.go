@@ -129,10 +129,12 @@ var catalog = map[string]entry{
 	"login.unknownProvider":    {"未知的上游: %s", "Unknown provider: %s"},
 
 	// ---- 自定义服务商 ----
-	"provider.nameEmpty":  {"服务商名称不能为空", "The provider name must not be empty"},
 	"provider.urlEmpty":   {"接口地址（Base URL）不能为空", "The base URL must not be empty"},
 	"provider.urlInvalid": {"接口地址无效，需为 http(s):// 开头的完整地址", "Invalid base URL — it must be a full http(s):// URL"},
-	"provider.modelEmpty": {"模型 ID 不能为空", "The model ID must not be empty"},
+	"provider.notRemovable": {
+		"内置服务商 %s 不能删除，可在设置里停用",
+		"The built-in provider %s cannot be deleted — disable it in Settings instead",
+	},
 
 	// ---- API Key ----
 	"key.empty":     {"API Key 不能为空", "The API key must not be empty"},

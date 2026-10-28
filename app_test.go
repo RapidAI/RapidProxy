@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -438,5 +440,726 @@ func TestPollLoginKeepsFlowOnRetryableCodeError(t *testing.T) {
 
 	if polls < 3 {
 		t.Errorf("可重试错误应继续轮询，实际只轮询 %d 次", polls)
+	}
+}
+
+// 自定义分组按「协议 + 地址 + 密钥」各自成组：换地址或换密钥就是另一个
+// 分组，三项都相同才复用同一组（重复提交幂等）。
+func TestAddCustomProviderGroupsByIdentity(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 联机校验会打 /models：桩服务器一律放行，避免测试依赖外网。
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"demo-model","name":"Demo"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, nil, logger), store: credStore}
+
+	first, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "openai", Model: "demo-model",
+	})
+	if err != nil {
+		t.Fatalf("新增自定义分组失败: %v", err)
+	}
+	profile, ok := a.settings().ProfileByID(first)
+	if !ok {
+		t.Fatalf("新增的分组 %s 未进配置", first)
+	}
+	if profile.Protocol != "openai" || profile.BaseURL != stub.URL {
+		t.Errorf("分组字段不对: %+v", profile)
+	}
+	// 名称留空时按域名生成，且带上协议后缀，便于和另一协议的组区分。
+	if profile.Name == "" || !strings.Contains(profile.Name, "OpenAI") {
+		t.Errorf("留空名称应按域名生成并带协议后缀，实际 %q", profile.Name)
+	}
+
+	// 同一组重复提交：幂等，仍是一个分组。
+	again, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "openai", Model: "demo-model",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again != first {
+		t.Errorf("同地址同密钥应复用同一分组: %s != %s", again, first)
+	}
+
+	// 同地址换密钥：另一个分组。
+	otherKey, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-beta", Protocol: "openai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if otherKey == first {
+		t.Error("不同 API Key 应各自成组")
+	}
+
+	// 同地址换线协议：也是另一个分组。
+	anthropic, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "anthropic",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if anthropic == first {
+		t.Error("不同线协议应各自成组")
+	}
+	if p, _ := a.settings().ProfileByID(anthropic); p.Protocol != "anthropic" {
+		t.Errorf("Anthropic 分组的协议字段不对: %+v", p)
+	}
+
+	// 地址归一：尾斜杠与大小写差异不该造出新分组。
+	same, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: strings.ToUpper(stub.URL) + "/", APIKey: "sk-alpha", Protocol: "openai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if same != first {
+		t.Errorf("地址仅大小写 / 尾斜杠不同应视为同一分组: %s != %s", same, first)
+	}
+
+	// 每个分组各自落库了凭据。
+	creds, err := credStore.List("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(creds) != 3 {
+		t.Errorf("应有 3 个分组的凭据（重复提交不新增），实际 %d 个", len(creds))
+	}
+}
+
+// 删除自定义分组会连带清掉该组的凭据；内置预设不允许删除。
+func TestDeleteCustomProvider(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"demo-model"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, nil, logger), store: credStore}
+
+	id, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "openai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n := credStore.Count(id); n != 1 {
+		t.Fatalf("新增后应有 1 份凭据，实际 %d", n)
+	}
+
+	if err := a.DeleteCustomProvider(id); err != nil {
+		t.Fatalf("删除自定义分组失败: %v", err)
+	}
+	if _, ok := a.settings().ProfileByID(id); ok {
+		t.Error("分组应从配置里移除")
+	}
+	if n := credStore.Count(id); n != 0 {
+		t.Errorf("分组凭据应一并删除，实际还剩 %d 份", n)
+	}
+
+	// 内置预设不可删（否则下次 normalize 又会补回来，删了等于没删）。
+	if err := a.DeleteCustomProvider("claude"); err == nil {
+		t.Error("内置预设应拒绝删除")
+	}
+	if _, ok := a.settings().ProfileByID("claude"); !ok {
+		t.Error("内置预设不应被删除")
+	}
+
+	// 未知分组报错而不是静默成功。
+	if err := a.DeleteCustomProvider("custom-nosuchgroup"); err == nil {
+		t.Error("未知分组应报错")
+	}
+}
+
+// 删掉分组后，引用它的虚拟组成员要一并清理，否则会留下永远走不通的成员。
+func TestDeleteCustomProviderPrunesVirtualMembers(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"demo-model"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, nil, logger), store: credStore}
+
+	id, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "openai", Model: "demo-model",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg = a.settings().Clone()
+	cfg.VirtualModels = []config.VirtualModel{{
+		Name:    "mix",
+		Enabled: true,
+		Members: []config.VirtualMember{{Provider: id, Model: "demo-model", Weight: 1}},
+	}}
+	cfg.Normalize()
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	a.cfgMu.Lock()
+	a.cfg = cfg
+	a.cfgMu.Unlock()
+	a.srv.SetConfig(cfg)
+
+	if err := a.DeleteCustomProvider(id); err != nil {
+		t.Fatal(err)
+	}
+	vm, ok := a.settings().VirtualModelByName("mix")
+	if !ok {
+		t.Fatal("虚拟组本身应保留（用户可能还要加别的成员）")
+	}
+	if len(vm.Members) != 0 {
+		t.Errorf("指向已删分组的成员应被清理，实际还剩 %+v", vm.Members)
+	}
+}
+
+// 自定义分组的「可用模型」支持一次填多个：上游没有 /models 目录时，
+// 这是用户登记模型的唯一途径。逗号（中英文）、分号、空白都算分隔。
+func TestAddCustomProviderAcceptsMultipleModels(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 上游没有 /models：同步拿不到清单，只能靠手填。
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.NotFound(w, r)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	id, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL:  stub.URL,
+		APIKey:   "sk-alpha",
+		Protocol: "anthropic",
+		Model:    "claude-opus-4-5, claude-sonnet-4-5；claude-haiku-4-5",
+	})
+	if err != nil {
+		t.Fatalf("新增失败: %v", err)
+	}
+	p, _ := a.settings().ProfileByID(id)
+	want := []string{"claude-opus-4-5", "claude-sonnet-4-5", "claude-haiku-4-5"}
+	if len(p.ExtraModels) != len(want) {
+		t.Fatalf("应解析出 %d 个模型，实际 %v", len(want), p.ExtraModels)
+	}
+	for i, m := range want {
+		if p.ExtraModels[i] != m {
+			t.Errorf("第 %d 个模型 = %q，期望 %q", i, p.ExtraModels[i], m)
+		}
+	}
+
+	// 再次提交只新增模型，不重复累积。
+	if _, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "anthropic",
+		Model: "claude-opus-4-5, claude-3-5-haiku",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, _ = a.settings().ProfileByID(id)
+	if len(p.ExtraModels) != len(want)+1 {
+		t.Errorf("重复提交应只并入新模型，实际 %v", p.ExtraModels)
+	}
+}
+
+// splitModels 处理各种分隔符与空白。
+func TestSplitModels(t *testing.T) {
+	cases := []struct {
+		in   string
+		want []string
+	}{
+		{"", nil},
+		{"   ", nil},
+		{"a", []string{"a"}},
+		{"a,b", []string{"a", "b"}},
+		{"a，b", []string{"a", "b"}},
+		{"a;b", []string{"a", "b"}},
+		{"a b", []string{"a", "b"}},
+		{" a ,, b \n c ", []string{"a", "b", "c"}},
+	}
+	for _, c := range cases {
+		got := splitModels(c.in)
+		if len(got) != len(c.want) {
+			t.Errorf("splitModels(%q) = %v，期望 %v", c.in, got, c.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != c.want[i] {
+				t.Errorf("splitModels(%q) = %v，期望 %v", c.in, got, c.want)
+				break
+			}
+		}
+	}
+}
+
+// 同一把密钥的不同粘贴形式必须复用同一分组：落库的凭据存的是归一化后的
+// 密钥，分组 ID 也必须基于归一化值，否则 "Bearer sk-x" 与 "sk-x" 会各建一组。
+func TestAddCustomProviderNormalizesKeyForIdentity(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	first, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "openai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, variant := range []string{"Bearer sk-alpha", "`sk-alpha`", `"sk-alpha"`, "  sk-alpha  "} {
+		id, err := a.AddCustomProvider(CustomProviderInput{
+			BaseURL: stub.URL, APIKey: variant, Protocol: "openai",
+		})
+		if err != nil {
+			t.Fatalf("提交 %q 失败: %v", variant, err)
+		}
+		if id != first {
+			t.Errorf("%q 应复用同一分组，实际 %s != %s", variant, id, first)
+		}
+	}
+	if n := credStore.Count(first); n != 1 {
+		t.Errorf("同一密钥应只有一份凭据，实际 %d", n)
+	}
+}
+
+// 无密钥的提交不能并进同地址的已有分组：那样会把对方的模型并过来，
+// 而用户的本意是建一个独立的、稍后再登录的分组。
+func TestAddCustomProviderEmptyKeyDoesNotHijackGroup(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	keyed, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "openai", Model: "only-this",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyless, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "", Protocol: "openai", Model: "other",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keyed == keyless {
+		t.Fatal("无密钥分组不应与同地址的有密钥分组合并")
+	}
+	p, _ := a.settings().ProfileByID(keyed)
+	if len(p.ExtraModels) != 1 || p.ExtraModels[0] != "only-this" {
+		t.Errorf("有密钥分组的模型被污染: %v", p.ExtraModels)
+	}
+}
+
+// 自动生成的显示名不能重名：同域名、同路径、不同密钥最容易撞。
+func TestAddCustomProviderAutoNameIsUnique(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	seen := map[string]string{}
+	for _, key := range []string{"sk-alpha-1111", "sk-beta-2222", "sk-gamma-3333"} {
+		id, err := a.AddCustomProvider(CustomProviderInput{
+			BaseURL: stub.URL, APIKey: key, Protocol: "openai",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		p, _ := a.settings().ProfileByID(id)
+		if prev, dup := seen[p.Name]; dup {
+			t.Errorf("显示名重复: %q 同时用于 %s 与 %s", p.Name, prev, id)
+		}
+		seen[p.Name] = id
+	}
+}
+
+// 用户手填的名字原样保留，不因重名被改写。
+func TestAddCustomProviderKeepsExplicitName(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	for _, key := range []string{"sk-a-1111", "sk-b-2222"} {
+		id, err := a.AddCustomProvider(CustomProviderInput{
+			Name: "我的网关", BaseURL: stub.URL, APIKey: key, Protocol: "openai",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if p, _ := a.settings().ProfileByID(id); p.Name != "我的网关" {
+			t.Errorf("用户指定的名称被改写为 %q", p.Name)
+		}
+	}
+}
+
+// 地址归一化只影响 scheme / host 的大小写，路径保持大小写敏感。
+func TestNormalizeBaseURL(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://API.Example.com/v1", "https://api.example.com/v1"},
+		{"https://api.example.com/v1/", "https://api.example.com/v1"},
+		{"https://api.example.com/API/v1", "https://api.example.com/API/v1"},
+		{"  https://api.example.com/v1  ", "https://api.example.com/v1"},
+		{"http://127.0.0.1:8080/v1", "http://127.0.0.1:8080/v1"},
+	}
+	for _, c := range cases {
+		if got := normalizeBaseURL(c.in); got != c.want {
+			t.Errorf("normalizeBaseURL(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+	// 路径大小写不同必须是不同端点，否则会把两个真实不同的接口撞成一组。
+	if normalizeBaseURL("https://a.com/API") == normalizeBaseURL("https://a.com/api") {
+		t.Error("路径大小写敏感，不应归一")
+	}
+}
+
+// 删除分组：配置先落盘、凭据后清理；残留凭据文件不应让删除报错。
+func TestDeleteCustomProviderSucceedsDespiteMissingCreds(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	id, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-alpha", Protocol: "openai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 手动删掉凭据文件，模拟「配置还在、凭据已丢」的不一致状态。
+	creds, _ := credStore.List(id)
+	for _, c := range creds {
+		if err := credStore.Delete(id, c.ID); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := a.DeleteCustomProvider(id); err != nil {
+		t.Fatalf("凭据已缺失时删除分组仍应成功: %v", err)
+	}
+	if _, ok := a.settings().ProfileByID(id); ok {
+		t.Error("分组应从配置里移除")
+	}
+}
+
+// 自动名称要能区分不同端点，同时不因「末尾多写 /v1」而看起来是两个端点：
+// 上游客户端会自动补 /v1，所以 host/path 与 host/path/v1 是同一个端点。
+func TestCustomProviderNameConsistency(t *testing.T) {
+	same := [][2]string{
+		{"https://api.deepseek.com", "https://api.deepseek.com/v1"},
+		{"https://relay.example.com/anthropic", "https://relay.example.com/anthropic/v1"},
+		{"https://relay.example.com/anthropic", "https://relay.example.com/anthropic/v1/"},
+	}
+	for _, pair := range same {
+		a := customProviderName("", "openai", pair[0])
+		b := customProviderName("", "openai", pair[1])
+		if a != b {
+			t.Errorf("%q 与 %q 应生成同一名称，实际 %q != %q", pair[0], pair[1], a, b)
+		}
+	}
+
+	// 不同端点必须能区分。
+	differ := [][2]string{
+		{"https://relay.example.com/openai", "https://relay.example.com/anthropic"},
+		{"https://a.example.com/v1", "https://b.example.com/v1"},
+	}
+	for _, pair := range differ {
+		if customProviderName("", "openai", pair[0]) == customProviderName("", "openai", pair[1]) {
+			t.Errorf("%q 与 %q 应生成不同名称", pair[0], pair[1])
+		}
+	}
+
+	// 线协议不同，名称也要不同（同域名挂 OpenAI 与 Anthropic 两个端点很常见）。
+	if customProviderName("", "openai", "https://relay.example.com") ==
+		customProviderName("", "anthropic", "https://relay.example.com") {
+		t.Error("不同线协议应生成不同名称")
+	}
+
+	// 用户给了名字就原样用。
+	if got := customProviderName("我的网关", "openai", "https://relay.example.com"); got != "我的网关" {
+		t.Errorf("用户指定名称被改写为 %q", got)
+	}
+}
+
+// 非 /v1 的版本段（如智谱的 /v4）要保留：它确实是路径的一部分，不能当成
+// 可省略的版本后缀剥掉。
+func TestCustomProviderNameKeepsNonV1Version(t *testing.T) {
+	got := customProviderName("", "openai", "https://open.bigmodel.cn/api/coding/paas/v4")
+	if !strings.Contains(got, "/api/coding/paas/v4") {
+		t.Errorf("非 /v1 的版本段应保留在名称里，实际 %q", got)
+	}
+}
+
+// displayPath 的剥离规则。
+func TestDisplayPath(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://a.com", ""},
+		{"https://a.com/v1", ""},
+		{"https://a.com/v1/", ""},
+		{"https://a.com/api", "api"},
+		{"https://a.com/api/v1", "api"},
+		{"https://a.com/api/v1/v1", "api"},
+		{"https://a.com/API/v1", "API"},
+	}
+	for _, c := range cases {
+		if got := displayPath(c.in); got != c.want {
+			t.Errorf("displayPath(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+}
+
+// 用户常常整条粘贴对话端点（文档 / 代码里复制的完整 URL），而 base_url 的
+// 语义是前缀，程序会自己拼 /chat/completions。不剥掉就会拼出
+// .../chat/completions/v1/chat/completions，请求全部 404。
+func TestNormalizeBaseURLInput(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"https://api.deepseek.com", "https://api.deepseek.com"},
+		{"https://api.deepseek.com/v1", "https://api.deepseek.com/v1"},
+		{"https://api.deepseek.com/v1/", "https://api.deepseek.com/v1"},
+		{"https://api.deepseek.com/v1/chat/completions", "https://api.deepseek.com/v1"},
+		{"https://api.deepseek.com/chat/completions", "https://api.deepseek.com"},
+		{"https://relay.example.com/anthropic/v1/messages", "https://relay.example.com/anthropic/v1"},
+		{"https://host/v1/responses", "https://host/v1"},
+		// fragment 与 query 必须去掉：拼上子路径后它们会把路径吞掉。
+		{"https://api.deepseek.com?api-version=2", "https://api.deepseek.com"},
+		{"https://api.deepseek.com/v1#frag", "https://api.deepseek.com/v1"},
+		// 大小写不敏感地识别端点尾巴。
+		{"https://host/V1/CHAT/COMPLETIONS", "https://host/V1"},
+	}
+	for _, c := range cases {
+		if got := normalizeBaseURLInput(c.in); got != c.want {
+			t.Errorf("normalizeBaseURLInput(%q) = %q，期望 %q", c.in, got, c.want)
+		}
+	}
+	// 单独的 /completions 可能真是自建网关的 base，不能剥。
+	if got := normalizeBaseURLInput("https://host/api/completions"); got != "https://host/api/completions" {
+		t.Errorf("单独的 /completions 不应被剥掉，实际 %q", got)
+	}
+}
+
+// 粘贴完整端点后，分组必须能正常工作：地址被收敛、身份按收敛后的地址计算。
+func TestAddCustomProviderAcceptsPastedEndpointURL(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotPath string
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	// 用户粘贴的是完整对话端点。
+	id, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL:  stub.URL + "/v1/chat/completions",
+		APIKey:   "sk-alpha",
+		Protocol: "openai",
+	})
+	if err != nil {
+		t.Fatalf("粘贴完整端点应被接受: %v", err)
+	}
+	p, _ := a.settings().ProfileByID(id)
+	if p.BaseURL != stub.URL+"/v1" {
+		t.Errorf("地址应被收敛到 %q，实际 %q", stub.URL+"/v1", p.BaseURL)
+	}
+	// 校验请求应打到 .../v1/models，而不是 .../v1/chat/completions/v1/models。
+	if gotPath != "/v1/models" {
+		t.Errorf("请求路径应为 /v1/models，实际 %q", gotPath)
+	}
+}
+
+// 并发添加不同分组时不能丢配置：cfgMu 只保护指针，挡不住两个写者各自
+// 克隆同一份旧配置再依次覆盖（实测 6 个并发只落盘 1 个）。cfgWriteMu 把
+// 「读-改-写」整体串行化后才正确。
+func TestAddCustomProviderConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	const n = 8
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, _ = a.AddCustomProvider(CustomProviderInput{
+				BaseURL: stub.URL, APIKey: fmt.Sprintf("sk-key-%d", i), Protocol: "openai",
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	count := func(profiles []config.Profile) int {
+		n := 0
+		for _, p := range profiles {
+			if p.IsUserCustomProfile() {
+				n++
+			}
+		}
+		return n
+	}
+	persisted, err := config.Load(a.cfg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := count(persisted.Profiles); got != n {
+		t.Errorf("落盘应有 %d 个自定义分组，实际 %d", n, got)
+	}
+	if got := count(a.settings().Profiles); got != n {
+		t.Errorf("内存应有 %d 个自定义分组，实际 %d", n, got)
+	}
+}
+
+// 并发增删混跑后，内存与落盘必须一致，且删掉的那个真的不在了。
+func TestAddDeleteCustomProviderConcurrent(t *testing.T) {
+	dir := t.TempDir()
+	logger := applog.New(filepath.Join(dir, "logs"), 3)
+	t.Cleanup(func() { _ = logger.Close() })
+	credStore, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stub := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.WriteString(w, `{"data":[{"id":"m"}]}`)
+	}))
+	defer stub.Close()
+
+	cfg := config.DefaultAt(filepath.Join(dir, "config.json"))
+	a := &App{cfg: cfg, log: logger, srv: proxysrv.New(cfg, credStore, logger), store: credStore}
+
+	victim, err := a.AddCustomProvider(CustomProviderInput{
+		BaseURL: stub.URL, APIKey: "sk-victim", Protocol: "openai",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(5)
+	go func() { defer wg.Done(); _ = a.DeleteCustomProvider(victim) }()
+	for i := 0; i < 4; i++ {
+		go func(i int) {
+			defer wg.Done()
+			_, _ = a.AddCustomProvider(CustomProviderInput{
+				BaseURL: stub.URL, APIKey: fmt.Sprintf("sk-new-%d", i), Protocol: "openai",
+			})
+		}(i)
+	}
+	wg.Wait()
+
+	if _, ok := a.settings().ProfileByID(victim); ok {
+		t.Error("被删的分组不应还在内存配置里")
+	}
+	persisted, err := config.Load(a.cfg.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := persisted.ProfileByID(victim); ok {
+		t.Error("被删的分组不应还在落盘配置里")
+	}
+	n := 0
+	for _, p := range persisted.Profiles {
+		if p.IsUserCustomProfile() {
+			n++
+		}
+	}
+	if n != 4 {
+		t.Errorf("应有 4 个自定义分组，实际 %d", n)
 	}
 }

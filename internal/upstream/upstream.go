@@ -831,6 +831,22 @@ var ErrCustomKeyInvalid = custom.ErrKeyInvalid
 // ErrCustomKeyRejected 是 custom 密钥被上游拒绝（401/403）的应用层哨兵。
 var ErrCustomKeyRejected = custom.ErrKeyRejected
 
+// NormalizeCustomAPIKey 清洗 custom 密钥，不依赖具体上游。
+//
+// 供「还没确定属于哪个上游」的调用方使用：例如新增自定义分组时要先按
+// 「协议 + 地址 + 密钥」算分组 ID，此时客户端还没构造出来。归一化必须与
+// 落库用的 NormalizeAPIKey 完全一致，否则同一把密钥的两种写法会算出两个
+// 分组 ID，用户重复提交就凭空多出一组。
+func NormalizeCustomAPIKey(key string) (string, error) {
+	return custom.NormalizeAPIKey(key)
+}
+
+// KeyLabelFor 返回一把 custom 密钥的展示标签（首 4 + 末 4 位）。
+// 密钥过短时返回 "key"，调用方应把它当作「没有可用信息」处理。
+func KeyLabelFor(key string) string {
+	return custom.KeyLabel(key)
+}
+
 // NormalizeAPIKey 清洗用户粘贴的 custom 密钥。
 func (c *Client) NormalizeAPIKey(key string) (string, error) {
 	if ProfileKind(c.profile) != KindCustom {

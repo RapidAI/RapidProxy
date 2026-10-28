@@ -511,8 +511,18 @@ html, body {
 
 .vm-add-row { display: flex; gap: 10px; align-items: center; margin-top: 12px; flex-wrap: wrap; }
 .vm-add-row select.input { max-width: 260px; }
+/* 模型输入框（input + datalist）：与上游下拉同宽，避免长模型名把行撑开。 */
+.vm-add-row #vm-add-model { max-width: 260px; }
 .vm-add-row .vm-weight { width: 90px; }
 .vm-editor-actions { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
 
 /* 模型表格里虚拟组条目的行内标签 */
 .vm-tag { margin-left: 6px; }
+
+/* ------------------------- 自定义服务商 ------------------------- */
+/* 表单与操作行之间留出呼吸，否则「添加分组」按钮会贴着最后一个输入框。 */
+#tab-accounts .form-grid { margin-bottom: 14px; }
+/* 表单与下方分组列表之间留出分隔：两者语义不同（输入 vs 已有），
+ * 贴着排会让「添加分组」按钮看起来像列表的一部分。 */
+.custom-groups-head { margin-top: 18px; padding-top: 14px; border-top: 1px solid var(--border); }
+#custom-groups { margin-top: 10px; }
